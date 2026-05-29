@@ -3,10 +3,12 @@ package db
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -15,7 +17,7 @@ import (
 	"github.com/sujit/sqlite/internal/wal"
 )
 
-func TestDatabaseFileLockRejectsCompetingProcess(t *testing.T) {
+func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
 	if os.Getenv("SUJIT_SQLITE_LOCK_HELPER") == "1" {
 		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
 		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
@@ -41,7 +43,7 @@ func TestDatabaseFileLockRejectsCompetingProcess(t *testing.T) {
 	dir := t.TempDir()
 	ready := filepath.Join(dir, "ready")
 	done := filepath.Join(dir, "done")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseFileLockRejectsCompetingProcess$", "-test.v")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseFileLockAllowsCompetingReaders$", "-test.v")
 	cmd.Env = append(os.Environ(),
 		"SUJIT_SQLITE_LOCK_HELPER=1",
 		"SUJIT_SQLITE_LOCK_DIR="+dir,
@@ -69,12 +71,91 @@ func TestDatabaseFileLockRejectsCompetingProcess(t *testing.T) {
 	}
 
 	competing, err := Open(dir, Options{})
-	if err == nil {
-		_ = competing.Close()
-		t.Fatal("expected competing open to fail while another process holds the database lock")
+	if err != nil {
+		t.Fatalf("competing reader open failed: %v", err)
 	}
+	_ = competing.Close()
+}
+
+func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows locking shim is currently advisory no-op")
+	}
+	if os.Getenv("SUJIT_SQLITE_WRITE_LOCK_HELPER") == "1" {
+		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
+		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
+		done := os.Getenv("SUJIT_SQLITE_LOCK_DONE")
+		d, err := Open(dir, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		if err := acquireDatabaseWriteLock(d.lock); err != nil {
+			t.Fatal(err)
+		}
+		defer releaseDatabaseWriteLock(d.lock)
+		if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(done); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for parent")
+	}
+
+	dir := t.TempDir()
+	ctx := context.Background()
+	setup, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setup.Exec(ctx, `CREATE TABLE write_lock_items (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := filepath.Join(dir, "write-ready")
+	done := filepath.Join(dir, "write-done")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseWriteLockRejectsCompetingWriter$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"SUJIT_SQLITE_WRITE_LOCK_HELPER=1",
+		"SUJIT_SQLITE_LOCK_DIR="+dir,
+		"SUJIT_SQLITE_LOCK_READY="+ready,
+		"SUJIT_SQLITE_LOCK_DONE="+done,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.WriteFile(done, []byte("done"), 0o600)
+		_ = cmd.Wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("helper did not acquire database write lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	competing, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competing.Close()
+	_, err = competing.Exec(ctx, `INSERT INTO write_lock_items VALUES (1)`)
 	if !errors.Is(err, ErrDatabaseLocked) {
-		t.Fatalf("competing open err = %v, want ErrDatabaseLocked", err)
+		t.Fatalf("competing write err = %v, want ErrDatabaseLocked", err)
 	}
 }
 
@@ -698,6 +779,9 @@ func TestIndexPageCorruptionIsRejectedOnReopen(t *testing.T) {
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Remove(filepath.Join(dir, "db.wal")); err != nil {
+		t.Fatal(err)
+	}
 	path := singleGlob(t, filepath.Join(dir, "index_corrupt_idx_corrupt_idx_name_idx_*.pages"))
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -710,6 +794,146 @@ func TestIndexPageCorruptionIsRejectedOnReopen(t *testing.T) {
 	if reopened, err := Open(dir, Options{}); err == nil {
 		_ = reopened.Close()
 		t.Fatal("expected corrupt index page to fail reopen")
+	}
+}
+
+func TestTablePageCorruptionIsRejectedOnReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE corrupt_table (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO corrupt_table VALUES (1, 'Ada')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "db.wal")); err != nil {
+		t.Fatal(err)
+	}
+	path := singleGlob(t, filepath.Join(dir, "table_corrupt_table_*.pages"))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)-1] ^= 0xff
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir, Options{}); err == nil {
+		_ = reopened.Close()
+		t.Fatal("expected corrupt table page to fail reopen")
+	}
+}
+
+func TestMissingCheckpointTableGenerationIsRejected(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE missing_gen (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO missing_gen VALUES (1, 'Ada')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "db.wal")); err != nil {
+		t.Fatal(err)
+	}
+	path := singleGlob(t, filepath.Join(dir, "table_missing_gen_*.pages"))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir, Options{}); err == nil {
+		_ = reopened.Close()
+		t.Fatal("expected missing checkpoint table generation to fail reopen")
+	}
+}
+
+func TestCorruptCheckpointMetadataIsRejected(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE corrupt_meta (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO corrupt_meta VALUES (1, 'Ada')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "db.wal")); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "db.pages"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < page.DefaultSize {
+		t.Fatalf("db.pages too small: %d", len(raw))
+	}
+	raw[page.HeaderSize+20] ^= 0xff
+	if err := os.WriteFile(filepath.Join(dir, "db.pages"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(dir, Options{}); err == nil {
+		_ = reopened.Close()
+		t.Fatal("expected corrupt checkpoint metadata to fail reopen")
+	}
+}
+
+func TestPhysicalPageWALRestoresCheckpointMetadata(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE physical_wal_restore (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO physical_wal_restore VALUES (1, 'Ada')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "db.pages"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := page.HeaderSize; i < page.HeaderSize+32 && i < len(raw); i++ {
+		raw[i] ^= 0xff
+	}
+	if err := os.WriteFile(filepath.Join(dir, "db.pages"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err := reopened.Query(ctx, `SELECT name FROM physical_wal_restore WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "Ada" {
+		t.Fatalf("restored row = %#v ok=%v", row, ok)
 	}
 }
 
@@ -833,6 +1057,165 @@ func TestReopenFromPagerCheckpointWithoutWAL(t *testing.T) {
 	row, ok := rows.Next()
 	if !ok || row[0] != "from-pages" {
 		t.Fatalf("pager-only reopen row = %#v ok=%v", row, ok)
+	}
+}
+
+func TestCommittedWALWithoutCheckpointSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE wal_only (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO wal_only VALUES (?, ?)`, int64(1), "from-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if d.checkpointed != 0 {
+		t.Fatalf("checkpointed = %d, want 0", d.checkpointed)
+	}
+	reopened, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err := reopened.Query(ctx, `SELECT msg FROM wal_only WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "from-wal" {
+		t.Fatalf("wal-only recovered row = %#v ok=%v", row, ok)
+	}
+	_ = d.Close()
+}
+
+func TestCommittedWALSurvivesMissingCheckpointFiles(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE wal_missing_pages (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO wal_missing_pages VALUES (?, ?)`, int64(1), "from-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, pattern := range []string{
+		filepath.Join(dir, "db.pages"),
+		filepath.Join(dir, "table_wal_missing_pages_*.pages"),
+		filepath.Join(dir, "index_wal_missing_pages_*.pages"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range matches {
+			_ = os.Remove(match)
+			_ = os.Remove(match + ".free")
+		}
+	}
+	reopened, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err := reopened.Query(ctx, `SELECT msg FROM wal_missing_pages WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "from-wal" {
+		t.Fatalf("wal recovered row after missing checkpoint = %#v ok=%v", row, ok)
+	}
+	_ = d.Close()
+}
+
+func TestCommittedDMLDoesNotCheckpointBeforeCloseByDefault(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE eager_pages (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO eager_pages VALUES (?, ?)`, int64(1), "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if d.checkpointed != 0 {
+		t.Fatalf("checkpointed = %d, want 0 before close/manual checkpoint", d.checkpointed)
+	}
+	if _, err := d.pager.ReadBlob(); err == nil {
+		t.Fatal("unexpected checkpoint metadata before close/manual checkpoint")
+	}
+}
+
+func TestManualCheckpointWritesPagerBeforeClose(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE manual_pages (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO manual_pages VALUES (?, ?)`, int64(1), "committed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	metaBlob, err := d.pager.ReadBlob()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta checkpointMeta
+	if err := json.Unmarshal(metaBlob, &meta); err != nil {
+		t.Fatal(err)
+	}
+	table, err := d.loadTablePages("manual_pages", d.state.Catalog.Tables["manual_pages"], meta.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(table.Rows) != 1 || table.Rows[0].Values["msg"] != "committed" {
+		t.Fatalf("pager table rows = %#v", table.Rows)
+	}
+	if d.checkpointed != d.applied {
+		t.Fatalf("checkpointed = %d, applied = %d", d.checkpointed, d.applied)
+	}
+}
+
+func TestCheckpointThresholdTriggers(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true, CheckpointIntervalTx: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE threshold_pages (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if d.checkpointed != 0 {
+		t.Fatalf("checkpointed after first tx = %d, want 0", d.checkpointed)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO threshold_pages VALUES (?, ?)`, int64(1), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if d.checkpointed != d.applied {
+		t.Fatalf("checkpointed = %d, applied = %d", d.checkpointed, d.applied)
 	}
 }
 

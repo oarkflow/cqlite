@@ -1,0 +1,63 @@
+package db
+
+import (
+	"testing"
+
+	"github.com/sujit/sqlite/internal/catalog"
+)
+
+func TestRowVersionMaintainsSchemaPositionedValues(t *testing.T) {
+	schema := &catalog.Table{
+		Name: "items",
+		Columns: []catalog.Column{
+			{Name: "id", Type: catalog.Integer},
+			{Name: "name", Type: catalog.Text},
+			{Name: "score", Type: catalog.Integer},
+		},
+	}
+	row := newRowVersion(schema, 1, map[string]any{"id": int64(1), "name": "Ada", "score": int64(7)}, 2)
+	if len(row.Pos) != 3 || row.Pos[0] != int64(1) || row.Pos[1] != "Ada" || row.Pos[2] != int64(7) {
+		t.Fatalf("positioned values = %#v", row.Pos)
+	}
+	row.Values["score"] = int64(8)
+	row.syncPositioned(schema)
+	if row.Pos[2] != int64(8) {
+		t.Fatalf("synced positioned score = %#v", row.Pos)
+	}
+	row.Values = nil
+	row.ensureValues(schema)
+	if row.Values["name"] != "Ada" || row.Values["score"] != int64(8) {
+		t.Fatalf("rebuilt values = %#v", row.Values)
+	}
+}
+
+func TestTableDataPrimaryAndSecondaryRuntimeBTrees(t *testing.T) {
+	schema := &catalog.Table{
+		Name: "items",
+		Columns: []catalog.Column{
+			{Name: "id", Type: catalog.Integer, PrimaryKey: true},
+			{Name: "name", Type: catalog.Text},
+		},
+		Indexes: []catalog.Index{{Name: "items_name_idx", Columns: []string{"name"}}},
+	}
+	data := &tableData{Rows: []rowVersion{
+		newRowVersion(schema, 10, map[string]any{"id": int64(10), "name": "Ada"}, 1),
+		newRowVersion(schema, 20, map[string]any{"id": int64(20), "name": "Grace"}, 1),
+		newRowVersion(schema, 30, map[string]any{"id": int64(30), "name": "Ada"}, 1),
+	}}
+	data.rebuildRuntime(schema)
+	if pos, ok := data.lookupRowID(20); !ok || pos != 1 {
+		t.Fatalf("lookup rowid = %d %v, want 1 true", pos, ok)
+	}
+	positions := data.rangeRowIDs(ptrInt64(11), ptrInt64(31))
+	if len(positions) != 2 || positions[0] != 1 || positions[1] != 2 {
+		t.Fatalf("range positions = %#v", positions)
+	}
+	idx := catalog.Index{Name: "items_name_idx", Columns: []string{"name"}}
+	positions = data.lookupIndexPositions("items_name_idx", runtimeIndexLookupKey(idx, "Ada"))
+	if len(positions) != 2 || positions[0] != 0 || positions[1] != 2 {
+		t.Fatalf("index positions = %#v", positions)
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }

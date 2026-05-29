@@ -2,12 +2,20 @@
 
 package db
 
-import "os"
+type databaseLock struct{}
 
-func acquireDatabaseLock(path string) (*os.File, error) {
-	return nil, nil
+func acquireDatabaseLock(path string) (*databaseLock, error) {
+	return &databaseLock{}, nil
 }
 
-func releaseDatabaseLock(f *os.File) error {
+func acquireDatabaseWriteLock(l *databaseLock) error {
+	return nil
+}
+
+func releaseDatabaseWriteLock(l *databaseLock) error {
+	return nil
+}
+
+func releaseDatabaseLock(l *databaseLock) error {
 	return nil
 }

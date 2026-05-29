@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -30,7 +31,7 @@ type DB struct {
 	opts         Options
 	wal          *wal.Log
 	pager        *pager.Pager
-	lock         *os.File
+	lock         *databaseLock
 	buffer       *buffer.Pool
 	txmgr        *txn.Manager
 	state        persistedState
@@ -75,7 +76,7 @@ func Open(path string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
-	var lock *os.File
+	var lock *databaseLock
 	if !opts.DisableFileLock {
 		var err error
 		lock, err = acquireDatabaseLock(path)
@@ -105,11 +106,23 @@ func Open(path string, opts Options) (*DB, error) {
 		state:  newState(),
 		opened: time.Now(),
 	}
-	if err := d.loadSnapshot(); err != nil {
+	if err := d.replayPhysicalPages(); err != nil {
 		_ = log.Close()
 		_ = pg.Close()
 		_ = releaseDatabaseLock(lock)
 		return nil, err
+	}
+	if err := d.loadSnapshot(); err != nil {
+		if walHasRecords(filepath.Join(path, "db.wal")) {
+			d.state = newState()
+			d.applied = 0
+			d.checkpointed = 0
+		} else {
+			_ = log.Close()
+			_ = pg.Close()
+			_ = releaseDatabaseLock(lock)
+			return nil, err
+		}
 	}
 	if err := d.replay(); err != nil {
 		_ = log.Close()
@@ -307,6 +320,10 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		return Result{}, true, err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	d.state.NextTx = next
 	res, fast, err := fastDirectDML(&d.state, stmt, args)
@@ -324,12 +341,19 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 		return Result{}, true, err
 	}
 	d.applied = next
+	if err := d.maybeCheckpointLocked(ctx); err != nil {
+		return Result{}, true, err
+	}
 	return res, true, nil
 }
 
 func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		return Result{}, true, err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	d.state.NextTx = next
 	res, fast, err := fastSimpleDML(&d.state, query, args)
@@ -343,6 +367,9 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		return Result{}, true, err
 	}
 	d.applied = next
+	if err := d.maybeCheckpointLocked(context.Background()); err != nil {
+		return Result{}, true, err
+	}
 	return res, true, nil
 }
 
@@ -581,6 +608,11 @@ func stripStrictOnly(query string) string {
 	return q
 }
 
+func walHasRecords(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Size() >= 21
+}
+
 func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if err := d.checkOpen(); err != nil {
 		return nil, err
@@ -615,13 +647,22 @@ func (d *DB) Close() error {
 	d.explicitMu.Unlock()
 	d.mu.Lock()
 	if d.applied != d.checkpointed {
-		if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
+		if err := acquireDatabaseWriteLock(d.lock); err != nil {
 			d.mu.Unlock()
 			_ = d.wal.Close()
 			_ = d.pager.Close()
 			_ = releaseDatabaseLock(d.lock)
 			return err
 		}
+		if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
+			_ = releaseDatabaseWriteLock(d.lock)
+			d.mu.Unlock()
+			_ = d.wal.Close()
+			_ = d.pager.Close()
+			_ = releaseDatabaseLock(d.lock)
+			return err
+		}
+		_ = releaseDatabaseWriteLock(d.lock)
 	}
 	d.mu.Unlock()
 	err := d.wal.Close()
@@ -685,6 +726,26 @@ func (d *DB) loadSnapshot() error {
 	}
 	d.state.rebuildRuntime()
 	return nil
+}
+
+func (d *DB) replayPhysicalPages() error {
+	return d.wal.Replay(func(rec wal.Record) error {
+		if rec.Type != wal.RecordPage {
+			return nil
+		}
+		frame, err := wal.DecodePageRecord(rec.Data)
+		if err != nil {
+			return err
+		}
+		pg, err := page.Decode(frame.Data)
+		if err != nil {
+			return err
+		}
+		if uint64(pg.ID) != frame.PageID {
+			return fmt.Errorf("page WAL id mismatch: frame=%d page=%d", frame.PageID, pg.ID)
+		}
+		return d.pager.Write(pg)
+	})
 }
 
 func (d *DB) replay() error {
@@ -757,6 +818,10 @@ func (d *DB) commit(tx *Tx) error {
 	if len(tx.ops) == 0 {
 		return nil
 	}
+	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		return err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	tx.writes.NextTx = next
 	data, err := encodeTransactionWAL(tx.ops)
@@ -768,7 +833,59 @@ func (d *DB) commit(tx *Tx) error {
 	}
 	d.state = tx.writes
 	d.applied = next
+	if err := d.maybeCheckpointLocked(context.Background()); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (d *DB) Checkpoint(ctx context.Context) error {
+	if err := d.checkOpen(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		return err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
+	return d.checkpointLocked(ctx)
+}
+
+func (d *DB) maybeCheckpointLocked(ctx context.Context) error {
+	if d.applied == d.checkpointed {
+		return nil
+	}
+	if d.opts.CheckpointIntervalTx > 0 && d.applied-d.checkpointed >= d.opts.CheckpointIntervalTx {
+		return d.checkpointLocked(ctx)
+	}
+	if d.opts.CheckpointIntervalBytes > 0 {
+		info, err := os.Stat(filepath.Join(d.path, "db.wal"))
+		if err != nil {
+			return err
+		}
+		if info.Size() >= d.opts.CheckpointIntervalBytes {
+			return d.checkpointLocked(ctx)
+		}
+	}
+	return nil
+}
+
+func (d *DB) checkpointLocked(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if d.applied == d.checkpointed {
+		return nil
+	}
+	return d.writeCheckpointPages(d.state, d.applied)
 }
 
 func (d *DB) writeCheckpointPages(state persistedState, applied uint64) error {
@@ -798,9 +915,37 @@ func (d *DB) writeCheckpointPages(state persistedState, applied uint64) error {
 	if err := d.pager.WriteBlob(data); err != nil {
 		return err
 	}
+	if err := d.appendPhysicalPagerWAL(applied); err != nil {
+		return err
+	}
 	d.checkpointed = applied
 	if err := d.cleanupCheckpointGenerations(state, generation); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (d *DB) appendPhysicalPagerWAL(txid uint64) error {
+	raw, err := os.ReadFile(filepath.Join(d.path, "db.pages"))
+	if err != nil {
+		return err
+	}
+	if len(raw)%d.opts.PageSize != 0 {
+		return fmt.Errorf("pager file size %d is not page aligned", len(raw))
+	}
+	for off := 0; off < len(raw); off += d.opts.PageSize {
+		pg, err := page.Decode(raw[off : off+d.opts.PageSize])
+		if err != nil {
+			return err
+		}
+		frame := wal.PageRecord{
+			PageID: uint64(pg.ID),
+			LSN:    pg.LSN,
+			Data:   append([]byte(nil), raw[off:off+d.opts.PageSize]...),
+		}
+		if err := d.wal.Append(wal.Record{Type: wal.RecordPage, TxID: txid, Data: wal.EncodePageRecord(frame)}, d.opts.SyncPolicy == SyncFull); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -864,6 +1009,9 @@ func (d *DB) loadTablePages(name string, schema *catalog.Table, generation uint6
 		records, rerr := pg.ReadRecords()
 		if rerr != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				if generation != 0 {
+					return nil, fmt.Errorf("missing checkpoint table pages for %s generation %d", name, generation)
+				}
 				return &tableData{}, nil
 			}
 			return nil, err

@@ -34,8 +34,9 @@ func encodeRowVersion(schema *catalog.Table, row rowVersion) ([]byte, error) {
 	binary.LittleEndian.PutUint64(fixed[16:24], row.Deleted)
 	binary.LittleEndian.PutUint32(fixed[24:28], uint32(len(schema.Columns)))
 	buf.Write(fixed[:])
-	for _, col := range schema.Columns {
-		if err := encodeRowValue(&buf, row.Values[col.Name]); err != nil {
+	row.ensurePositioned(schema)
+	for i := range schema.Columns {
+		if err := encodeRowValue(&buf, row.Pos[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -63,24 +64,25 @@ func decodeRowVersion(schema *catalog.Table, data []byte) (rowVersion, error) {
 		RowID:   int64(binary.LittleEndian.Uint64(data[pos : pos+8])),
 		Created: binary.LittleEndian.Uint64(data[pos+8 : pos+16]),
 		Deleted: binary.LittleEndian.Uint64(data[pos+16 : pos+24]),
-		Values:  make(map[string]any, len(schema.Columns)),
+		Pos:     make([]any, len(schema.Columns)),
 	}
 	count := int(binary.LittleEndian.Uint32(data[pos+24 : pos+28]))
 	pos += 28
 	if count != len(schema.Columns) {
 		return rowVersion{}, errors.New("row column count does not match schema")
 	}
-	for _, col := range schema.Columns {
+	for i := range schema.Columns {
 		value, next, err := decodeRowValue(data, pos)
 		if err != nil {
 			return rowVersion{}, err
 		}
-		row.Values[col.Name] = value
+		row.Pos[i] = value
 		pos = next
 	}
 	if pos != len(data) {
 		return rowVersion{}, errors.New("trailing row bytes")
 	}
+	row.ensureValues(schema)
 	return row, nil
 }
 

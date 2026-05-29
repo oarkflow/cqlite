@@ -35,8 +35,31 @@ func TestRowCodecRoundTrip(t *testing.T) {
 	if got.Values["id"] != int64(7) || got.Values["score"] != 3.5 || got.Values["name"] != "Ada" || got.Values["empty"] != nil {
 		t.Fatalf("values = %#v", got.Values)
 	}
+	if len(got.Pos) != len(schema.Columns) || got.Pos[0] != int64(7) || got.Pos[1] != 3.5 || got.Pos[2] != "Ada" {
+		t.Fatalf("positioned values = %#v", got.Pos)
+	}
 	if !bytes.Equal(got.Values["payload"].([]byte), []byte("bytes")) {
 		t.Fatalf("payload = %#v", got.Values["payload"])
+	}
+}
+
+func TestRowCodecPrefersSchemaPositionedValues(t *testing.T) {
+	schema := rowCodecTestSchema()
+	row := rowVersion{
+		RowID:  9,
+		Values: map[string]any{"id": int64(1), "score": 1.5, "name": "map"},
+		Pos:    []any{int64(9), 4.5, "pos", []byte("payload"), nil},
+	}
+	data, err := encodeRowVersion(schema, row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeRowVersion(schema, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Values["id"] != int64(9) || got.Values["score"] != 4.5 || got.Values["name"] != "pos" {
+		t.Fatalf("decoded values did not come from positioned storage: %#v", got.Values)
 	}
 }
 

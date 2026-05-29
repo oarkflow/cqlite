@@ -116,6 +116,9 @@ func (l *Log) Replay(fn func(Record) error) error {
 		}
 		data := make([]byte, n)
 		if _, err := io.ReadFull(r, data); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
 			return err
 		}
 		want := binary.LittleEndian.Uint32(header[17:21])

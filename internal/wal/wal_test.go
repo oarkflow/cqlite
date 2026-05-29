@@ -34,6 +34,40 @@ func TestReplayIgnoresPartialTrailingRecord(t *testing.T) {
 	}
 }
 
+func TestReplayIgnoresPartialTrailingPayload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.wal")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(Record{Type: RecordCommit, TxID: 1, Data: []byte("committed")}, false); err != nil {
+		t.Fatal(err)
+	}
+	var header [21]byte
+	header[0] = byte(RecordCommit)
+	binary.LittleEndian.PutUint64(header[1:9], 2)
+	binary.LittleEndian.PutUint64(header[9:17], 100)
+	if _, err := log.file.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.file.Write([]byte("torn")); err != nil {
+		t.Fatal(err)
+	}
+	var records []Record
+	if err := log.Replay(func(rec Record) error {
+		records = append(records, rec)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].TxID != 1 || string(records[0].Data) != "committed" {
+		t.Fatalf("records = %#v", records)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReplayRejectsCorruptChecksum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db.wal")
 	log, err := Open(path)

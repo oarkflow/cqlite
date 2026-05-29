@@ -12,6 +12,7 @@ import (
 type rowVersion struct {
 	RowID   int64          `json:"row_id"`
 	Values  map[string]any `json:"values"`
+	Pos     []any          `json:"pos,omitempty"`
 	Created uint64         `json:"created"`
 	Deleted uint64         `json:"deleted,omitempty"`
 }
@@ -75,6 +76,7 @@ func (s persistedState) clone() persistedState {
 			td.Rows[i] = rowVersion{
 				RowID:   row.RowID,
 				Values:  cloneValues(row.Values),
+				Pos:     clonePositionedValues(row.Pos),
 				Created: row.Created,
 				Deleted: row.Deleted,
 			}
@@ -95,6 +97,72 @@ func cloneValues(in map[string]any) map[string]any {
 	return out
 }
 
+func clonePositionedValues(in []any) []any {
+	if in == nil {
+		return nil
+	}
+	return append([]any(nil), in...)
+}
+
+func newRowVersion(schema *catalog.Table, rowid int64, values map[string]any, created uint64) rowVersion {
+	return rowVersion{
+		RowID:   rowid,
+		Values:  values,
+		Pos:     valuesToPositioned(schema, values),
+		Created: created,
+	}
+}
+
+func valuesToPositioned(schema *catalog.Table, values map[string]any) []any {
+	if schema == nil {
+		return nil
+	}
+	pos := make([]any, len(schema.Columns))
+	for i, col := range schema.Columns {
+		pos[i] = values[col.Name]
+	}
+	return pos
+}
+
+func positionedToValues(schema *catalog.Table, pos []any) map[string]any {
+	values := make(map[string]any, len(schema.Columns))
+	for i, col := range schema.Columns {
+		if i < len(pos) {
+			values[col.Name] = pos[i]
+		} else {
+			values[col.Name] = nil
+		}
+	}
+	return values
+}
+
+func (r *rowVersion) ensurePositioned(schema *catalog.Table) {
+	if schema == nil {
+		return
+	}
+	if len(r.Pos) == len(schema.Columns) {
+		return
+	}
+	r.Pos = valuesToPositioned(schema, r.Values)
+}
+
+func (r *rowVersion) ensureValues(schema *catalog.Table) {
+	if schema == nil {
+		return
+	}
+	if r.Values != nil && len(r.Values) >= len(schema.Columns) {
+		return
+	}
+	r.Values = positionedToValues(schema, r.Pos)
+}
+
+func (r *rowVersion) syncPositioned(schema *catalog.Table) {
+	if schema == nil {
+		return
+	}
+	r.Pos = valuesToPositioned(schema, r.Values)
+}
+
 func (s *persistedState) rebuildRuntime() {
 	for name, data := range s.Tables {
 		if tbl := s.Catalog.Tables[name]; tbl != nil {
@@ -112,6 +180,9 @@ func (t *tableData) rebuildRuntime(schema *catalog.Table) {
 		}
 	}
 	for i, row := range t.Rows {
+		t.Rows[i].ensureValues(schema)
+		t.Rows[i].ensurePositioned(schema)
+		row = t.Rows[i]
 		t.addRowIDPosition(row.RowID, i)
 		if row.Deleted != 0 {
 			continue

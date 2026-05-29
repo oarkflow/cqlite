@@ -169,6 +169,7 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 		return Result{}, true, err
 	}
 	data.Rows[pos].Values[col.Name] = cv
+	data.Rows[pos].syncPositioned(t)
 	return Result{RowsAffected: 1}, true, nil
 }
 
@@ -242,7 +243,7 @@ func fastInsertValues(s *persistedState, table string, args []any) (Result, bool
 	if err := validateInsertFast(s, t, data, row, rowid); err != nil {
 		return Result{}, true, err
 	}
-	data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+	data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
 	if rowid >= t.NextRowID {
 		t.NextRowID = rowid + 1
 	}
@@ -315,6 +316,7 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 			return Result{}, true, err
 		}
 		row.Values[col.Name] = cv
+		row.syncPositioned(t)
 		affected++
 	}
 	return Result{RowsAffected: affected}, true, nil
@@ -423,7 +425,7 @@ func fastInsertDML(s *persistedState, st *ast.InsertStmt, args []any) (Result, b
 	if err := validateInsertFast(s, t, data, row, rowid); err != nil {
 		return Result{}, true, err
 	}
-	data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+	data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
 	if rowid >= t.NextRowID {
 		t.NextRowID = rowid + 1
 	}
@@ -1256,7 +1258,7 @@ func execCreateTableAsSelect(s *persistedState, st *ast.CreateTableStmt, rawSQL 
 			}
 		}
 		rowid := t.NextRowID
-		data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+		data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
 		t.NextRowID++
 	}
 	data.rebuildRuntime(t)
@@ -1588,6 +1590,7 @@ func execAlterTable(s *persistedState, st *ast.AlterTableStmt) (Result, error) {
 			t.Columns = append(t.Columns, col)
 			for i := range s.Tables[t.Name].Rows {
 				s.Tables[t.Name].Rows[i].Values[col.Name] = col.Default
+				s.Tables[t.Name].Rows[i].syncPositioned(t)
 			}
 		case *ast.RenameTableCmd:
 			newName := qname(c.NewName)
@@ -1614,6 +1617,7 @@ func execAlterTable(s *persistedState, st *ast.AlterTableStmt) (Result, error) {
 			}
 			for i := range s.Tables[t.Name].Rows {
 				delete(s.Tables[t.Name].Rows[i].Values, name)
+				s.Tables[t.Name].Rows[i].syncPositioned(t)
 			}
 		default:
 			return Result{}, fmt.Errorf("unsupported ALTER TABLE command: %T", cmd)
@@ -1685,7 +1689,7 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 				return false, 0, err
 			}
 		}
-		data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+		data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
 		if rowid >= t.NextRowID {
 			t.NextRowID = rowid + 1
 		}
@@ -1803,6 +1807,7 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 			return err
 		}
 		row.Values = next
+		row.syncPositioned(t)
 		data.rebuildRuntime(t)
 		return nil
 	}
@@ -1901,6 +1906,7 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 			}
 		}
 		row.Values = next
+		row.syncPositioned(t)
 		changed = true
 		affected++
 	}
@@ -2022,12 +2028,14 @@ func validateDeleteReferences(s *persistedState, table string, old map[string]an
 						for _, col := range fk.Columns {
 							row.Values[col] = nil
 						}
+						row.syncPositioned(child)
 					case "set default":
 						for _, col := range fk.Columns {
 							if def, _, ok := child.Column(col); ok {
 								row.Values[col] = def.Default
 							}
 						}
+						row.syncPositioned(child)
 						if err := validateRow(s, child, childData, row.Values, row.RowID); err != nil {
 							return err
 						}
@@ -2080,16 +2088,19 @@ func applyUpdateReferences(s *persistedState, table string, old, next map[string
 					for i, refCol := range refCols {
 						row.Values[fk.Columns[i]] = next[refCol]
 					}
+					row.syncPositioned(child)
 				case "set null":
 					for _, col := range fk.Columns {
 						row.Values[col] = nil
 					}
+					row.syncPositioned(child)
 				case "set default":
 					for _, col := range fk.Columns {
 						if def, _, ok := child.Column(col); ok {
 							row.Values[col] = def.Default
 						}
 					}
+					row.syncPositioned(child)
 					if err := validateRow(s, child, childData, row.Values, row.RowID); err != nil {
 						return err
 					}

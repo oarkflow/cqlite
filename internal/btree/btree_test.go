@@ -61,6 +61,33 @@ func TestTreeSplitsAndScansInOrder(t *testing.T) {
 	}
 }
 
+func TestTreeSplitsThenCompactsAfterDeletes(t *testing.T) {
+	tr := NewWithOrder(4)
+	for i := 0; i < 80; i++ {
+		key := []byte(fmt.Sprintf("%03d", i))
+		tr.Put(key, []byte(fmt.Sprintf("v%03d", i)))
+	}
+	if tr.root.leaf {
+		t.Fatal("expected inserts to split root")
+	}
+	for i := 0; i < 76; i++ {
+		key := []byte(fmt.Sprintf("%03d", i))
+		if !tr.Delete(key) {
+			t.Fatalf("delete %s failed", key)
+		}
+	}
+	if !tr.root.leaf {
+		t.Fatal("expected delete compaction to collapse tree to one leaf")
+	}
+	want := map[string]string{
+		"076": "v076",
+		"077": "v077",
+		"078": "v078",
+		"079": "v079",
+	}
+	assertTreeMatchesMap(t, tr, want)
+}
+
 func TestTreeRandomOperations(t *testing.T) {
 	tr := NewWithOrder(5)
 	want := make(map[string]string)

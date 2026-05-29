@@ -16,14 +16,16 @@ const (
 )
 
 type Options struct {
-	CompatibilityMode string
-	PageSize          int
-	CacheSize         int
-	JournalMode       string
-	Synchronous       string
-	BufferPoolSize    int
-	SyncPolicy        SyncPolicy
-	DisableFileLock   bool
+	CompatibilityMode       string
+	PageSize                int
+	CacheSize               int
+	JournalMode             string
+	Synchronous             string
+	BufferPoolSize          int
+	SyncPolicy              SyncPolicy
+	DisableFileLock         bool
+	CheckpointIntervalBytes int64
+	CheckpointIntervalTx    uint64
 }
 
 type TxOptions struct {
