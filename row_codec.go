@@ -35,8 +35,9 @@ func encodeRowVersion(schema *catalog.Table, row rowVersion) ([]byte, error) {
 	binary.LittleEndian.PutUint32(fixed[24:28], uint32(len(schema.Columns)))
 	buf.Write(fixed[:])
 	row.ensurePositioned(schema)
+	values := row.positionedValues()
 	for i := range schema.Columns {
-		if err := encodeRowValue(&buf, row.Pos[i]); err != nil {
+		if err := encodeRowValue(&buf, values[i]); err != nil {
 			return nil, err
 		}
 	}

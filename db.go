@@ -50,6 +50,12 @@ type logicalRecord struct {
 
 const simpleWALMagic byte = 0xA5
 const txWALMagic byte = 0xA6
+const txSimpleWALMagic byte = 0xA7
+
+type simpleWALRecord struct {
+	plan simpleDMLPlan
+	args []any
+}
 
 func Open(path string, opts Options) (*DB, error) {
 	if path == "" {
@@ -154,7 +160,11 @@ func (d *DB) Begin(ctx context.Context, opts TxOptions) (*Tx, error) {
 		return nil, ctx.Err()
 	default:
 	}
-	return &Tx{db: d, tx: d.txmgr.Begin(opts.Isolation), writes: d.state.clone()}, nil
+	d.mu.Lock()
+	writes := d.state.clone()
+	baseApplied := d.applied
+	d.mu.Unlock()
+	return &Tx{db: d, tx: d.txmgr.Begin(opts.Isolation), writes: writes, baseApplied: baseApplied}, nil
 }
 
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error) {
@@ -389,15 +399,35 @@ func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
 	if !ok || plan.params != len(args) || len(args) > math.MaxUint16 {
 		return nil, false
 	}
-	data := make([]byte, 0, 64+len(args)*16)
+	return encodeSimpleWALPlan(plan, args)
+}
+
+func encodeSimpleWALPlan(plan simpleDMLPlan, args []any) ([]byte, bool) {
+	return appendSimpleWALPlan(make([]byte, 0, 64+len(args)*16), plan, args)
+}
+
+func appendSimpleWALPlan(data []byte, plan simpleDMLPlan, args []any) ([]byte, bool) {
 	data = append(data, simpleWALMagic, plan.kind)
-	data = appendString16(data, plan.table)
+	var ok bool
+	data, ok = appendString16OK(data, plan.table)
+	if !ok {
+		return nil, false
+	}
 	if plan.kind == 'd' {
-		data = appendString16(data, plan.where)
+		data, ok = appendString16OK(data, plan.where)
+		if !ok {
+			return nil, false
+		}
 	}
 	if plan.kind == 'u' {
-		data = appendString16(data, plan.col)
-		data = appendString16(data, plan.where)
+		data, ok = appendString16OK(data, plan.col)
+		if !ok {
+			return nil, false
+		}
+		data, ok = appendString16OK(data, plan.where)
+		if !ok {
+			return nil, false
+		}
 		data = binary.LittleEndian.AppendUint64(data, uint64(plan.inc))
 	}
 	data = binary.LittleEndian.AppendUint16(data, uint16(len(args)))
@@ -411,15 +441,128 @@ func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
 	return data, true
 }
 
+func decodeSimpleWALRecord(data []byte) (simpleWALRecord, bool, error) {
+	if len(data) < 2 || data[0] != simpleWALMagic {
+		return simpleWALRecord{}, false, nil
+	}
+	kind := data[1]
+	rest := data[2:]
+	table, rest, err := readString16(rest)
+	if err != nil {
+		return simpleWALRecord{}, true, err
+	}
+	plan := simpleDMLPlan{kind: kind, table: table}
+	switch kind {
+	case 'i':
+	case 'd':
+		plan.where, rest, err = readString16(rest)
+		if err != nil {
+			return simpleWALRecord{}, true, err
+		}
+	case 'u':
+		plan.col, rest, err = readString16(rest)
+		if err != nil {
+			return simpleWALRecord{}, true, err
+		}
+		plan.where, rest, err = readString16(rest)
+		if err != nil {
+			return simpleWALRecord{}, true, err
+		}
+		if len(rest) < 8 {
+			return simpleWALRecord{}, true, errors.New("truncated simple WAL update increment")
+		}
+		plan.inc = int64(binary.LittleEndian.Uint64(rest[:8]))
+		rest = rest[8:]
+	default:
+		return simpleWALRecord{}, true, errors.New("unknown simple WAL record")
+	}
+	if len(rest) < 2 {
+		return simpleWALRecord{}, true, errors.New("truncated simple WAL argument count")
+	}
+	n := int(binary.LittleEndian.Uint16(rest[:2]))
+	rest = rest[2:]
+	args := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		var v any
+		v, rest, err = readWALValue(rest)
+		if err != nil {
+			return simpleWALRecord{}, true, err
+		}
+		args = append(args, v)
+	}
+	if len(rest) != 0 {
+		return simpleWALRecord{}, true, errors.New("trailing simple WAL bytes")
+	}
+	plan.params = len(args)
+	return simpleWALRecord{plan: plan, args: args}, true, nil
+}
+
+func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
+	var (
+		res  Result
+		fast bool
+		err  error
+	)
+	switch rec.plan.kind {
+	case 'i':
+		res, fast, err = fastInsertValues(s, rec.plan.table, rec.args)
+	case 'u':
+		res, fast, err = fastIncrementUpdate(s, simpleIncrementUpdate{
+			table: rec.plan.table,
+			col:   rec.plan.col,
+			where: rec.plan.where,
+			inc:   rec.plan.inc,
+		}, rec.args)
+	case 'd':
+		res, fast, err = fastDeleteWhere(s, rec.plan.table, rec.plan.where, rec.args)
+	default:
+		return errors.New("unknown simple WAL mutation")
+	}
+	_ = res
+	if err != nil {
+		return err
+	}
+	if !fast {
+		return errors.New("could not replay simple WAL mutation")
+	}
+	return nil
+}
+
 func appendString16(dst []byte, s string) []byte {
+	dst, _ = appendString16OK(dst, s)
+	return dst
+}
+
+func appendString16OK(dst []byte, s string) ([]byte, bool) {
 	if len(s) > math.MaxUint16 {
-		return nil
+		return nil, false
 	}
 	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(s)))
-	return append(dst, s...)
+	return append(dst, s...), true
 }
 
 func decodeSimpleWAL(data []byte) (string, []any, bool, error) {
+	rec, ok, err := decodeSimpleWALRecord(data)
+	if !ok || err != nil {
+		return "", nil, ok, err
+	}
+	kind := rec.plan.kind
+	table := rec.plan.table
+	query := ""
+	switch kind {
+	case 'i':
+		query = "INSERT INTO " + table + " VALUES (" + strings.TrimRight(strings.Repeat("?,", len(rec.args)), ",") + ")"
+	case 'd':
+		query = "DELETE FROM " + table + " WHERE " + rec.plan.where + " = ?"
+	case 'u':
+		query = "UPDATE " + table + " SET " + rec.plan.col + " = " + rec.plan.col + " + " + strconv.FormatInt(rec.plan.inc, 10) + " WHERE " + rec.plan.where + " = ?"
+	default:
+		return "", nil, true, errors.New("unknown simple WAL record")
+	}
+	return query, rec.args, true, nil
+}
+
+func decodeSimpleWALLegacy(data []byte) (string, []any, bool, error) {
 	if len(data) < 2 || data[0] != simpleWALMagic {
 		return "", nil, false, nil
 	}
@@ -532,6 +675,9 @@ func appendWALValue(dst []byte, v any) ([]byte, bool) {
 }
 
 func encodeTransactionWAL(ops []logicalRecord) ([]byte, error) {
+	if data, ok := encodeSimpleTransactionWAL(ops); ok {
+		return data, nil
+	}
 	data, err := json.Marshal(ops)
 	if err != nil {
 		return nil, err
@@ -540,6 +686,102 @@ func encodeTransactionWAL(ops []logicalRecord) ([]byte, error) {
 	out = append(out, txWALMagic)
 	out = append(out, data...)
 	return out, nil
+}
+
+func encodeTxWAL(tx *Tx) ([]byte, error) {
+	if len(tx.ops) == 0 && len(tx.pendingInserts) > 0 {
+		if data, ok := encodePendingInsertTransactionWAL(tx); ok {
+			return data, nil
+		}
+	}
+	tx.flushPendingInsertLogs()
+	return encodeTransactionWAL(tx.ops)
+}
+
+func encodePendingInsertTransactionWAL(tx *Tx) ([]byte, bool) {
+	if len(tx.pendingInserts) == 0 || len(tx.pendingInserts) > math.MaxUint32 {
+		return nil, false
+	}
+	out := []byte{txSimpleWALMagic}
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(tx.pendingInserts)))
+	for _, ref := range tx.pendingInserts {
+		table := tx.writes.Catalog.Tables[ref.table]
+		data := tx.writes.Tables[ref.table]
+		if table == nil || data == nil || ref.index < 0 || ref.index >= len(data.Pending) {
+			return nil, false
+		}
+		plan := simpleDMLPlan{kind: 'i', table: table.Name, params: len(table.Columns)}
+		lengthAt := len(out)
+		out = binary.LittleEndian.AppendUint32(out, 0)
+		start := len(out)
+		var ok bool
+		out, ok = appendSimpleWALPlan(out, plan, (&data.Pending[ref.index]).positionedValues())
+		if !ok || len(out)-start > math.MaxUint32 {
+			return nil, false
+		}
+		binary.LittleEndian.PutUint32(out[lengthAt:lengthAt+4], uint32(len(out)-start))
+	}
+	return out, true
+}
+
+func encodeSimpleTransactionWAL(ops []logicalRecord) ([]byte, bool) {
+	if len(ops) == 0 || len(ops) > math.MaxUint32 {
+		return nil, false
+	}
+	out := []byte{txSimpleWALMagic}
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(ops)))
+	for _, op := range ops {
+		plan, planOK := simplePlan(op.SQL)
+		if !planOK || plan.params != len(op.Args) {
+			return nil, false
+		}
+		lengthAt := len(out)
+		out = binary.LittleEndian.AppendUint32(out, 0)
+		start := len(out)
+		var ok bool
+		out, ok = appendSimpleWALPlan(out, plan, op.Args)
+		if !ok || len(out)-start > math.MaxUint32 {
+			return nil, false
+		}
+		binary.LittleEndian.PutUint32(out[lengthAt:lengthAt+4], uint32(len(out)-start))
+	}
+	return out, true
+}
+
+func decodeSimpleTransactionWAL(data []byte) ([]simpleWALRecord, bool, error) {
+	if len(data) == 0 || data[0] != txSimpleWALMagic {
+		return nil, false, nil
+	}
+	data = data[1:]
+	if len(data) < 4 {
+		return nil, true, errors.New("truncated simple transaction WAL count")
+	}
+	n := int(binary.LittleEndian.Uint32(data[:4]))
+	data = data[4:]
+	records := make([]simpleWALRecord, 0, n)
+	for i := 0; i < n; i++ {
+		if len(data) < 4 {
+			return nil, true, errors.New("truncated simple transaction WAL record length")
+		}
+		size := int(binary.LittleEndian.Uint32(data[:4]))
+		data = data[4:]
+		if len(data) < size {
+			return nil, true, errors.New("truncated simple transaction WAL record")
+		}
+		rec, ok, err := decodeSimpleWALRecord(data[:size])
+		if err != nil {
+			return nil, true, err
+		}
+		if !ok {
+			return nil, true, errors.New("invalid simple transaction WAL record")
+		}
+		records = append(records, rec)
+		data = data[size:]
+	}
+	if len(data) != 0 {
+		return nil, true, errors.New("trailing simple transaction WAL bytes")
+	}
+	return records, true, nil
 }
 
 func decodeTransactionWAL(data []byte) ([]logicalRecord, bool, error) {
@@ -763,6 +1005,19 @@ func (d *DB) replay() error {
 			return nil
 		}
 		if rec.Type == wal.RecordCommit && rec.TxID > d.applied {
+			if records, ok, err := decodeSimpleTransactionWAL(rec.Data); err != nil {
+				return err
+			} else if ok {
+				d.state.NextTx = rec.TxID
+				for _, simple := range records {
+					if err := applySimpleWALRecord(&d.state, simple); err != nil {
+						return err
+					}
+				}
+				d.state.materializePending()
+				d.applied = rec.TxID
+				return nil
+			}
 			if ops, ok, err := decodeTransactionWAL(rec.Data); err != nil {
 				return err
 			} else if ok {
@@ -779,15 +1034,14 @@ func (d *DB) replay() error {
 				d.applied = rec.TxID
 				return nil
 			}
-			if query, args, ok, err := decodeSimpleWAL(rec.Data); err != nil {
+			if simple, ok, err := decodeSimpleWALRecord(rec.Data); err != nil {
 				return err
 			} else if ok {
 				d.state.NextTx = rec.TxID
-				if _, fast, err := fastSimpleDML(&d.state, query, args); err != nil {
+				if err := applySimpleWALRecord(&d.state, simple); err != nil {
 					return err
-				} else if !fast {
-					return errors.New("could not replay simple WAL record")
 				}
+				d.state.materializePending()
 				d.applied = rec.TxID
 				return nil
 			}
@@ -815,7 +1069,7 @@ func (d *DB) commit(tx *Tx) error {
 	if err := d.checkOpen(); err != nil {
 		return err
 	}
-	if len(tx.ops) == 0 {
+	if len(tx.ops) == 0 && len(tx.pendingInserts) == 0 {
 		return nil
 	}
 	if err := acquireDatabaseWriteLock(d.lock); err != nil {
@@ -824,19 +1078,102 @@ func (d *DB) commit(tx *Tx) error {
 	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	tx.writes.NextTx = next
-	data, err := encodeTransactionWAL(tx.ops)
+	pendingOnly, err := d.validatePendingOnly(tx, d.applied != tx.baseApplied)
+	if err != nil {
+		return err
+	}
+	data, err := encodeTxWAL(tx)
 	if err != nil {
 		return err
 	}
 	if err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: next, Data: data}, d.opts.SyncPolicy == SyncFull); err != nil {
 		return err
 	}
+	if pendingOnly {
+		d.applyPendingOnly(tx, next)
+		d.applied = next
+		if err := d.maybeCheckpointLocked(context.Background()); err != nil {
+			return err
+		}
+		return nil
+	}
+	tx.writes.materializePending()
 	d.state = tx.writes
 	d.applied = next
 	if err := d.maybeCheckpointLocked(context.Background()); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (d *DB) validatePendingOnly(tx *Tx, revalidateConflicts bool) (bool, error) {
+	if tx.writes.Pragmas.SchemaVer != d.state.Pragmas.SchemaVer || len(tx.writes.Catalog.Tables) != len(d.state.Catalog.Tables) {
+		return false, nil
+	}
+	hasPending := false
+	for name, data := range tx.writes.Tables {
+		if data == nil {
+			continue
+		}
+		if !data.deferRuntime || !data.rowsShared || len(data.Rows) != data.baseRows {
+			return false, nil
+		}
+		if len(data.Pending) > 0 {
+			hasPending = true
+		}
+		if _, ok := d.state.Tables[name]; !ok {
+			return false, nil
+		}
+		if _, ok := d.state.Catalog.Tables[name]; !ok {
+			return false, nil
+		}
+	}
+	if !hasPending {
+		return false, nil
+	}
+	if revalidateConflicts {
+		for name, data := range tx.writes.Tables {
+			if len(data.Pending) == 0 {
+				continue
+			}
+			liveData := d.state.Tables[name]
+			liveTable := d.state.Catalog.Tables[name]
+			if liveData == nil || liveTable == nil {
+				return false, nil
+			}
+			for _, row := range data.Pending {
+				if row.Values == nil {
+					if err := validateIntegerPrimaryKeyFast(liveTable, liveData, row.RowID, integerPrimaryKeyColumn(liveTable)); err != nil {
+						return false, err
+					}
+				} else {
+					if err := validateInsertFast(&d.state, liveTable, liveData, row.Values, row.RowID); err != nil {
+						return false, err
+					}
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
+	d.state.NextTx = next
+	d.state.Pragmas = tx.writes.Pragmas
+	for name, data := range tx.writes.Tables {
+		if len(data.Pending) == 0 {
+			continue
+		}
+		liveData := d.state.Tables[name]
+		liveTable := d.state.Catalog.Tables[name]
+		txTable := tx.writes.Catalog.Tables[name]
+		for _, row := range data.Pending {
+			row.Created = next
+			liveData.Rows = append(liveData.Rows, row)
+			liveData.addRuntime(liveTable, len(liveData.Rows)-1)
+		}
+		liveTable.NextRowID = txTable.NextRowID
+	}
 }
 
 func (d *DB) Checkpoint(ctx context.Context) error {
@@ -1168,18 +1505,26 @@ func (d *DB) checkOpen() error {
 }
 
 type Tx struct {
-	db         *DB
-	tx         *txn.Tx
-	writes     persistedState
-	savepoints []savepoint
-	ops        []logicalRecord
-	closed     bool
+	db             *DB
+	tx             *txn.Tx
+	writes         persistedState
+	baseApplied    uint64
+	savepoints     []savepoint
+	ops            []logicalRecord
+	pendingInserts []pendingInsertRef
+	closed         bool
 }
 
 type savepoint struct {
-	name  string
-	state persistedState
-	ops   int
+	name           string
+	state          persistedState
+	ops            int
+	pendingInserts int
+}
+
+type pendingInsertRef struct {
+	table string
+	index int
 }
 
 func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error) {
@@ -1213,14 +1558,59 @@ func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error
 }
 
 func (t *Tx) logOp(query string, args []any) {
+	if ref, ok := t.pendingInsertRef(query, args); ok && len(t.ops) == 0 {
+		t.pendingInserts = append(t.pendingInserts, ref)
+		return
+	}
+	t.flushPendingInsertLogs()
 	copied := append([]any(nil), args...)
 	t.ops = append(t.ops, logicalRecord{SQL: query, Args: copied})
+}
+
+func (t *Tx) pendingInsertRef(query string, args []any) (pendingInsertRef, bool) {
+	plan, ok := simplePlan(query)
+	if !ok || plan.kind != 'i' || plan.params != len(args) {
+		return pendingInsertRef{}, false
+	}
+	table, ok := t.writes.Catalog.Table(plan.table)
+	if !ok || !canFastPositionedInsert(&t.writes, table) {
+		return pendingInsertRef{}, false
+	}
+	data := t.writes.Tables[table.Name]
+	if data == nil || len(data.Pending) == 0 {
+		return pendingInsertRef{}, false
+	}
+	return pendingInsertRef{table: table.Name, index: len(data.Pending) - 1}, true
+}
+
+func (t *Tx) flushPendingInsertLogs() {
+	if len(t.pendingInserts) == 0 {
+		return
+	}
+	for _, ref := range t.pendingInserts {
+		table := t.writes.Catalog.Tables[ref.table]
+		data := t.writes.Tables[ref.table]
+		if table == nil || data == nil || ref.index < 0 || ref.index >= len(data.Pending) {
+			continue
+		}
+		row := data.Pending[ref.index]
+		t.ops = append(t.ops, logicalRecord{
+			SQL:  insertSQLForTable(table),
+			Args: append([]any(nil), row.positionedValues()...),
+		})
+	}
+	t.pendingInserts = nil
+}
+
+func insertSQLForTable(t *catalog.Table) string {
+	return "INSERT INTO " + t.Name + " VALUES (" + strings.TrimRight(strings.Repeat("?,", len(t.Columns)), ",") + ")"
 }
 
 func (t *Tx) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if err := t.check(); err != nil {
 		return nil, err
 	}
+	t.writes.materializePending()
 	parseMu.Lock()
 	defer parseMu.Unlock()
 	return queryRows(ctx, &t.writes, query, args...)
@@ -1249,6 +1639,9 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		_, err := t.execTransactionCommand(cmd)
 		return true, err
 	}
+	if !looksLikeTransactionControl(query) {
+		return false, nil
+	}
 	stmt, err := parseStatementCached(query)
 	if err != nil {
 		return false, nil
@@ -1270,12 +1663,14 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 			t.writes = t.db.state.clone()
 			t.savepoints = nil
 			t.ops = nil
+			t.pendingInserts = nil
 			return true, nil
 		}
 		for i := len(t.savepoints) - 1; i >= 0; i-- {
 			if t.savepoints[i].name == name {
 				t.writes = t.savepoints[i].state.clone()
 				t.ops = t.ops[:t.savepoints[i].ops]
+				t.pendingInserts = t.pendingInserts[:t.savepoints[i].pendingInserts]
 				t.savepoints = t.savepoints[:i+1]
 				return true, nil
 			}
@@ -1285,7 +1680,7 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		if name == "" {
 			return true, errors.New("savepoint name is required")
 		}
-		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone(), ops: len(t.ops)})
+		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts)})
 		return true, nil
 	case "release", "release_savepoint":
 		if name == "" {
@@ -1303,6 +1698,34 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 	}
 }
 
+func looksLikeTransactionControl(query string) bool {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return false
+	}
+	end := 0
+	for end < len(q) {
+		c := q[end]
+		if c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			break
+		}
+		end++
+	}
+	first := q[:end]
+	switch {
+	case strings.EqualFold(first, "begin"),
+		strings.EqualFold(first, "start"),
+		strings.EqualFold(first, "commit"),
+		strings.EqualFold(first, "end"),
+		strings.EqualFold(first, "rollback"),
+		strings.EqualFold(first, "savepoint"),
+		strings.EqualFold(first, "release"):
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 	switch cmd.kind {
 	case "begin":
@@ -1313,6 +1736,7 @@ func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 		t.writes = t.db.state.clone()
 		t.savepoints = nil
 		t.ops = nil
+		t.pendingInserts = nil
 		return Result{}, nil
 	case "rollback_to":
 		if cmd.name == "" {
@@ -1322,6 +1746,7 @@ func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 			if t.savepoints[i].name == cmd.name {
 				t.writes = t.savepoints[i].state.clone()
 				t.ops = t.ops[:t.savepoints[i].ops]
+				t.pendingInserts = t.pendingInserts[:t.savepoints[i].pendingInserts]
 				t.savepoints = t.savepoints[:i+1]
 				return Result{}, nil
 			}
@@ -1331,7 +1756,7 @@ func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 		if cmd.name == "" {
 			return Result{}, errors.New("savepoint name is required")
 		}
-		t.savepoints = append(t.savepoints, savepoint{name: cmd.name, state: t.writes.clone(), ops: len(t.ops)})
+		t.savepoints = append(t.savepoints, savepoint{name: cmd.name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts)})
 		return Result{}, nil
 	case "release":
 		if cmd.name == "" {

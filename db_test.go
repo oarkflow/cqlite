@@ -567,9 +567,18 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 	defer log.Close()
 	var snapshots int
 	var txBatches int
+	var simpleTxBatches int
 	if err := log.Replay(func(rec wal.Record) error {
 		if rec.Type == wal.RecordSnapshot {
 			snapshots++
+		}
+		if records, ok, err := decodeSimpleTransactionWAL(rec.Data); err != nil {
+			return err
+		} else if ok {
+			simpleTxBatches++
+			if len(records) == 0 {
+				t.Fatal("simple transaction WAL batch was empty")
+			}
 		}
 		if _, ok, err := decodeTransactionWAL(rec.Data); err != nil {
 			return err
@@ -583,7 +592,7 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 	if snapshots != 0 {
 		t.Fatalf("transaction commit wrote %d state snapshot WAL records", snapshots)
 	}
-	if txBatches == 0 {
+	if txBatches+simpleTxBatches == 0 {
 		t.Fatal("expected at least one transaction batch WAL record")
 	}
 
@@ -608,6 +617,188 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 		t.Fatalf("unexpected recovered row after savepoint rollback: %#v", row)
 	}
 	_ = d.Close()
+}
+
+func TestParameterizedTransactionUsesSimpleMutationWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE simple_tx_wal (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(ctx, TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO simple_tx_wal VALUES (?, ?)`, int64(1), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO simple_tx_wal VALUES (?, ?)`, int64(2), "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	log, err := wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var simpleTxBatches int
+	if err := log.Replay(func(rec wal.Record) error {
+		records, ok, err := decodeSimpleTransactionWAL(rec.Data)
+		if err != nil {
+			return err
+		}
+		if ok {
+			simpleTxBatches++
+			if len(records) != 2 {
+				t.Fatalf("simple mutation WAL records = %d, want 2", len(records))
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if simpleTxBatches != 1 {
+		t.Fatalf("simple transaction WAL batches = %d, want 1", simpleTxBatches)
+	}
+	_ = d.Close()
+
+	recovered, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	rows, err := recovered.Query(ctx, `SELECT msg FROM simple_tx_wal WHERE id = ?`, int64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "two" {
+		t.Fatalf("recovered simple mutation WAL row = %#v ok=%v", row, ok)
+	}
+}
+
+func TestFailedPendingOnlyCommitDoesNotAppendRecoverableWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE failed_commit_wal (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(ctx, TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO failed_commit_wal VALUES (?, ?)`, int64(1), "tx"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO failed_commit_wal VALUES (?, ?)`, int64(1), "live"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err == nil {
+		t.Fatal("conflicting transaction commit succeeded")
+	}
+	_ = d.Close()
+
+	recovered, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	rows, err := recovered.Query(ctx, `SELECT msg FROM failed_commit_wal WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "live" {
+		t.Fatalf("recovered row after failed commit = %#v ok=%v", row, ok)
+	}
+	if row, ok := rows.Next(); ok {
+		t.Fatalf("unexpected extra row after failed commit recovery: %#v", row)
+	}
+}
+
+func TestTransactionDeferredRuntimeSeesOwnRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE tx_visible (id INTEGER PRIMARY KEY, name TEXT UNIQUE, score INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(ctx, TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(ctx, `INSERT INTO tx_visible VALUES (?, ?, ?)`, int64(1), "ada", int64(10)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, `SELECT score FROM tx_visible WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != int64(10) {
+		t.Fatalf("tx-local primary-key lookup row = %#v ok=%v", row, ok)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tx_visible SET score = score + 2 WHERE id = ?`, int64(1)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = tx.Query(ctx, `SELECT score FROM tx_visible WHERE name = ?`, "ada")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok = rows.Next()
+	if !ok || row[0] != int64(12) {
+		t.Fatalf("tx-local indexed lookup after update row = %#v ok=%v", row, ok)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM tx_visible WHERE id = ?`, int64(1)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = tx.Query(ctx, `SELECT score FROM tx_visible WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); ok {
+		t.Fatalf("deleted tx-local row remained visible: %#v", row)
+	}
+}
+
+func TestTransactionDeferredRuntimeRejectsDuplicateRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE tx_dupes (id INTEGER PRIMARY KEY, name TEXT UNIQUE)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(ctx, TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(ctx, `INSERT INTO tx_dupes VALUES (?, ?)`, int64(1), "ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO tx_dupes VALUES (?, ?)`, int64(1), "grace"); err == nil {
+		t.Fatal("duplicate primary key inside transaction was accepted")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO tx_dupes VALUES (?, ?)`, int64(2), "ada"); err == nil {
+		t.Fatal("duplicate unique index value inside transaction was accepted")
+	}
 }
 
 func TestWALCrashStyleRecoveryWithIndex(t *testing.T) {

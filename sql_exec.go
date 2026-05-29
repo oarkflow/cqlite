@@ -115,6 +115,7 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 	if ins, ok := stmt.(*ast.InsertStmt); ok {
 		return fastInsertDML(s, ins, args)
 	}
+	s.materializePending()
 	upd, ok := stmt.(*ast.UpdateStmt)
 	if !ok || len(upd.Set) != 1 {
 		return Result{}, false, nil
@@ -146,6 +147,9 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 		return Result{RowsAffected: 0}, true, nil
 	}
 	data := s.Tables[t.Name]
+	if data.runtimeDeferred() {
+		return Result{}, false, nil
+	}
 	pos, ok := data.lookupRowID(id)
 	if !ok || data.Rows[pos].Deleted != 0 {
 		return Result{RowsAffected: 0}, true, nil
@@ -160,13 +164,21 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 	if countParams(asn.Value) > 0 {
 		return Result{}, false, nil
 	}
-	nextValue, ok, err := fastUpdateValue(asn.Value, data.Rows[pos].Values)
+	rowValues := data.Rows[pos].Values
+	if rowValues == nil {
+		rowValues = positionedToValues(t, data.Rows[pos].positionedValues())
+	}
+	nextValue, ok, err := fastUpdateValue(asn.Value, rowValues)
 	if err != nil || !ok {
 		return Result{}, ok, err
 	}
 	cv, err := coerce(col, nextValue, t.Strict)
 	if err != nil {
 		return Result{}, true, err
+	}
+	data.copyRow(pos)
+	if data.Rows[pos].Values == nil {
+		data.Rows[pos].Values = positionedToValues(t, data.Rows[pos].positionedValues())
 	}
 	data.Rows[pos].Values[col.Name] = cv
 	data.Rows[pos].syncPositioned(t)
@@ -185,6 +197,7 @@ func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, e
 	case 'i':
 		return fastInsertValues(s, plan.table, args)
 	case 'u':
+		s.materializePending()
 		return fastIncrementUpdate(s, simpleIncrementUpdate{
 			table: plan.table,
 			col:   plan.col,
@@ -192,6 +205,7 @@ func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, e
 			inc:   plan.inc,
 		}, args)
 	case 'd':
+		s.materializePending()
 		return fastDeleteWhere(s, plan.table, plan.where, args)
 	default:
 		return Result{}, false, nil
@@ -224,6 +238,9 @@ func fastInsertValues(s *persistedState, table string, args []any) (Result, bool
 	if len(args) != len(t.Columns) {
 		return Result{}, false, nil
 	}
+	if canFastPositionedInsert(s, t) {
+		return fastInsertPositioned(s, t, data, args)
+	}
 	row := make(map[string]any, len(t.Columns))
 	for i, col := range t.Columns {
 		cv, err := coerce(col, args[i], t.Strict)
@@ -243,12 +260,75 @@ func fastInsertValues(s *persistedState, table string, args []any) (Result, bool
 	if err := validateInsertFast(s, t, data, row, rowid); err != nil {
 		return Result{}, true, err
 	}
-	data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
+	data.stageRow(t, newRowVersion(t, rowid, row, s.NextTx))
 	if rowid >= t.NextRowID {
 		t.NextRowID = rowid + 1
 	}
-	data.addRuntime(t, len(data.Rows)-1)
 	return Result{RowsAffected: 1, LastInsertID: rowid}, true, nil
+}
+
+func canFastPositionedInsert(s *persistedState, t *catalog.Table) bool {
+	if s.Pragmas.ForeignKeys || len(t.ForeignKeys) > 0 || len(t.Checks) > 0 || len(t.Indexes) > 0 {
+		return false
+	}
+	ipk := integerPrimaryKeyColumn(t)
+	for _, col := range t.Columns {
+		if col.Check != "" || col.References != nil {
+			return false
+		}
+		if (col.PrimaryKey || col.Unique) && col.Name != ipk {
+			return false
+		}
+	}
+	return ipk != ""
+}
+
+func fastInsertPositioned(s *persistedState, t *catalog.Table, data *tableData, args []any) (Result, bool, error) {
+	pos := make([]any, len(t.Columns))
+	rowid := t.NextRowID
+	pkName := integerPrimaryKeyColumn(t)
+	pkIndex := -1
+	for i, col := range t.Columns {
+		cv, err := coerce(col, args[i], t.Strict)
+		if err != nil {
+			return Result{}, true, err
+		}
+		if col.NotNull && cv == nil {
+			return Result{}, true, fmt.Errorf("column %s cannot be null", col.Name)
+		}
+		pos[i] = cv
+		if col.Name == pkName {
+			pkIndex = i
+		}
+	}
+	if pkIndex >= 0 {
+		if pos[pkIndex] == nil {
+			pos[pkIndex] = rowid
+		} else if id, ok := asInt(pos[pkIndex]); ok {
+			rowid = id
+		}
+	}
+	if err := validateIntegerPrimaryKeyFast(t, data, rowid, pkName); err != nil {
+		return Result{}, true, err
+	}
+	data.stageRow(t, newPositionedRowVersion(rowid, pos, s.NextTx))
+	if rowid >= t.NextRowID {
+		t.NextRowID = rowid + 1
+	}
+	return Result{RowsAffected: 1, LastInsertID: rowid}, true, nil
+}
+
+func validateIntegerPrimaryKeyFast(t *catalog.Table, data *tableData, rowid int64, pkName string) error {
+	if data.rowids == nil {
+		data.rebuildRuntime(t)
+	}
+	if pos, ok := data.lookupRowID(rowid); ok && pos >= 0 && pos < len(data.Rows) && data.Rows[pos].Deleted == 0 {
+		return fmt.Errorf("unique constraint failed: %s.%s", t.Name, pkName)
+	}
+	if data.pendingRowIDConflict(rowid) {
+		return fmt.Errorf("unique constraint failed: %s.%s", t.Name, pkName)
+	}
+	return nil
 }
 
 type simpleIncrementUpdate struct {
@@ -267,7 +347,7 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 		return Result{}, true, fmt.Errorf("table does not exist: %s", upd.table)
 	}
 	pk := integerPrimaryKeyColumn(t)
-	if pk == "" || upd.where != pk {
+	if pk != upd.where && usableIndexForColumn(s, upd.table, upd.where) == "" {
 		return Result{}, false, nil
 	}
 	col, _, ok := t.Column(upd.col)
@@ -280,6 +360,9 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 	data := s.Tables[t.Name]
 	if data == nil {
 		return Result{RowsAffected: 0}, true, nil
+	}
+	if data.runtimeDeferred() {
+		return Result{}, false, nil
 	}
 	var positions []int
 	if pk != "" && upd.where == pk {
@@ -307,13 +390,18 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 		if row.Deleted != 0 {
 			continue
 		}
-		cur, ok := asInt(row.Values[col.Name])
+		cur, ok := asInt(row.value(t, col.Name))
 		if !ok {
 			return Result{}, false, nil
 		}
 		cv, err := coerce(col, cur+upd.inc, t.Strict)
 		if err != nil {
 			return Result{}, true, err
+		}
+		data.copyRow(pos)
+		row = &data.Rows[pos]
+		if row.Values == nil {
+			row.Values = positionedToValues(t, row.positionedValues())
 		}
 		row.Values[col.Name] = cv
 		row.syncPositioned(t)
@@ -333,6 +421,9 @@ func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result
 	data := s.Tables[t.Name]
 	if data == nil {
 		return Result{RowsAffected: 0}, true, nil
+	}
+	if data.runtimeDeferred() {
+		return Result{}, false, nil
 	}
 	var positions []int
 	if pk := integerPrimaryKeyColumn(t); pk == where || where == "rowid" || where == "_rowid_" || where == "oid" {
@@ -356,6 +447,7 @@ func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result
 		if pos < 0 || pos >= len(data.Rows) {
 			continue
 		}
+		data.copyRow(pos)
 		row := &data.Rows[pos]
 		if row.Deleted != 0 {
 			continue
@@ -425,11 +517,10 @@ func fastInsertDML(s *persistedState, st *ast.InsertStmt, args []any) (Result, b
 	if err := validateInsertFast(s, t, data, row, rowid); err != nil {
 		return Result{}, true, err
 	}
-	data.Rows = append(data.Rows, newRowVersion(t, rowid, row, s.NextTx))
+	data.stageRow(t, newRowVersion(t, rowid, row, s.NextTx))
 	if rowid >= t.NextRowID {
 		t.NextRowID = rowid + 1
 	}
-	data.addRuntime(t, len(data.Rows)-1)
 	return Result{RowsAffected: 1, LastInsertID: rowid}, true, nil
 }
 
@@ -445,6 +536,15 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 					data.rebuildRuntime(t)
 				}
 				if pos, ok := data.lookupRowID(rowid); ok && pos >= 0 && pos < len(data.Rows) && data.Rows[pos].Deleted == 0 {
+					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
+				}
+				for i := data.baseRows; data.deferRuntime && i < len(data.Rows); i++ {
+					row := data.Rows[i]
+					if row.Deleted == 0 && row.RowID == rowid {
+						return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
+					}
+				}
+				if data.pendingRowIDConflict(rowid) {
 					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
 				}
 				continue
@@ -471,6 +571,27 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 			}
 			return true
 		})
+		for i := data.baseRows; data.deferRuntime && !conflict && i < len(data.Rows); i++ {
+			row := data.Rows[i]
+			if row.Deleted != 0 {
+				continue
+			}
+			same := true
+			for _, col := range idx.Columns {
+				same = same && valuesEqual(row.Values[col], values[col], columnCollation(t, col))
+			}
+			conflict = same
+		}
+		for _, row := range data.Pending {
+			if conflict || row.Deleted != 0 {
+				continue
+			}
+			same := true
+			for _, col := range idx.Columns {
+				same = same && valuesEqual(row.Values[col], values[col], columnCollation(t, col))
+			}
+			conflict = same
+		}
 		if conflict {
 			return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
 		}
@@ -641,6 +762,31 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 	if plan.order.col != "" && len(plan.conds) > 0 && !simpleSelectOrderCompatible(plan, args) {
 		return nil, false, nil
 	}
+	width := len(projectors)
+	out := make([]any, 0, 16*width)
+	emit := func(row rowVersion) {
+		for _, p := range projectors {
+			out = append(out, p(row))
+		}
+	}
+	if plan.order.col == "" {
+		if used := simpleSelectEachCandidatePosition(s, plan, data, args, func(pos int) bool {
+			if pos < 0 || pos >= len(data.Rows) {
+				return true
+			}
+			row := data.Rows[pos]
+			if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
+				return true
+			}
+			emit(row)
+			return true
+		}); used {
+			if plan.limit >= 0 {
+				out = applySimpleFlatLimit(out, width, plan.limit, plan.offset)
+			}
+			return isql.NewFlatRows(cols, out), true, nil
+		}
+	}
 	positions := simpleSelectCandidatePositions(s, plan, data, args)
 	if positions == nil && plan.order.col != "" {
 		positions = simpleSelectOrderPositions(s, plan, data)
@@ -648,17 +794,11 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 	if positions != nil && plan.order.desc {
 		reverseInts(positions)
 	}
-	width := len(projectors)
 	capHint := len(data.Rows)
 	if positions != nil {
 		capHint = len(positions)
 	}
-	out := make([]any, 0, capHint*width)
-	emit := func(row rowVersion) {
-		for _, p := range projectors {
-			out = append(out, p(row))
-		}
-	}
+	out = make([]any, 0, capHint*width)
 	if positions != nil {
 		for _, pos := range positions {
 			if pos < 0 || pos >= len(data.Rows) {
@@ -886,17 +1026,28 @@ func simpleSelectProjectors(t *catalog.Table, cols []string) ([]string, []func(r
 			projectors = append(projectors, func(row rowVersion) any { return row.RowID })
 			continue
 		}
-		if _, _, ok := t.Column(col); !ok {
+		if _, idx, ok := t.Column(col); !ok {
 			return nil, nil, false
+		} else {
+			c := col
+			colIdx := idx
+			names = append(names, name)
+			projectors = append(projectors, func(row rowVersion) any {
+				if v, ok := row.positionalAt(colIdx); ok {
+					return v
+				}
+				return row.Values[c]
+			})
+			continue
 		}
-		c := col
-		names = append(names, name)
-		projectors = append(projectors, func(row rowVersion) any { return row.Values[c] })
 	}
 	return names, projectors, true
 }
 
 func simpleSelectCandidatePositions(s *persistedState, plan simpleSelectPlan, data *tableData, args []any) []int {
+	if data.runtimeDeferred() {
+		return nil
+	}
 	for _, cond := range plan.conds {
 		if cond.op != "=" {
 			continue
@@ -916,7 +1067,29 @@ func simpleSelectCandidatePositions(s *persistedState, plan simpleSelectPlan, da
 	return rangeCandidatePositions(s, plan.table, data, col, start, end)
 }
 
+func simpleSelectEachCandidatePosition(s *persistedState, plan simpleSelectPlan, data *tableData, args []any, fn func(int) bool) bool {
+	if data.runtimeDeferred() {
+		return false
+	}
+	for _, cond := range plan.conds {
+		if cond.op != "=" {
+			continue
+		}
+		v, ok := simpleSelectCondValue(cond, args)
+		if !ok {
+			return true
+		}
+		if used := eachSimpleSelectEquality(s, plan.table, data, cond.col, v, fn); used {
+			return true
+		}
+	}
+	return false
+}
+
 func simpleSelectOrderPositions(s *persistedState, plan simpleSelectPlan, data *tableData) []int {
+	if data.runtimeDeferred() {
+		return nil
+	}
 	t, _ := s.Catalog.Table(plan.table)
 	col := plan.order.col
 	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
@@ -940,6 +1113,9 @@ func simpleSelectOrderCompatible(plan simpleSelectPlan, args []any) bool {
 }
 
 func lookupSimpleSelectEquality(s *persistedState, table string, data *tableData, col string, val any) ([]int, bool) {
+	if data.runtimeDeferred() {
+		return nil, false
+	}
 	t, _ := s.Catalog.Table(table)
 	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
 		id, ok := asInt(val)
@@ -964,6 +1140,28 @@ func lookupSimpleSelectEquality(s *persistedState, table string, data *tableData
 		}
 	}
 	return data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, val)), true
+}
+
+func eachSimpleSelectEquality(s *persistedState, table string, data *tableData, col string, val any, fn func(int) bool) bool {
+	t, _ := s.Catalog.Table(table)
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		return false
+	}
+	idxName := usableIndexForColumn(s, table, col)
+	if idxName == "" {
+		return false
+	}
+	var idx catalog.Index
+	for _, candidate := range t.Indexes {
+		if candidate.Name == idxName {
+			idx = candidate
+			break
+		}
+	}
+	key := runtimeIndexLookupKeyBytes(idx, val)
+	used := true
+	data.eachIndexPositionBytes(idxName, key, fn)
+	return used
 }
 
 func simpleSelectRange(conds []simpleSelectCond, args []any) (string, *rangeBound, *rangeBound, bool) {
@@ -1004,7 +1202,7 @@ func simpleSelectMatches(t *catalog.Table, plan simpleSelectPlan, row rowVersion
 		if cond.col == "rowid" || cond.col == "_rowid_" || cond.col == "oid" {
 			left = row.RowID
 		} else {
-			left = row.Values[cond.col]
+			left = row.value(t, cond.col)
 		}
 		c, ok := compareValues(left, right, columnCollation(t, cond.col))
 		if !ok {
@@ -1589,6 +1787,7 @@ func execAlterTable(s *persistedState, st *ast.AlterTableStmt) (Result, error) {
 			}
 			t.Columns = append(t.Columns, col)
 			for i := range s.Tables[t.Name].Rows {
+				s.Tables[t.Name].copyRow(i)
 				s.Tables[t.Name].Rows[i].Values[col.Name] = col.Default
 				s.Tables[t.Name].Rows[i].syncPositioned(t)
 			}
@@ -1616,6 +1815,7 @@ func execAlterTable(s *persistedState, st *ast.AlterTableStmt) (Result, error) {
 				t.ForeignKeys[i].Columns = removeString(t.ForeignKeys[i].Columns, name)
 			}
 			for i := range s.Tables[t.Name].Rows {
+				s.Tables[t.Name].copyRow(i)
 				delete(s.Tables[t.Name].Rows[i].Values, name)
 				s.Tables[t.Name].Rows[i].syncPositioned(t)
 			}
@@ -1806,6 +2006,8 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 		if err := validateRow(s, t, data, next, row.RowID); err != nil {
 			return err
 		}
+		data.copyRow(i)
+		row = &data.Rows[i]
 		row.Values = next
 		row.syncPositioned(t)
 		data.rebuildRuntime(t)
@@ -1821,6 +2023,8 @@ func deleteReplaceConflicts(s *persistedState, t *catalog.Table, data *tableData
 			continue
 		}
 		if rowConflictsForReplace(t, row.Values, incoming) {
+			data.copyRow(i)
+			row = &data.Rows[i]
 			row.Deleted = s.NextTx
 		}
 	}
@@ -1872,6 +2076,7 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 		if row.Deleted != 0 {
 			continue
 		}
+		row.ensureValues(t)
 		whereBind := binder{args: args, pos: setParamCount}
 		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
 		if err != nil {
@@ -1905,6 +2110,8 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 				return Result{}, err
 			}
 		}
+		data.copyRow(i)
+		row = &data.Rows[i]
 		row.Values = next
 		row.syncPositioned(t)
 		changed = true
@@ -1956,6 +2163,7 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 		if row.Deleted != 0 {
 			continue
 		}
+		row.ensureValues(s.Catalog.Tables[catalog.Normalize(name)])
 		whereBind := bind
 		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
 		if err != nil {
@@ -1967,6 +2175,8 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 					return Result{}, err
 				}
 			}
+			data.copyRow(i)
+			row = &data.Rows[i]
 			row.Deleted = s.NextTx
 			changed = true
 			affected++
@@ -2021,6 +2231,8 @@ func validateDeleteReferences(s *persistedState, table string, old map[string]an
 					match = match && reflect.DeepEqual(row.Values[fk.Columns[i]], old[refCol])
 				}
 				if match {
+					childData.copyRow(i)
+					row = &childData.Rows[i]
 					switch fk.OnDelete {
 					case "cascade":
 						row.Deleted = s.NextTx
@@ -2083,6 +2295,8 @@ func applyUpdateReferences(s *persistedState, table string, old, next map[string
 				if !match {
 					continue
 				}
+				childData.copyRow(i)
+				row = &childData.Rows[i]
 				switch fk.OnUpdate {
 				case "cascade":
 					for i, refCol := range refCols {
@@ -2234,7 +2448,7 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 	if len(st.OrderBy) > 0 {
 		return nil, false, nil
 	}
-	predicate, ok, err := fastPredicate(st.Where, args)
+	predicate, ok, err := fastPredicate(t, st.Where, args)
 	if err != nil {
 		return nil, true, err
 	}
@@ -2464,10 +2678,16 @@ func fastProjectors(t *catalog.Table, cols []ast.SelectColumn) ([]string, []func
 	var projectors []func(rowVersion) any
 	for _, sel := range cols {
 		if sel.Star {
-			for _, col := range t.Columns {
+			for idx, col := range t.Columns {
 				c := col.Name
+				colIdx := idx
 				names = append(names, c)
-				projectors = append(projectors, func(row rowVersion) any { return row.Values[c] })
+				projectors = append(projectors, func(row rowVersion) any {
+					if v, ok := row.positionalAt(colIdx); ok {
+						return v
+					}
+					return row.Values[c]
+				})
 			}
 			continue
 		}
@@ -2484,17 +2704,25 @@ func fastProjectors(t *catalog.Table, cols []ast.SelectColumn) ([]string, []func
 			projectors = append(projectors, func(row rowVersion) any { return row.RowID })
 			continue
 		}
-		if _, _, ok := t.Column(col); !ok {
+		if _, idx, ok := t.Column(col); !ok {
 			return nil, nil, false
+		} else {
+			c := col
+			colIdx := idx
+			names = append(names, name)
+			projectors = append(projectors, func(row rowVersion) any {
+				if v, ok := row.positionalAt(colIdx); ok {
+					return v
+				}
+				return row.Values[c]
+			})
+			continue
 		}
-		c := col
-		names = append(names, name)
-		projectors = append(projectors, func(row rowVersion) any { return row.Values[c] })
 	}
 	return names, projectors, true
 }
 
-func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, error) {
+func fastPredicate(t *catalog.Table, expr ast.Expr, args []any) (func(rowVersion) bool, bool, error) {
 	if expr == nil {
 		return func(rowVersion) bool { return true }, true, nil
 	}
@@ -2504,11 +2732,11 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 	}
 	switch be.Op {
 	case lexer.AND, lexer.OR:
-		left, ok, err := fastPredicate(be.Left, args)
+		left, ok, err := fastPredicate(t, be.Left, args)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
-		right, ok, err := fastPredicate(be.Right, args)
+		right, ok, err := fastPredicate(t, be.Right, args)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
@@ -2531,6 +2759,12 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 		valueExpr = be.Left
 		columnOnLeft = false
 	}
+	colIdx := -1
+	if col != "rowid" && col != "_rowid_" && col != "oid" {
+		if _, idx, ok := t.Column(col); ok {
+			colIdx = idx
+		}
+	}
 	val, err := evalExpr(valueExpr, nil, &binder{args: args})
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported expression") {
@@ -2542,8 +2776,10 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 		rv := any(nil)
 		if col == "rowid" || col == "_rowid_" || col == "oid" {
 			rv = row.RowID
+		} else if v, ok := row.positionalAt(colIdx); ok {
+			rv = v
 		} else {
-			rv = row.Values[col]
+			rv = row.value(t, col)
 		}
 		left, right := rv, val
 		if !columnOnLeft {
@@ -2573,6 +2809,9 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 }
 
 func candidatePositions(s *persistedState, table string, data *tableData, where ast.Expr, args []any) []int {
+	if data.runtimeDeferred() {
+		return nil
+	}
 	col, val, ok, err := indexedEqualityPredicate(where, args)
 	if err != nil {
 		return nil
@@ -2657,6 +2896,29 @@ func runtimeIndexLookupKey(idx catalog.Index, val any) string {
 		return runtimeValueKey(val)
 	}
 	return indexRuntimeKey(idx, map[string]any{idx.Columns[0]: val})
+}
+
+func runtimeIndexLookupKeyBytes(idx catalog.Index, val any) []byte {
+	if len(idx.Columns) != 1 {
+		return []byte(runtimeIndexLookupKey(idx, val))
+	}
+	switch x := val.(type) {
+	case string:
+		key := make([]byte, 0, len(x)+2)
+		key = append(key, 's', ':')
+		key = append(key, x...)
+		return key
+	case int64:
+		key := make([]byte, 0, 10)
+		key = append(key, 'i', ':')
+		return append(key, encodeInt64Key(x)...)
+	case int:
+		key := make([]byte, 0, 10)
+		key = append(key, 'i', ':')
+		return append(key, encodeInt64Key(int64(x))...)
+	default:
+		return []byte(runtimeValueKey(val))
+	}
 }
 
 type fastOrderTerm struct {
@@ -3524,7 +3786,7 @@ func rowToContext(name string, r *ast.SimpleTable, t *catalog.Table, row rowVers
 	}
 	vals := make(map[string]any, len(t.Columns)*3+9)
 	for _, col := range t.Columns {
-		v := row.Values[col.Name]
+		v := row.value(t, col.Name)
 		vals[col.Name] = v
 		vals[name+"."+col.Name] = v
 		vals[alias+"."+col.Name] = v
@@ -3584,6 +3846,11 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
 				}
 			}
+			for _, row := range data.Pending {
+				if row.Deleted == 0 && row.RowID != self && valuesEqual(row.Values[col.Name], v, col.Collation) {
+					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
+				}
+			}
 		}
 	}
 	for _, idx := range t.Indexes {
@@ -3591,6 +3858,18 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 			continue
 		}
 		for _, row := range data.Rows {
+			if row.Deleted != 0 || row.RowID == self {
+				continue
+			}
+			same := true
+			for _, col := range idx.Columns {
+				same = same && valuesEqual(row.Values[col], values[col], columnCollation(t, col))
+			}
+			if same {
+				return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
+			}
+		}
+		for _, row := range data.Pending {
 			if row.Deleted != 0 || row.RowID == self {
 				continue
 			}
@@ -3857,6 +4136,9 @@ func coerce(col catalog.Column, v any, strict bool) (any, error) {
 			return f, nil
 		}
 	case catalog.Text:
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
 		return fmt.Sprint(v), nil
 	case catalog.Blob:
 		if x, ok := v.([]byte); ok {
@@ -3881,6 +4163,8 @@ func applyAffinity(col catalog.Column, v any) any {
 		}
 	case catalog.Text:
 		switch x := v.(type) {
+		case string:
+			return x
 		case []byte:
 			return string(x)
 		default:

@@ -18,9 +18,16 @@ type rowVersion struct {
 }
 
 type tableData struct {
-	Rows    []rowVersion           `json:"rows"`
-	rowids  *btree.Tree            `json:"-"`
-	indexes map[string]*btree.Tree `json:"-"`
+	Rows         []rowVersion           `json:"rows"`
+	Pending      []rowVersion           `json:"-"`
+	pendingRowID map[int64]struct{}     `json:"-"`
+	pendingLast  int64                  `json:"-"`
+	pendingAsc   bool                   `json:"-"`
+	rowids       *btree.Tree            `json:"-"`
+	indexes      map[string]*btree.Tree `json:"-"`
+	baseRows     int                    `json:"-"`
+	deferRuntime bool                   `json:"-"`
+	rowsShared   bool                   `json:"-"`
 }
 
 type persistedState struct {
@@ -71,25 +78,51 @@ func (s persistedState) clone() persistedState {
 		out.Catalog.Tables[name] = &cp
 	}
 	for name, data := range s.Tables {
-		td := &tableData{Rows: make([]rowVersion, len(data.Rows))}
-		for i, row := range data.Rows {
-			td.Rows[i] = rowVersion{
-				RowID:   row.RowID,
-				Values:  cloneValues(row.Values),
-				Pos:     clonePositionedValues(row.Pos),
-				Created: row.Created,
-				Deleted: row.Deleted,
+		td := &tableData{Rows: data.Rows[:len(data.Rows):len(data.Rows)]}
+		if len(data.Pending) > 0 {
+			td.Pending = append([]rowVersion(nil), data.Pending...)
+		}
+		if len(data.pendingRowID) > 0 {
+			td.pendingRowID = make(map[int64]struct{}, len(data.pendingRowID))
+			for rowid := range data.pendingRowID {
+				td.pendingRowID[rowid] = struct{}{}
 			}
 		}
-		if tbl := out.Catalog.Tables[name]; tbl != nil {
-			td.rebuildRuntime(tbl)
-		}
+		td.rowids = data.rowids
+		td.indexes = data.indexes
+		td.baseRows = len(data.Rows)
+		td.deferRuntime = true
+		td.rowsShared = true
+		td.pendingLast = data.pendingLast
+		td.pendingAsc = data.pendingAsc
+		data.rowsShared = true
 		out.Tables[name] = td
 	}
 	return out
 }
 
+func (t *tableData) copyRow(pos int) {
+	if t == nil || pos < 0 || pos >= len(t.Rows) {
+		return
+	}
+	if t.rowsShared {
+		rows := make([]rowVersion, len(t.Rows))
+		copy(rows, t.Rows)
+		t.Rows = rows
+		t.rowsShared = false
+	}
+	t.Rows[pos].Values = cloneValues(t.Rows[pos].Values)
+	t.Rows[pos].Pos = clonePositionedValues(t.Rows[pos].Pos)
+}
+
+func (t *tableData) runtimeDeferred() bool {
+	return t != nil && t.deferRuntime
+}
+
 func cloneValues(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
 		out[k] = v
@@ -109,6 +142,14 @@ func newRowVersion(schema *catalog.Table, rowid int64, values map[string]any, cr
 		RowID:   rowid,
 		Values:  values,
 		Pos:     valuesToPositioned(schema, values),
+		Created: created,
+	}
+}
+
+func newPositionedRowVersion(rowid int64, values []any, created uint64) rowVersion {
+	return rowVersion{
+		RowID:   rowid,
+		Pos:     values,
 		Created: created,
 	}
 }
@@ -153,7 +194,29 @@ func (r *rowVersion) ensureValues(schema *catalog.Table) {
 	if r.Values != nil && len(r.Values) >= len(schema.Columns) {
 		return
 	}
-	r.Values = positionedToValues(schema, r.Pos)
+	r.Values = positionedToValues(schema, r.positionedValues())
+}
+
+func (r rowVersion) value(schema *catalog.Table, col string) any {
+	if col == "rowid" || col == "_rowid_" || col == "oid" {
+		return r.RowID
+	}
+	if schema != nil {
+		if _, idx, ok := schema.Column(col); ok && idx >= 0 && idx < len(r.Pos) {
+			return r.Pos[idx]
+		}
+	}
+	if r.Values == nil {
+		return nil
+	}
+	return r.Values[col]
+}
+
+func (r rowVersion) positionalAt(idx int) (any, bool) {
+	if idx >= 0 && idx < len(r.Pos) {
+		return r.Pos[idx], true
+	}
+	return nil, false
 }
 
 func (r *rowVersion) syncPositioned(schema *catalog.Table) {
@@ -163,7 +226,12 @@ func (r *rowVersion) syncPositioned(schema *catalog.Table) {
 	r.Pos = valuesToPositioned(schema, r.Values)
 }
 
+func (r *rowVersion) positionedValues() []any {
+	return r.Pos
+}
+
 func (s *persistedState) rebuildRuntime() {
+	s.materializePending()
 	for name, data := range s.Tables {
 		if tbl := s.Catalog.Tables[name]; tbl != nil {
 			data.rebuildRuntime(tbl)
@@ -171,9 +239,97 @@ func (s *persistedState) rebuildRuntime() {
 	}
 }
 
+func (s *persistedState) materializePending() {
+	for name, data := range s.Tables {
+		if tbl := s.Catalog.Tables[name]; tbl != nil {
+			data.materializePending(tbl)
+		}
+	}
+}
+
+func (t *tableData) stageRow(schema *catalog.Table, row rowVersion) int {
+	if t.deferRuntime {
+		t.Pending = append(t.Pending, row)
+		t.trackPendingRowID(row.RowID)
+		return len(t.Rows) + len(t.Pending) - 1
+	}
+	t.Rows = append(t.Rows, row)
+	pos := len(t.Rows) - 1
+	t.addRuntime(schema, pos)
+	return pos
+}
+
+func (t *tableData) materializePending(schema *catalog.Table) {
+	if t == nil || len(t.Pending) == 0 {
+		return
+	}
+	if t.rowsShared {
+		rows := make([]rowVersion, len(t.Rows), len(t.Rows)+len(t.Pending))
+		copy(rows, t.Rows)
+		t.Rows = rows
+		t.rowsShared = false
+	}
+	start := len(t.Rows)
+	t.Rows = append(t.Rows, t.Pending...)
+	t.Pending = nil
+	t.pendingRowID = nil
+	t.pendingLast = 0
+	t.pendingAsc = false
+	for i := start; i < len(t.Rows); i++ {
+		t.addRuntime(schema, i)
+	}
+}
+
+func (t *tableData) trackPendingRowID(rowid int64) {
+	if len(t.Pending) == 1 {
+		t.pendingLast = rowid
+		t.pendingAsc = true
+		return
+	}
+	if t.pendingAsc && rowid > t.pendingLast {
+		t.pendingLast = rowid
+		return
+	}
+	t.ensurePendingRowIDMap()
+	t.pendingRowID[rowid] = struct{}{}
+	t.pendingAsc = false
+}
+
+func (t *tableData) ensurePendingRowIDMap() {
+	if t.pendingRowID != nil {
+		return
+	}
+	t.pendingRowID = make(map[int64]struct{}, len(t.Pending))
+	for _, row := range t.Pending {
+		t.pendingRowID[row.RowID] = struct{}{}
+	}
+}
+
+func (t *tableData) pendingRowIDConflict(rowid int64) bool {
+	if len(t.Pending) == 0 {
+		return false
+	}
+	if t.pendingAsc && rowid > t.pendingLast {
+		return false
+	}
+	if t.pendingRowID != nil {
+		_, ok := t.pendingRowID[rowid]
+		return ok
+	}
+	for _, row := range t.Pending {
+		if row.Deleted == 0 && row.RowID == rowid {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *tableData) rebuildRuntime(schema *catalog.Table) {
 	t.rowids = btree.New()
 	t.indexes = make(map[string]*btree.Tree, len(schema.Indexes))
+	t.baseRows = len(t.Rows)
+	t.deferRuntime = false
+	t.rowsShared = false
 	for _, idx := range schema.Indexes {
 		if len(idx.Columns) > 0 {
 			t.indexes[idx.Name] = btree.New()
@@ -197,6 +353,9 @@ func (t *tableData) rebuildRuntime(schema *catalog.Table) {
 }
 
 func (t *tableData) addRuntime(schema *catalog.Table, pos int) {
+	if t.deferRuntime {
+		return
+	}
 	if t.rowids == nil || t.indexes == nil {
 		t.rebuildRuntime(schema)
 		return
@@ -284,10 +443,14 @@ func (t *tableData) lookupIndexPositions(indexName, key string) []int {
 }
 
 func (t *tableData) eachIndexPosition(indexName, key string, fn func(int) bool) {
+	t.eachIndexPositionBytes(indexName, []byte(key), fn)
+}
+
+func (t *tableData) eachIndexPositionBytes(indexName string, key []byte, fn func(int) bool) {
 	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
 		return
 	}
-	t.indexes[indexName].View([]byte(key), func(raw []byte) {
+	t.indexes[indexName].View(key, func(raw []byte) {
 		eachEncodedIndexPosition(raw, fn)
 	})
 }

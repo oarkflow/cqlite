@@ -16,13 +16,15 @@ func TestRowVersionMaintainsSchemaPositionedValues(t *testing.T) {
 		},
 	}
 	row := newRowVersion(schema, 1, map[string]any{"id": int64(1), "name": "Ada", "score": int64(7)}, 2)
-	if len(row.Pos) != 3 || row.Pos[0] != int64(1) || row.Pos[1] != "Ada" || row.Pos[2] != int64(7) {
-		t.Fatalf("positioned values = %#v", row.Pos)
+	pos := row.positionedValues()
+	if len(pos) != 3 || pos[0] != int64(1) || pos[1] != "Ada" || pos[2] != int64(7) {
+		t.Fatalf("positioned values = %#v", pos)
 	}
 	row.Values["score"] = int64(8)
 	row.syncPositioned(schema)
-	if row.Pos[2] != int64(8) {
-		t.Fatalf("synced positioned score = %#v", row.Pos)
+	pos = row.positionedValues()
+	if pos[2] != int64(8) {
+		t.Fatalf("synced positioned score = %#v", pos)
 	}
 	row.Values = nil
 	row.ensureValues(schema)

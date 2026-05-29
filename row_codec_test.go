@@ -35,8 +35,9 @@ func TestRowCodecRoundTrip(t *testing.T) {
 	if got.Values["id"] != int64(7) || got.Values["score"] != 3.5 || got.Values["name"] != "Ada" || got.Values["empty"] != nil {
 		t.Fatalf("values = %#v", got.Values)
 	}
-	if len(got.Pos) != len(schema.Columns) || got.Pos[0] != int64(7) || got.Pos[1] != 3.5 || got.Pos[2] != "Ada" {
-		t.Fatalf("positioned values = %#v", got.Pos)
+	pos := got.positionedValues()
+	if len(pos) != len(schema.Columns) || pos[0] != int64(7) || pos[1] != 3.5 || pos[2] != "Ada" {
+		t.Fatalf("positioned values = %#v", pos)
 	}
 	if !bytes.Equal(got.Values["payload"].([]byte), []byte("bytes")) {
 		t.Fatalf("payload = %#v", got.Values["payload"])

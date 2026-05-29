@@ -34,25 +34,25 @@ Status legend:
 
 ### P0 Benchmark Baseline
 
-Recorded on Apple M2 Pro with `GOCACHE=$(pwd)/.gocache go test -bench . -benchmem -benchtime=3000x -run '^$'`.
+Recorded on Apple M2 Pro with `GOCACHE=$(pwd)/.gocache go test -bench ... -benchmem -run '^$'`. The latest write-path remediation removed eager checkpoints, staged insert-only transaction rows, added positional hot inserts, and generalized indexed update fast paths.
 
 | Operation | Custom | mattn/go-sqlite3 |
 | --- | ---: | ---: |
-| insert transaction | `776.7 ns/op`, `595 B/op`, `10 allocs/op` | `795.2 ns/op`, `284 B/op`, `8 allocs/op` |
-| insert autocommit SyncFull | `3.80 ms/op`, `1151 B/op`, `18 allocs/op` | `3.39 ms/op`, `237 B/op`, `7 allocs/op` |
-| point lookup primary key | `632.8 ns/op`, `341 B/op`, `10 allocs/op` | `2285 ns/op`, `608 B/op`, `22 allocs/op` |
+| insert transaction | `574-666 ns/op`, `706-760 B/op`, `9-11 allocs/op` | `899-1358 ns/op`, `288 B/op`, `8-9 allocs/op` |
+| insert autocommit SyncFull | `23.5-31.0 us/op`, `964-989 B/op`, `17-18 allocs/op` | `36.8-94.5 us/op`, `255 B/op`, `8 allocs/op` |
+| point lookup primary key | `720 ns/op`, `357 B/op`, `10 allocs/op` | `2481 ns/op`, `608 B/op`, `22 allocs/op` |
 | indexed lookup | `2144 ns/op`, `1736 B/op`, `52 allocs/op` | `4014 ns/op`, `627 B/op`, `33 allocs/op` |
-| range scan | `7312 ns/op`, `5304 B/op`, `39 allocs/op` | `19.8 us/op`, `1891 B/op`, `188 allocs/op` |
-| full scan | `61.7 us/op`, `49.5 KB/op`, `10 allocs/op` | `325 us/op`, `62.5 KB/op`, `4764 allocs/op` |
-| update by primary key SyncFull | `640 us/op`, `413 B/op`, `7 allocs/op` | `379 us/op`, `133 B/op`, `5 allocs/op` |
+| range scan | `25.7 us/op`, `5312 B/op`, `39 allocs/op` | `20.9 us/op`, `1891 B/op`, `188 allocs/op` |
+| full scan | `126 us/op`, `49.6 KB/op`, `10 allocs/op` | `337 us/op`, `62.5 KB/op`, `4764 allocs/op` |
+| update by primary key SyncFull | `33.3 us/op`, `831 B/op`, `10 allocs/op` | `50.1 us/op`, `133 B/op`, `5 allocs/op` |
 | join aggregate | `77.3 us/op`, `5706 B/op`, `121 allocs/op` | `170 us/op`, `1248 B/op`, `75 allocs/op` |
-| insert autocommit SyncOff | `38.1 us/op`, `1308 B/op`, `20 allocs/op` | `7388 ns/op`, `256 B/op`, `8 allocs/op` |
-| insert batch SyncOff | `9.23 ms/op`, `17.2 MB/op`, `189832 allocs/op` | `101 us/op`, `26.4 KB/op`, `920 allocs/op` |
-| update by primary key SyncOff | `32.0 us/op`, `413 B/op`, `7 allocs/op` | `7267 ns/op`, `133 B/op`, `5 allocs/op` |
-| update by secondary index SyncOff | `285 us/op`, `6111 B/op`, `93 allocs/op` | `26.6 us/op`, `152 B/op`, `7 allocs/op` |
-| delete by primary key SyncOff | `27.8 us/op`, `255 B/op`, `6 allocs/op` | `7212 ns/op`, `135 B/op`, `5 allocs/op` |
-| delete by secondary index SyncOff | `3249 ns/op`, `319 B/op`, `10 allocs/op` | `8481 ns/op`, `168 B/op`, `7 allocs/op` |
-| concurrent mixed read/write SyncOff | `943.9 ns/op`, `271 B/op`, `9 allocs/op` | `4579 ns/op`, `627 B/op`, `19 allocs/op` |
+| insert autocommit SyncOff | `6088 ns/op`, `986 B/op`, `18 allocs/op` | `8065 ns/op`, `256 B/op`, `8 allocs/op` |
+| insert batch SyncOff | `109-119 us/op`, `136-139 KB/op`, `1479-1579 allocs/op` | `100-121 us/op`, `26.4 KB/op`, `920 allocs/op` |
+| update by primary key SyncOff | `6063 ns/op`, `831 B/op`, `10 allocs/op` | `6630 ns/op`, `133 B/op`, `5 allocs/op` |
+| update by secondary index SyncOff | `11.3 us/op`, `5630 B/op`, `66 allocs/op` | `38.2 us/op`, `152 B/op`, `7 allocs/op` |
+| delete by primary key SyncOff | `5092 ns/op`, `344 B/op`, `7 allocs/op` | `7824 ns/op`, `135 B/op`, `5 allocs/op` |
+| delete by secondary index SyncOff | `5880 ns/op`, `744 B/op`, `13 allocs/op` | `11.4 us/op`, `168 B/op`, `7 allocs/op` |
+| concurrent mixed read/write SyncOff | `1363 ns/op`, `313 B/op`, `9 allocs/op` | `5342 ns/op`, `627 B/op`, `19 allocs/op` |
 
 ## P1: Real Pager-Backed Storage
 
@@ -84,6 +84,7 @@ Recorded on Apple M2 Pro with `GOCACHE=$(pwd)/.gocache go test -bench . -benchme
 ## P3: WAL, Recovery, And Crash Matrix
 
 - [ ] Replace logical SQL replay with page/physical WAL records for normal storage mutations.
+- [x] Replay simple autocommit and simple explicit-transaction DML from binary mutation WAL records without reconstructing SQL text.
 - [x] Add physical page WAL records and open-time replay for checkpoint metadata pager pages.
 - [x] Keep checksummed records and committed-transaction boundaries.
 - [x] Add physical page WAL record encoding, replay decoding, and fuzz coverage.
