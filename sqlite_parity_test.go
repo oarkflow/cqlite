@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"os/exec"
 	"strings"
 	"testing"
@@ -150,6 +151,150 @@ func TestSQLiteParityForJoinsOrderingGroupingAndPragmas(t *testing.T) {
 	}
 }
 
+func TestSQLiteParityForSQLTransactionCommands(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE tx_items (id INTEGER PRIMARY KEY, msg TEXT)`,
+		`BEGIN IMMEDIATE`,
+		`INSERT INTO tx_items VALUES (1, 'rolled back')`,
+		`ROLLBACK`,
+		`BEGIN EXCLUSIVE`,
+		`INSERT INTO tx_items VALUES (2, 'kept')`,
+		`SAVEPOINT s1`,
+		`INSERT INTO tx_items VALUES (3, 'discarded')`,
+		`ROLLBACK TO s1`,
+		`RELEASE SAVEPOINT s1`,
+		`COMMIT`,
+	}
+	queries := []string{
+		`SELECT id, msg FROM tx_items ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("transaction command mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForLeftAndCrossJoins(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE join_users (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE join_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)`,
+		`INSERT INTO join_users VALUES (1, 'Ada')`,
+		`INSERT INTO join_users VALUES (2, 'Grace')`,
+		`INSERT INTO join_orders VALUES (1, 1, 10.5)`,
+	}
+	queries := []string{
+		`SELECT join_users.name, join_orders.total FROM join_users LEFT JOIN join_orders ON join_users.id = join_orders.user_id ORDER BY join_users.id`,
+		`SELECT join_users.name, join_orders.total FROM join_users CROSS JOIN join_orders ORDER BY join_users.id, join_orders.id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("left/cross join mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForInSubqueries(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE sub_users (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE sub_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)`,
+		`INSERT INTO sub_users VALUES (1, 'Ada')`,
+		`INSERT INTO sub_users VALUES (2, 'Grace')`,
+		`INSERT INTO sub_users VALUES (3, 'Linus')`,
+		`INSERT INTO sub_orders VALUES (1, 1, 10.0)`,
+		`INSERT INTO sub_orders VALUES (2, 1, 20.0)`,
+		`INSERT INTO sub_orders VALUES (3, 2, 5.0)`,
+		`UPDATE sub_users SET name = name || '!' WHERE id IN (SELECT user_id FROM sub_orders WHERE total >= 20)`,
+		`DELETE FROM sub_orders WHERE user_id NOT IN (SELECT id FROM sub_users WHERE name LIKE 'A%')`,
+	}
+	queries := []string{
+		`SELECT id, name FROM sub_users WHERE id IN (SELECT user_id FROM sub_orders WHERE total >= 10) ORDER BY id`,
+		`SELECT id, user_id, total FROM sub_orders ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("IN subquery mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForScalarSubqueries(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE scalar_users (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE scalar_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)`,
+		`INSERT INTO scalar_users VALUES (1, 'Ada')`,
+		`INSERT INTO scalar_users VALUES (2, 'Grace')`,
+		`INSERT INTO scalar_orders VALUES (1, 1, 10.0)`,
+		`INSERT INTO scalar_orders VALUES (2, 1, 20.0)`,
+		`INSERT INTO scalar_orders VALUES (3, 2, 5.0)`,
+	}
+	queries := []string{
+		`SELECT (SELECT max(total) FROM scalar_orders)`,
+		`SELECT name FROM scalar_users WHERE id = (SELECT user_id FROM scalar_orders WHERE total = 20.0)`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("scalar subquery mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForExistsSubqueries(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE exists_users (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE exists_orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)`,
+		`INSERT INTO exists_users VALUES (1, 'Ada')`,
+		`INSERT INTO exists_users VALUES (2, 'Grace')`,
+		`INSERT INTO exists_orders VALUES (1, 1, 10.0)`,
+	}
+	queries := []string{
+		`SELECT name FROM exists_users WHERE EXISTS (SELECT id FROM exists_orders WHERE total >= 10) ORDER BY id`,
+		`SELECT name FROM exists_users WHERE NOT EXISTS (SELECT id FROM exists_orders WHERE total > 99) ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("EXISTS subquery mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForAggregateFunctionsAndHaving(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE agg_items (id INTEGER PRIMARY KEY, bucket INTEGER, score REAL)`,
+		`INSERT INTO agg_items VALUES (1, 1, 10.0)`,
+		`INSERT INTO agg_items VALUES (2, 1, 20.0)`,
+		`INSERT INTO agg_items VALUES (3, 2, 5.0)`,
+		`INSERT INTO agg_items VALUES (4, 2, NULL)`,
+	}
+	queries := []string{
+		`SELECT count(*), count(score), sum(score), avg(score), min(score), max(score) FROM agg_items`,
+		`SELECT bucket, avg(score), min(score), max(score) FROM agg_items GROUP BY bucket HAVING avg(score) >= 5 ORDER BY bucket`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("aggregate/having mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
 func TestSQLiteParityForForeignKeysAndQueryPlan(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not available")
@@ -221,6 +366,53 @@ func TestSQLiteParityForIndexedEqualityLookup(t *testing.T) {
 	sqlite := runSQLite(t, setup, queries)
 	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
 		t.Fatalf("indexed lookup mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForIndexedRangeLookup(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE range_items (id INTEGER PRIMARY KEY, bucket INTEGER, name TEXT)`,
+		`CREATE INDEX range_items_bucket_idx ON range_items (bucket)`,
+		`INSERT INTO range_items VALUES (1, 1, 'one')`,
+		`INSERT INTO range_items VALUES (2, 2, 'two')`,
+		`INSERT INTO range_items VALUES (3, 3, 'three')`,
+		`INSERT INTO range_items VALUES (4, 4, 'four')`,
+	}
+	queries := []string{
+		`SELECT id, bucket FROM range_items WHERE id >= 2 AND id < 4 ORDER BY id`,
+		`SELECT id, bucket FROM range_items WHERE bucket >= 2 AND bucket <= 3 ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("indexed range mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForIndexedOrderByLimit(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE ordered_items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`,
+		`CREATE INDEX ordered_items_score_idx ON ordered_items (score)`,
+		`INSERT INTO ordered_items VALUES (1, 'one', 30)`,
+		`INSERT INTO ordered_items VALUES (2, 'two', 10)`,
+		`INSERT INTO ordered_items VALUES (3, 'three', 20)`,
+		`INSERT INTO ordered_items VALUES (4, 'four', 40)`,
+	}
+	queries := []string{
+		`SELECT id, score FROM ordered_items ORDER BY id DESC LIMIT 2`,
+		`SELECT id, score FROM ordered_items ORDER BY score LIMIT 3`,
+		`SELECT id, score FROM ordered_items WHERE score >= 20 ORDER BY score DESC LIMIT 2`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("indexed order by limit mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
 	}
 }
 
@@ -302,6 +494,102 @@ func TestSQLiteParityForPartialExpressionIndexMetadata(t *testing.T) {
 	}
 }
 
+func TestSQLiteParityForPragmaIndexInfo(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE pragma_items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`,
+		`CREATE INDEX pragma_items_score_name_idx ON pragma_items (score, name)`,
+	}
+	queries := []string{
+		`PRAGMA index_info(pragma_items_score_name_idx)`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("index_info mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForBuiltInCollations(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE collated_items (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE, code TEXT COLLATE RTRIM)`,
+		`INSERT INTO collated_items VALUES (1, 'bravo', 'x  ')`,
+		`INSERT INTO collated_items VALUES (2, 'Alpha', 'x')`,
+		`INSERT INTO collated_items VALUES (3, 'charlie', 'y')`,
+	}
+	queries := []string{
+		`SELECT id, name FROM collated_items WHERE name = 'alpha'`,
+		`SELECT name FROM collated_items ORDER BY name`,
+		`SELECT id FROM collated_items ORDER BY code`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("collation mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForCheckConstraints(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE checked_items (id INTEGER PRIMARY KEY, score INTEGER CHECK (score >= 0), name TEXT, CHECK (id > 0 AND name IS NOT NULL))`,
+		`INSERT INTO checked_items VALUES (1, 0, 'zero')`,
+		`INSERT INTO checked_items VALUES (2, NULL, 'unknown')`,
+	}
+	queries := []string{
+		`SELECT id, score, name FROM checked_items ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("check constraint valid-row mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for _, stmt := range setup[:1] {
+		if _, err := d.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO checked_items VALUES (3, -1, 'bad')`); err == nil {
+		t.Fatal("expected custom CHECK failure")
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO checked_items VALUES (-1, 1, 'bad')`); err == nil {
+		t.Fatal("expected custom table CHECK failure")
+	}
+	dir := t.TempDir()
+	persisted, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persisted.Exec(ctx, setup[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := persisted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Exec(ctx, `INSERT INTO checked_items VALUES (4, -2, 'bad')`); err == nil {
+		t.Fatal("expected persisted custom CHECK failure after reopen")
+	}
+}
+
 func TestSQLiteParityForExpressionSemantics(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not available")
@@ -314,6 +602,7 @@ func TestSQLiteParityForExpressionSemantics(t *testing.T) {
 	queries := []string{
 		`SELECT name || ':' || n, n % 4, CASE WHEN n BETWEEN 5 AND 8 THEN 'mid' ELSE 'hi' END FROM exprs ORDER BY id`,
 		`SELECT name FROM exprs WHERE n IN (7, 9) OR name LIKE 'Gra%' ORDER BY id`,
+		`SELECT name FROM exprs WHERE name LIKE 'A!_a' ESCAPE '!' ORDER BY id`,
 		`SELECT ifnull(maybe, 'fallback'), coalesce(maybe, name), nullif(name, 'Ada') FROM exprs ORDER BY id`,
 		`SELECT lower(name), upper(name), length(name), abs(-r) FROM exprs ORDER BY id`,
 	}
@@ -362,6 +651,185 @@ func TestSQLiteParityForAlterDropColumn(t *testing.T) {
 	sqlite := runSQLite(t, setup, queries)
 	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
 		t.Fatalf("alter drop column mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForRandomIndexedDML(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE random_items (id INTEGER PRIMARY KEY, bucket INTEGER, name TEXT)`,
+		`CREATE INDEX random_items_bucket_idx ON random_items (bucket)`,
+	}
+	rng := rand.New(rand.NewSource(7))
+	live := make(map[int]bool)
+	for i := 0; i < 80; i++ {
+		id := rng.Intn(30) + 1
+		switch rng.Intn(3) {
+		case 0:
+			setup = append(setup, fmt.Sprintf(`DELETE FROM random_items WHERE id = %d`, id))
+			delete(live, id)
+		case 1:
+			if live[id] {
+				bucket := rng.Intn(5)
+				setup = append(setup, fmt.Sprintf(`UPDATE random_items SET bucket = %d, name = 'u%d' WHERE id = %d`, bucket, i, id))
+			}
+		default:
+			bucket := rng.Intn(5)
+			if live[id] {
+				setup = append(setup, fmt.Sprintf(`UPDATE random_items SET bucket = %d, name = 'n%d' WHERE id = %d`, bucket, i, id))
+			} else {
+				setup = append(setup, fmt.Sprintf(`INSERT INTO random_items (id, bucket, name) VALUES (%d, %d, 'n%d')`, id, bucket, i))
+			}
+			live[id] = true
+		}
+	}
+	queries := []string{
+		`SELECT id, bucket, name FROM random_items ORDER BY id`,
+		`SELECT id, name FROM random_items WHERE bucket = 2 ORDER BY id`,
+		`SELECT bucket, count(*) FROM random_items GROUP BY bucket ORDER BY bucket`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("random indexed DML mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForInsertOrReplace(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE replace_items (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT)`,
+		`INSERT INTO replace_items VALUES (1, 'a', 'old')`,
+		`INSERT OR REPLACE INTO replace_items VALUES (1, 'a', 'new')`,
+		`INSERT OR REPLACE INTO replace_items VALUES (2, 'a', 'by-code')`,
+	}
+	queries := []string{
+		`SELECT id, code, name FROM replace_items ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("insert or replace mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForInsertSelect(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE source_items (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`,
+		`CREATE TABLE copied_items (id INTEGER PRIMARY KEY, label TEXT)`,
+		`INSERT INTO source_items VALUES (1, 'Ada', 10)`,
+		`INSERT INTO source_items VALUES (2, 'Grace', 5)`,
+		`INSERT INTO copied_items (id, label) SELECT id + 10, name || ':' || score FROM source_items WHERE score >= 10`,
+	}
+	queries := []string{
+		`SELECT id, label FROM copied_items ORDER BY id`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("insert select mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestSQLiteParityForCreateTableAsSelect(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE ctas_source (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`,
+		`INSERT INTO ctas_source VALUES (1, 'Ada', 10)`,
+		`INSERT INTO ctas_source VALUES (2, 'Grace', 5)`,
+		`CREATE TABLE ctas_copy AS SELECT id, name || ':' || score AS label FROM ctas_source WHERE score >= 10`,
+	}
+	queries := []string{
+		`SELECT id, label FROM ctas_copy ORDER BY id`,
+		`PRAGMA table_info(ctas_copy)`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("create table as select mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestExplainQueryPlanAccessPaths(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for _, stmt := range []string{
+		`CREATE TABLE plan_items (id INTEGER PRIMARY KEY, bucket INTEGER, name TEXT)`,
+		`CREATE INDEX plan_items_bucket_idx ON plan_items (bucket)`,
+		`INSERT INTO plan_items VALUES (1, 2, 'one')`,
+	} {
+		if _, err := d.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items WHERE id = 1`, "USING INTEGER PRIMARY KEY")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items WHERE id >= 1`, "USING INTEGER PRIMARY KEY")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items WHERE bucket = 2`, "USING INDEX plan_items_bucket_idx")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT bucket FROM plan_items WHERE bucket = 2`, "USING COVERING INDEX plan_items_bucket_idx")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items WHERE bucket >= 2`, "USING INDEX plan_items_bucket_idx")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items WHERE name = 'one'`, "SCAN plan_items")
+	assertPlanNotContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items ORDER BY id`, "USE TEMP B-TREE")
+	assertPlanNotContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items ORDER BY bucket`, "USE TEMP B-TREE")
+	assertPlanAnyContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items ORDER BY name`, "USE TEMP B-TREE")
+	assertPlanContains(t, d, `EXPLAIN QUERY PLAN SELECT * FROM plan_items p JOIN plan_items q ON p.bucket = q.bucket`, "NESTED LOOP JOIN")
+}
+
+func assertPlanContains(t *testing.T, d *DB, query, want string) {
+	t.Helper()
+	rows, err := d.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || !strings.Contains(fmt.Sprint(row[3]), want) {
+		t.Fatalf("plan for %q = %#v ok=%v, want %q", query, row, ok, want)
+	}
+}
+
+func assertPlanNotContains(t *testing.T, d *DB, query, unwanted string) {
+	t.Helper()
+	rows, err := d.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			return
+		}
+		if strings.Contains(fmt.Sprint(row[3]), unwanted) {
+			t.Fatalf("plan for %q contains %q in %#v", query, unwanted, row)
+		}
+	}
+}
+
+func assertPlanAnyContains(t *testing.T, d *DB, query, want string) {
+	t.Helper()
+	rows, err := d.Query(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			t.Fatalf("plan for %q did not contain %q", query, want)
+		}
+		if strings.Contains(fmt.Sprint(row[3]), want) {
+			return
+		}
 	}
 }
 
@@ -459,7 +927,7 @@ func normalizeRow(row []any) []string {
 			if x == float64(int64(x)) {
 				out[i] = fmt.Sprintf("%.1f", x)
 			} else {
-				out[i] = fmt.Sprint(x)
+				out[i] = fmt.Sprintf("%.15g", x)
 			}
 		default:
 			out[i] = fmt.Sprint(x)

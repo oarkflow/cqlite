@@ -2,6 +2,7 @@ package pager
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -12,8 +13,10 @@ import (
 
 type Pager struct {
 	mu       sync.Mutex
+	path     string
 	file     *os.File
 	pageSize int
+	free     []page.ID
 }
 
 const blobMagic = "SQLTBLB1"
@@ -26,7 +29,12 @@ func Open(path string, pageSize int) (*Pager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Pager{file: f, pageSize: pageSize}, nil
+	p := &Pager{path: path, file: f, pageSize: pageSize}
+	if err := p.loadFreeList(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return p, nil
 }
 
 func (p *Pager) Read(id page.ID) (page.Page, error) {
@@ -63,11 +71,34 @@ func (p *Pager) Write(pg page.Page) error {
 func (p *Pager) Allocate() (page.ID, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if n := len(p.free); n > 0 {
+		id := p.free[n-1]
+		p.free = p.free[:n-1]
+		if err := p.persistFreeListLocked(); err != nil {
+			return 0, err
+		}
+		return id, nil
+	}
 	info, err := p.file.Stat()
 	if err != nil {
 		return 0, err
 	}
 	return page.ID(info.Size()/int64(p.pageSize) + 1), nil
+}
+
+func (p *Pager) Free(id page.ID) error {
+	if id == 0 {
+		return errors.New("page id 0 is reserved")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, existing := range p.free {
+		if existing == id {
+			return nil
+		}
+	}
+	p.free = append(p.free, id)
+	return p.persistFreeListLocked()
 }
 
 func (p *Pager) Sync() error {
@@ -79,7 +110,46 @@ func (p *Pager) Sync() error {
 func (p *Pager) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.persistFreeListLocked(); err != nil {
+		_ = p.file.Close()
+		return err
+	}
 	return p.file.Close()
+}
+
+func (p *Pager) loadFreeList() error {
+	data, err := os.ReadFile(p.path + ".free")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var raw []uint64
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.free = make([]page.ID, len(raw))
+	for i, id := range raw {
+		p.free[i] = page.ID(id)
+	}
+	return nil
+}
+
+func (p *Pager) persistFreeListLocked() error {
+	raw := make([]uint64, len(p.free))
+	for i, id := range p.free {
+		raw[i] = uint64(id)
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	tmp := p.path + ".free.tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p.path+".free")
 }
 
 func (p *Pager) WriteBlob(data []byte) error {

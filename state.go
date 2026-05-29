@@ -1,9 +1,11 @@
 package db
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strconv"
 
+	"github.com/sujit/sqlite/internal/btree"
 	"github.com/sujit/sqlite/internal/catalog"
 )
 
@@ -15,9 +17,9 @@ type rowVersion struct {
 }
 
 type tableData struct {
-	Rows    []rowVersion                `json:"rows"`
-	rowids  map[int64]int               `json:"-"`
-	indexes map[string]map[string][]int `json:"-"`
+	Rows    []rowVersion           `json:"rows"`
+	rowids  *btree.Tree            `json:"-"`
+	indexes map[string]*btree.Tree `json:"-"`
 }
 
 type persistedState struct {
@@ -28,10 +30,11 @@ type persistedState struct {
 }
 
 type checkpointMeta struct {
-	Catalog catalog.Catalog `json:"catalog"`
-	NextTx  uint64          `json:"next_tx"`
-	Pragmas pragmaState     `json:"pragmas"`
-	Applied uint64          `json:"applied"`
+	Catalog    catalog.Catalog `json:"catalog"`
+	NextTx     uint64          `json:"next_tx"`
+	Pragmas    pragmaState     `json:"pragmas"`
+	Applied    uint64          `json:"applied"`
+	Generation uint64          `json:"generation,omitempty"`
 }
 
 type pragmaState struct {
@@ -101,15 +104,15 @@ func (s *persistedState) rebuildRuntime() {
 }
 
 func (t *tableData) rebuildRuntime(schema *catalog.Table) {
-	t.rowids = make(map[int64]int, len(t.Rows))
-	t.indexes = make(map[string]map[string][]int, len(schema.Indexes))
+	t.rowids = btree.New()
+	t.indexes = make(map[string]*btree.Tree, len(schema.Indexes))
 	for _, idx := range schema.Indexes {
 		if len(idx.Columns) > 0 {
-			t.indexes[idx.Name] = make(map[string][]int)
+			t.indexes[idx.Name] = btree.New()
 		}
 	}
 	for i, row := range t.Rows {
-		t.rowids[row.RowID] = i
+		t.addRowIDPosition(row.RowID, i)
 		if row.Deleted != 0 {
 			continue
 		}
@@ -117,8 +120,7 @@ func (t *tableData) rebuildRuntime(schema *catalog.Table) {
 			if len(idx.Columns) == 0 {
 				continue
 			}
-			key := indexRuntimeKey(idx, row.Values)
-			t.indexes[idx.Name][key] = append(t.indexes[idx.Name][key], i)
+			t.addIndexPosition(idx, i)
 		}
 	}
 }
@@ -132,7 +134,7 @@ func (t *tableData) addRuntime(schema *catalog.Table, pos int) {
 		return
 	}
 	row := t.Rows[pos]
-	t.rowids[row.RowID] = pos
+	t.addRowIDPosition(row.RowID, pos)
 	if row.Deleted != 0 {
 		return
 	}
@@ -140,12 +142,98 @@ func (t *tableData) addRuntime(schema *catalog.Table, pos int) {
 		if len(idx.Columns) == 0 {
 			continue
 		}
-		if t.indexes[idx.Name] == nil {
-			t.indexes[idx.Name] = make(map[string][]int)
-		}
-		key := indexRuntimeKey(idx, row.Values)
-		t.indexes[idx.Name][key] = append(t.indexes[idx.Name][key], pos)
+		t.addIndexPosition(idx, pos)
 	}
+}
+
+func (t *tableData) addRowIDPosition(rowid int64, pos int) {
+	if t.rowids == nil {
+		t.rowids = btree.New()
+	}
+	t.rowids.Put(encodeInt64Key(rowid), encodeIntPosition(pos))
+}
+
+func (t *tableData) lookupRowID(rowid int64) (int, bool) {
+	if t == nil || t.rowids == nil {
+		return 0, false
+	}
+	raw, ok := t.rowids.Get(encodeInt64Key(rowid))
+	if !ok {
+		return 0, false
+	}
+	return decodeIntPosition(raw)
+}
+
+func (t *tableData) rangeRowIDs(start *int64, end *int64) []int {
+	if t == nil || t.rowids == nil {
+		return nil
+	}
+	var startKey, endKey []byte
+	if start != nil {
+		startKey = encodeInt64Key(*start)
+	}
+	if end != nil {
+		endKey = encodeInt64Key(*end)
+	}
+	var out []int
+	t.rowids.Scan(startKey, endKey, func(_, raw []byte) bool {
+		if pos, ok := decodeIntPosition(raw); ok {
+			out = append(out, pos)
+		}
+		return true
+	})
+	return out
+}
+
+func (t *tableData) addIndexPosition(idx catalog.Index, pos int) {
+	if pos < 0 || pos >= len(t.Rows) {
+		return
+	}
+	tr := t.indexes[idx.Name]
+	if tr == nil {
+		tr = btree.New()
+		t.indexes[idx.Name] = tr
+	}
+	key := []byte(indexRuntimeKey(idx, t.Rows[pos].Values))
+	positions, _ := tr.Get(key)
+	next := decodeIndexPositions(positions)
+	next = append(next, pos)
+	tr.Put(key, encodeIndexPositions(next))
+}
+
+func (t *tableData) lookupIndexPositions(indexName, key string) []int {
+	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
+		return nil
+	}
+	raw, ok := t.indexes[indexName].Get([]byte(key))
+	if !ok {
+		return nil
+	}
+	return decodeIndexPositions(raw)
+}
+
+func (t *tableData) eachIndexPosition(indexName, key string, fn func(int) bool) {
+	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
+		return
+	}
+	t.indexes[indexName].View([]byte(key), func(raw []byte) {
+		eachEncodedIndexPosition(raw, fn)
+	})
+}
+
+func (t *tableData) rangeIndexPositions(indexName string, start, end []byte) []int {
+	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
+		return nil
+	}
+	var out []int
+	t.indexes[indexName].Scan(start, end, func(_, raw []byte) bool {
+		eachEncodedIndexPosition(raw, func(pos int) bool {
+			out = append(out, pos)
+			return true
+		})
+		return true
+	})
+	return out
 }
 
 func indexRuntimeKey(idx catalog.Index, values map[string]any) string {
@@ -164,9 +252,9 @@ func runtimeValueKey(v any) string {
 	case nil:
 		return "n:"
 	case int:
-		return "i:" + strconv.FormatInt(int64(x), 10)
+		return "i:" + string(encodeInt64Key(int64(x)))
 	case int64:
-		return "i:" + strconv.FormatInt(x, 10)
+		return "i:" + string(encodeInt64Key(x))
 	case float64:
 		return "f:" + strconv.FormatFloat(x, 'g', -1, 64)
 	case string:
@@ -180,5 +268,63 @@ func runtimeValueKey(v any) string {
 		return "x:" + string(x)
 	default:
 		return fmt.Sprintf("%#v", v)
+	}
+}
+
+func encodeIndexPositions(positions []int) []byte {
+	out := make([]byte, 4+len(positions)*8)
+	binary.LittleEndian.PutUint32(out[0:4], uint32(len(positions)))
+	for i, pos := range positions {
+		binary.LittleEndian.PutUint64(out[4+i*8:12+i*8], uint64(pos))
+	}
+	return out
+}
+
+func encodeInt64Key(v int64) []byte {
+	var out [8]byte
+	binary.BigEndian.PutUint64(out[:], uint64(v)^(uint64(1)<<63))
+	return out[:]
+}
+
+func encodeIntPosition(pos int) []byte {
+	var out [8]byte
+	binary.LittleEndian.PutUint64(out[:], uint64(pos))
+	return out[:]
+}
+
+func decodeIntPosition(data []byte) (int, bool) {
+	if len(data) != 8 {
+		return 0, false
+	}
+	return int(binary.LittleEndian.Uint64(data)), true
+}
+
+func decodeIndexPositions(data []byte) []int {
+	if len(data) < 4 {
+		return nil
+	}
+	n := int(binary.LittleEndian.Uint32(data[0:4]))
+	if n < 0 || len(data) < 4+n*8 {
+		return nil
+	}
+	out := make([]int, n)
+	for i := 0; i < n; i++ {
+		out[i] = int(binary.LittleEndian.Uint64(data[4+i*8 : 12+i*8]))
+	}
+	return out
+}
+
+func eachEncodedIndexPosition(data []byte, fn func(int) bool) {
+	if len(data) < 4 {
+		return
+	}
+	n := int(binary.LittleEndian.Uint32(data[0:4]))
+	if n < 0 || len(data) < 4+n*8 {
+		return
+	}
+	for i := 0; i < n; i++ {
+		if !fn(int(binary.LittleEndian.Uint64(data[4+i*8 : 12+i*8]))) {
+			return
+		}
 	}
 }

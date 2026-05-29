@@ -23,6 +23,7 @@ type Options struct {
 	Synchronous       string
 	BufferPoolSize    int
 	SyncPolicy        SyncPolicy
+	DisableFileLock   bool
 }
 
 type TxOptions struct {
@@ -33,6 +34,15 @@ type Result = isql.Result
 type Rows = isql.Rows
 
 type Value any
+
+type NamedArg struct {
+	Name  string
+	Value any
+}
+
+func Named(name string, value any) NamedArg {
+	return NamedArg{Name: name, Value: value}
+}
 
 type Stats struct {
 	Tables       int

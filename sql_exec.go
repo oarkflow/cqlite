@@ -22,6 +22,12 @@ import (
 const primaryKeyNamePlaceholder = "__primary_key__"
 
 var simpleDMLCache sync.Map
+var simpleSelectCache sync.Map
+
+// parseMu protects the oarkflow parser and every AST derived from it. The
+// parser reuses internal arena storage, so parsed ASTs must be consumed before
+// any other goroutine parses another statement.
+var parseMu sync.Mutex
 
 type simpleDMLPlan struct {
 	kind   byte
@@ -32,7 +38,30 @@ type simpleDMLPlan struct {
 	params int
 }
 
+type simpleSelectPlan struct {
+	table  string
+	cols   []string
+	conds  []simpleSelectCond
+	order  simpleSelectOrder
+	limit  int
+	offset int
+}
+
+type simpleSelectCond struct {
+	col      string
+	op       string
+	param    int
+	literal  any
+	hasParam bool
+}
+
+type simpleSelectOrder struct {
+	col  string
+	desc bool
+}
+
 func parseStatementCached(query string) (ast.Statement, error) {
+	query = normalizeInsertOrReplace(query)
 	return sqlparser.ParseStatement(query)
 }
 
@@ -80,6 +109,9 @@ func execute(ctx context.Context, s *persistedState, query string, args ...any) 
 }
 
 func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, bool, error) {
+	if hasNamedArgs(args) {
+		return Result{}, false, nil
+	}
 	if ins, ok := stmt.(*ast.InsertStmt); ok {
 		return fastInsertDML(s, ins, args)
 	}
@@ -103,7 +135,9 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 	if !ok || where.Op != lexer.EQ || exprColumnName(where.Left) != pk {
 		return Result{}, false, nil
 	}
-	idv, err := evalExpr(where.Right, nil, &binder{args: args})
+	asn := upd.Set[0]
+	setParams := countParams(asn.Value)
+	idv, err := evalExpr(where.Right, nil, &binder{args: args, pos: setParams})
 	if err != nil {
 		return Result{}, true, err
 	}
@@ -112,16 +146,18 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 		return Result{RowsAffected: 0}, true, nil
 	}
 	data := s.Tables[t.Name]
-	pos, ok := data.rowids[id]
+	pos, ok := data.lookupRowID(id)
 	if !ok || data.Rows[pos].Deleted != 0 {
 		return Result{RowsAffected: 0}, true, nil
 	}
-	asn := upd.Set[0]
 	col, _, ok := t.Column(asn.Column.Unquoted)
 	if !ok {
 		return Result{}, true, fmt.Errorf("unknown column: %s", asn.Column.Unquoted)
 	}
 	if !canFastUpdateColumn(s, t, col.Name) {
+		return Result{}, false, nil
+	}
+	if countParams(asn.Value) > 0 {
 		return Result{}, false, nil
 	}
 	nextValue, ok, err := fastUpdateValue(asn.Value, data.Rows[pos].Values)
@@ -137,6 +173,9 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 }
 
 func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, error) {
+	if hasNamedArgs(args) {
+		return Result{}, false, nil
+	}
 	plan, ok := simplePlan(query)
 	if !ok || plan.params != len(args) {
 		return Result{}, false, nil
@@ -151,6 +190,8 @@ func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, e
 			where: plan.where,
 			inc:   plan.inc,
 		}, args)
+	case 'd':
+		return fastDeleteWhere(s, plan.table, plan.where, args)
 	default:
 		return Result{}, false, nil
 	}
@@ -166,6 +207,8 @@ func simplePlan(query string) (simpleDMLPlan, bool) {
 		plan = simpleDMLPlan{kind: 'i', table: table, params: n}
 	} else if upd, ok := parseSimpleIncrementUpdate(query); ok {
 		plan = simpleDMLPlan{kind: 'u', table: upd.table, col: upd.col, where: upd.where, inc: upd.inc, params: 1}
+	} else if table, where, ok := parseSimpleDeleteWhere(query); ok {
+		plan = simpleDMLPlan{kind: 'd', table: table, where: where, params: 1}
 	}
 	actual, _ := simpleDMLCache.LoadOrStore(query, plan)
 	plan = actual.(simpleDMLPlan)
@@ -233,29 +276,101 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 	if !canFastUpdateColumn(s, t, col.Name) {
 		return Result{}, false, nil
 	}
-	id, ok := asInt(args[0])
-	if !ok {
-		return Result{RowsAffected: 0}, true, nil
-	}
 	data := s.Tables[t.Name]
-	pos, ok := data.rowids[id]
-	if !ok || data.Rows[pos].Deleted != 0 {
+	if data == nil {
 		return Result{RowsAffected: 0}, true, nil
 	}
-	cur, ok := asInt(data.Rows[pos].Values[col.Name])
-	if !ok {
+	var positions []int
+	if pk != "" && upd.where == pk {
+		id, ok := asInt(args[0])
+		if !ok {
+			return Result{RowsAffected: 0}, true, nil
+		}
+		pos, ok := data.lookupRowID(id)
+		if !ok {
+			return Result{RowsAffected: 0}, true, nil
+		}
+		positions = []int{pos}
+	} else if idxName := usableIndexForColumn(s, upd.table, upd.where); idxName != "" {
+		idx := catalog.Index{Name: idxName, Columns: []string{upd.where}}
+		positions = data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, args[0]))
+	} else {
 		return Result{}, false, nil
 	}
-	cv, err := coerce(col, cur+upd.inc, t.Strict)
-	if err != nil {
-		return Result{}, true, err
+	var affected int64
+	for _, pos := range positions {
+		if pos < 0 || pos >= len(data.Rows) {
+			continue
+		}
+		row := &data.Rows[pos]
+		if row.Deleted != 0 {
+			continue
+		}
+		cur, ok := asInt(row.Values[col.Name])
+		if !ok {
+			return Result{}, false, nil
+		}
+		cv, err := coerce(col, cur+upd.inc, t.Strict)
+		if err != nil {
+			return Result{}, true, err
+		}
+		row.Values[col.Name] = cv
+		affected++
 	}
-	data.Rows[pos].Values[col.Name] = cv
-	return Result{RowsAffected: 1}, true, nil
+	return Result{RowsAffected: affected}, true, nil
+}
+
+func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result, bool, error) {
+	if len(args) != 1 {
+		return Result{}, false, nil
+	}
+	t, ok := s.Catalog.Table(table)
+	if !ok {
+		return Result{}, true, fmt.Errorf("table does not exist: %s", table)
+	}
+	data := s.Tables[t.Name]
+	if data == nil {
+		return Result{RowsAffected: 0}, true, nil
+	}
+	var positions []int
+	if pk := integerPrimaryKeyColumn(t); pk == where || where == "rowid" || where == "_rowid_" || where == "oid" {
+		id, ok := asInt(args[0])
+		if !ok {
+			return Result{RowsAffected: 0}, true, nil
+		}
+		pos, ok := data.lookupRowID(id)
+		if !ok {
+			return Result{RowsAffected: 0}, true, nil
+		}
+		positions = []int{pos}
+	} else if idxName := usableIndexForColumn(s, table, where); idxName != "" {
+		idx := catalog.Index{Name: idxName, Columns: []string{where}}
+		positions = data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, args[0]))
+	} else {
+		return Result{}, false, nil
+	}
+	var affected int64
+	for _, pos := range positions {
+		if pos < 0 || pos >= len(data.Rows) {
+			continue
+		}
+		row := &data.Rows[pos]
+		if row.Deleted != 0 {
+			continue
+		}
+		if s.Pragmas.ForeignKeys {
+			if err := validateDeleteReferences(s, table, row.Values); err != nil {
+				return Result{}, true, err
+			}
+		}
+		row.Deleted = s.NextTx
+		affected++
+	}
+	return Result{RowsAffected: affected}, true, nil
 }
 
 func fastInsertDML(s *persistedState, st *ast.InsertStmt, args []any) (Result, bool, error) {
-	if st.OnConflictDoNothing || st.Ignore || len(st.OnConflictUpdate) > 0 || len(st.Values) != 1 {
+	if st.Replace || st.OnConflictDoNothing || st.Ignore || len(st.OnConflictUpdate) > 0 || len(st.Values) != 1 {
 		return Result{}, false, nil
 	}
 	t, data, err := tableForWrite(s, qname(st.Table))
@@ -327,7 +442,7 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 				if data.rowids == nil {
 					data.rebuildRuntime(t)
 				}
-				if pos, ok := data.rowids[rowid]; ok && pos >= 0 && pos < len(data.Rows) && data.Rows[pos].Deleted == 0 {
+				if pos, ok := data.lookupRowID(rowid); ok && pos >= 0 && pos < len(data.Rows) && data.Rows[pos].Deleted == 0 {
 					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
 				}
 				continue
@@ -346,11 +461,20 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 			data.rebuildRuntime(t)
 		}
 		key := indexRuntimeKey(idx, values)
-		for _, pos := range data.indexes[idx.Name][key] {
+		conflict := false
+		data.eachIndexPosition(idx.Name, key, func(pos int) bool {
 			if pos >= 0 && pos < len(data.Rows) && data.Rows[pos].Deleted == 0 {
-				return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
+				conflict = true
+				return false
 			}
+			return true
+		})
+		if conflict {
+			return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
 		}
+	}
+	if err := validateChecks(t, values); err != nil {
+		return err
 	}
 	if s.Pragmas.ForeignKeys {
 		for _, fk := range t.ForeignKeys {
@@ -363,6 +487,9 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 }
 
 func canFastUpdateColumn(s *persistedState, t *catalog.Table, col string) bool {
+	if len(t.Checks) > 0 {
+		return false
+	}
 	c, _, ok := t.Column(col)
 	if !ok || c.PrimaryKey || c.Unique || c.NotNull || c.References != nil {
 		return false
@@ -472,12 +599,503 @@ func parseSimpleIncrementUpdate(query string) (simpleIncrementUpdate, bool) {
 	return simpleIncrementUpdate{table: table, col: col, where: where, inc: inc}, true
 }
 
+func parseSimpleDeleteWhere(query string) (string, string, bool) {
+	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	fields := strings.Fields(q)
+	if len(fields) != 7 || !strings.EqualFold(fields[0], "delete") || !strings.EqualFold(fields[1], "from") || !strings.EqualFold(fields[3], "where") {
+		return "", "", false
+	}
+	if fields[5] != "=" || fields[6] != "?" {
+		return "", "", false
+	}
+	table := catalog.Normalize(fields[2])
+	where := catalog.Normalize(fields[4])
+	if !isBareIdentifier(table) || !isBareIdentifier(where) {
+		return "", "", false
+	}
+	return table, where, true
+}
+
+func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, bool, error) {
+	plan, ok := parseSimpleSelectPlanCached(query)
+	if !ok {
+		return nil, false, nil
+	}
+	t, ok := s.Catalog.Table(plan.table)
+	if !ok {
+		return nil, true, fmt.Errorf("table does not exist: %s", plan.table)
+	}
+	data := s.Tables[catalog.Normalize(plan.table)]
+	if data == nil {
+		return isql.NewRows(plan.cols, nil), true, nil
+	}
+	cols, projectors, ok := simpleSelectProjectors(t, plan.cols)
+	if !ok {
+		return nil, false, nil
+	}
+	if plan.order.col != "" && columnCollation(t, plan.order.col) != "BINARY" {
+		return nil, false, nil
+	}
+	if plan.order.col != "" && len(plan.conds) > 0 && !simpleSelectOrderCompatible(plan, args) {
+		return nil, false, nil
+	}
+	positions := simpleSelectCandidatePositions(s, plan, data, args)
+	if positions == nil && plan.order.col != "" {
+		positions = simpleSelectOrderPositions(s, plan, data)
+	}
+	if positions != nil && plan.order.desc {
+		reverseInts(positions)
+	}
+	width := len(projectors)
+	capHint := len(data.Rows)
+	if positions != nil {
+		capHint = len(positions)
+	}
+	out := make([]any, 0, capHint*width)
+	emit := func(row rowVersion) {
+		for _, p := range projectors {
+			out = append(out, p(row))
+		}
+	}
+	if positions != nil {
+		for _, pos := range positions {
+			if pos < 0 || pos >= len(data.Rows) {
+				continue
+			}
+			row := data.Rows[pos]
+			if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
+				continue
+			}
+			emit(row)
+		}
+	} else if plan.order.col != "" {
+		return nil, false, nil
+	} else {
+		for _, row := range data.Rows {
+			if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
+				continue
+			}
+			emit(row)
+		}
+	}
+	if plan.limit >= 0 {
+		out = applySimpleFlatLimit(out, width, plan.limit, plan.offset)
+	}
+	return isql.NewFlatRows(cols, out), true, nil
+}
+
+func parseSimpleSelectPlanCached(query string) (simpleSelectPlan, bool) {
+	if cached, ok := simpleSelectCache.Load(query); ok {
+		return cached.(simpleSelectPlan), true
+	}
+	plan, ok := parseSimpleSelectPlan(query)
+	if !ok {
+		return simpleSelectPlan{}, false
+	}
+	simpleSelectCache.Store(query, plan)
+	return plan, true
+}
+
+func parseSimpleSelectPlan(query string) (simpleSelectPlan, bool) {
+	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	if !hasFoldPrefix(q, "select ") {
+		return simpleSelectPlan{}, false
+	}
+	fromAt := indexFold(q, " from ")
+	if fromAt < 0 {
+		return simpleSelectPlan{}, false
+	}
+	selectPart := strings.TrimSpace(q[len("select "):fromAt])
+	rest := strings.TrimSpace(q[fromAt+len(" from "):])
+	limit := -1
+	offset := 0
+	if limitAt := indexFold(rest, " limit "); limitAt >= 0 {
+		var ok bool
+		limitPart := strings.TrimSpace(rest[limitAt+len(" limit "):])
+		limit, offset, ok = parseSimpleLimit(limitPart)
+		if !ok {
+			return simpleSelectPlan{}, false
+		}
+		rest = strings.TrimSpace(rest[:limitAt])
+	}
+	var order simpleSelectOrder
+	if orderAt := indexFold(rest, " order by "); orderAt >= 0 {
+		var ok bool
+		orderPart := strings.TrimSpace(rest[orderAt+len(" order by "):])
+		order, ok = parseSimpleOrder(orderPart)
+		if !ok {
+			return simpleSelectPlan{}, false
+		}
+		rest = strings.TrimSpace(rest[:orderAt])
+	}
+	whereAt := indexFold(rest, " where ")
+	tablePart := rest
+	wherePart := ""
+	if whereAt >= 0 {
+		tablePart = strings.TrimSpace(rest[:whereAt])
+		wherePart = strings.TrimSpace(rest[whereAt+len(" where "):])
+	}
+	if tablePart == "" || strings.ContainsAny(tablePart, " \t\n\r,()") {
+		return simpleSelectPlan{}, false
+	}
+	table := catalog.Normalize(tablePart)
+	if !isBareIdentifier(table) {
+		return simpleSelectPlan{}, false
+	}
+	if table == "sqlite_schema" || table == "sqlite_master" {
+		return simpleSelectPlan{}, false
+	}
+	rawCols := strings.Split(selectPart, ",")
+	cols := make([]string, 0, len(rawCols))
+	for _, raw := range rawCols {
+		col := catalog.Normalize(strings.TrimSpace(raw))
+		if col == "" || !isBareIdentifier(col) {
+			return simpleSelectPlan{}, false
+		}
+		cols = append(cols, col)
+	}
+	conds, ok := parseSimpleSelectConds(wherePart)
+	if !ok {
+		return simpleSelectPlan{}, false
+	}
+	return simpleSelectPlan{table: table, cols: cols, conds: conds, order: order, limit: limit, offset: offset}, true
+}
+
+func parseSimpleOrder(part string) (simpleSelectOrder, bool) {
+	fields := strings.Fields(part)
+	if len(fields) == 0 || len(fields) > 2 {
+		return simpleSelectOrder{}, false
+	}
+	col := catalog.Normalize(fields[0])
+	if !isBareIdentifier(col) {
+		return simpleSelectOrder{}, false
+	}
+	order := simpleSelectOrder{col: col}
+	if len(fields) == 2 {
+		switch strings.ToLower(fields[1]) {
+		case "asc":
+		case "desc":
+			order.desc = true
+		default:
+			return simpleSelectOrder{}, false
+		}
+	}
+	return order, true
+}
+
+func parseSimpleLimit(part string) (int, int, bool) {
+	fields := strings.Fields(part)
+	if len(fields) != 1 && len(fields) != 3 {
+		return 0, 0, false
+	}
+	limit, err := strconv.Atoi(fields[0])
+	if err != nil || limit < 0 {
+		return 0, 0, false
+	}
+	offset := 0
+	if len(fields) == 3 {
+		if !strings.EqualFold(fields[1], "offset") {
+			return 0, 0, false
+		}
+		offset, err = strconv.Atoi(fields[2])
+		if err != nil || offset < 0 {
+			return 0, 0, false
+		}
+	}
+	return limit, offset, true
+}
+
+func parseSimpleSelectConds(wherePart string) ([]simpleSelectCond, bool) {
+	if strings.TrimSpace(wherePart) == "" {
+		return nil, true
+	}
+	parts := splitFoldAND(wherePart)
+	conds := make([]simpleSelectCond, 0, len(parts))
+	param := 0
+	for _, part := range parts {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) != 3 {
+			return nil, false
+		}
+		col := catalog.Normalize(fields[0])
+		if !isBareIdentifier(col) {
+			return nil, false
+		}
+		op := fields[1]
+		switch op {
+		case "=", "!=", "<>", "<", "<=", ">", ">=":
+		default:
+			return nil, false
+		}
+		cond := simpleSelectCond{col: col, op: op}
+		if fields[2] == "?" {
+			cond.param = param
+			cond.hasParam = true
+			param++
+		} else {
+			lit, ok := parseSimpleLiteral(fields[2])
+			if !ok {
+				return nil, false
+			}
+			cond.literal = lit
+		}
+		conds = append(conds, cond)
+	}
+	return conds, true
+}
+
+func splitFoldAND(s string) []string {
+	var out []string
+	rest := s
+	for {
+		i := indexFold(rest, " and ")
+		if i < 0 {
+			out = append(out, rest)
+			return out
+		}
+		out = append(out, rest[:i])
+		rest = rest[i+len(" and "):]
+	}
+}
+
+func parseSimpleLiteral(raw string) (any, bool) {
+	if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
+		return strings.ReplaceAll(raw[1:len(raw)-1], "''", "'"), true
+	}
+	if strings.EqualFold(raw, "null") {
+		return nil, true
+	}
+	if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return i, true
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f, true
+	}
+	return nil, false
+}
+
+func simpleSelectProjectors(t *catalog.Table, cols []string) ([]string, []func(rowVersion) any, bool) {
+	names := make([]string, 0, len(cols))
+	projectors := make([]func(rowVersion) any, 0, len(cols))
+	for _, col := range cols {
+		name := col
+		if col == "rowid" || col == "_rowid_" || col == "oid" {
+			names = append(names, name)
+			projectors = append(projectors, func(row rowVersion) any { return row.RowID })
+			continue
+		}
+		if _, _, ok := t.Column(col); !ok {
+			return nil, nil, false
+		}
+		c := col
+		names = append(names, name)
+		projectors = append(projectors, func(row rowVersion) any { return row.Values[c] })
+	}
+	return names, projectors, true
+}
+
+func simpleSelectCandidatePositions(s *persistedState, plan simpleSelectPlan, data *tableData, args []any) []int {
+	for _, cond := range plan.conds {
+		if cond.op != "=" {
+			continue
+		}
+		v, ok := simpleSelectCondValue(cond, args)
+		if !ok {
+			return []int{}
+		}
+		if positions, used := lookupSimpleSelectEquality(s, plan.table, data, cond.col, v); used {
+			return positions
+		}
+	}
+	col, start, end, ok := simpleSelectRange(plan.conds, args)
+	if !ok {
+		return nil
+	}
+	return rangeCandidatePositions(s, plan.table, data, col, start, end)
+}
+
+func simpleSelectOrderPositions(s *persistedState, plan simpleSelectPlan, data *tableData) []int {
+	t, _ := s.Catalog.Table(plan.table)
+	col := plan.order.col
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		return data.rangeRowIDs(nil, nil)
+	}
+	idxName := usableIndexForColumn(s, plan.table, col)
+	if idxName == "" {
+		return nil
+	}
+	return data.rangeIndexPositions(idxName, nil, nil)
+}
+
+func simpleSelectOrderCompatible(plan simpleSelectPlan, args []any) bool {
+	for _, cond := range plan.conds {
+		if cond.col == plan.order.col && cond.op == "=" {
+			return true
+		}
+	}
+	col, _, _, ok := simpleSelectRange(plan.conds, args)
+	return ok && col == plan.order.col
+}
+
+func lookupSimpleSelectEquality(s *persistedState, table string, data *tableData, col string, val any) ([]int, bool) {
+	t, _ := s.Catalog.Table(table)
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		id, ok := asInt(val)
+		if !ok {
+			return []int{}, true
+		}
+		pos, ok := data.lookupRowID(id)
+		if !ok {
+			return []int{}, true
+		}
+		return []int{pos}, true
+	}
+	idxName := usableIndexForColumn(s, table, col)
+	if idxName == "" {
+		return nil, false
+	}
+	var idx catalog.Index
+	for _, candidate := range t.Indexes {
+		if candidate.Name == idxName {
+			idx = candidate
+			break
+		}
+	}
+	return data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, val)), true
+}
+
+func simpleSelectRange(conds []simpleSelectCond, args []any) (string, *rangeBound, *rangeBound, bool) {
+	var col string
+	var start, end *rangeBound
+	for _, cond := range conds {
+		switch cond.op {
+		case "<", "<=", ">", ">=":
+		default:
+			continue
+		}
+		v, ok := simpleSelectCondValue(cond, args)
+		if !ok {
+			return "", nil, nil, false
+		}
+		if col == "" {
+			col = cond.col
+		} else if col != cond.col {
+			return "", nil, nil, false
+		}
+		bound := &rangeBound{value: v, inclusive: cond.op == "<=" || cond.op == ">="}
+		if cond.op == ">" || cond.op == ">=" {
+			start = tighterStart(start, bound)
+		} else {
+			end = tighterEnd(end, bound)
+		}
+	}
+	return col, start, end, col != ""
+}
+
+func simpleSelectMatches(t *catalog.Table, plan simpleSelectPlan, row rowVersion, args []any) bool {
+	for _, cond := range plan.conds {
+		right, ok := simpleSelectCondValue(cond, args)
+		if !ok {
+			return false
+		}
+		left := any(nil)
+		if cond.col == "rowid" || cond.col == "_rowid_" || cond.col == "oid" {
+			left = row.RowID
+		} else {
+			left = row.Values[cond.col]
+		}
+		c, ok := compareValues(left, right, columnCollation(t, cond.col))
+		if !ok {
+			return false
+		}
+		switch cond.op {
+		case "=":
+			if c != 0 {
+				return false
+			}
+		case "!=", "<>":
+			if c == 0 {
+				return false
+			}
+		case "<":
+			if c >= 0 {
+				return false
+			}
+		case "<=":
+			if c > 0 {
+				return false
+			}
+		case ">":
+			if c <= 0 {
+				return false
+			}
+		case ">=":
+			if c < 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func applySimpleFlatLimit(rows []any, width, limit, offset int) []any {
+	if width <= 0 {
+		return rows
+	}
+	total := len(rows) / width
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return rows[offset*width : end*width]
+}
+
+func reverseInts(values []int) {
+	for i, j := 0, len(values)-1; i < j; i, j = i+1, j-1 {
+		values[i], values[j] = values[j], values[i]
+	}
+}
+
+func simpleSelectCondValue(cond simpleSelectCond, args []any) (any, bool) {
+	if !cond.hasParam {
+		return cond.literal, true
+	}
+	if cond.param < 0 || cond.param >= len(args) {
+		return nil, false
+	}
+	return args[cond.param], true
+}
+
+func columnCollation(t *catalog.Table, col string) string {
+	if t == nil {
+		return "BINARY"
+	}
+	if c, _, ok := t.Column(col); ok && c.Collation != "" {
+		return strings.ToUpper(c.Collation)
+	}
+	return "BINARY"
+}
+
+func hasFoldPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+func indexFold(s, needle string) int {
+	return strings.Index(strings.ToLower(s), strings.ToLower(needle))
+}
+
 func queryRows(ctx context.Context, s *persistedState, query string, args ...any) (*Rows, error) {
 	if rows, ok, err := queryPragma(s, query); ok || err != nil {
 		return rows, err
 	}
 	if rows, ok := queryPlan(s, query); ok {
 		return rows, nil
+	}
+	if rows, ok, err := execSimpleSelectPlan(s, query, args); ok || err != nil {
+		return rows, err
 	}
 	stmt, err := parseStatementCached(query)
 	if err != nil {
@@ -500,6 +1118,9 @@ func queryRows(ctx context.Context, s *persistedState, query string, args ...any
 
 func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, rawSQL string) (Result, error) {
 	name := qname(st.Table)
+	if st.Select != nil {
+		return execCreateTableAsSelect(s, st, rawSQL)
+	}
 	t := &catalog.Table{Name: name, Strict: strict, SQL: strings.TrimSpace(rawSQL)}
 	seenPK := false
 	for _, col := range st.Columns {
@@ -514,7 +1135,7 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 			NotNull:    col.NotNull || col.PrimaryKey,
 			PrimaryKey: col.PrimaryKey,
 			Unique:     col.Unique,
-			Collation:  "BINARY",
+			Collation:  columnCollationFromCreate(rawSQL, col.Name.Unquoted),
 		}
 		if col.Default != nil {
 			v, err := evalExpr(col.Default, nil, &binder{})
@@ -525,7 +1146,7 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 			c.DefaultSQL = formatDefaultSQL(c.Default)
 		}
 		if col.Check != nil {
-			c.Check = "check"
+			c.Check = columnCheckFromCreate(rawSQL, col.Name.Unquoted)
 		}
 		if col.References != nil {
 			refCols := make([]string, 0, len(col.References.Columns))
@@ -555,6 +1176,7 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 		}
 		t.Columns = append(t.Columns, c)
 	}
+	t.Checks = tableChecksFromCreate(rawSQL)
 	for _, tc := range st.Constraints {
 		if tc.Type != ast.PrimaryKeyConstraint && tc.Type != ast.UniqueConstraint && tc.Type != ast.ForeignKeyConstraint {
 			continue
@@ -600,6 +1222,210 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 	s.Tables[catalog.Normalize(name)] = &tableData{}
 	s.Tables[catalog.Normalize(name)].rebuildRuntime(t)
 	return Result{}, nil
+}
+
+func execCreateTableAsSelect(s *persistedState, st *ast.CreateTableStmt, rawSQL string) (Result, error) {
+	name := qname(st.Table)
+	rows, err := execSelect(s, st.Select, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	t := &catalog.Table{Name: name, SQL: strings.TrimSpace(rawSQL)}
+	for i, col := range rows.Columns {
+		decl := ctasDeclType(s, st.Select, i)
+		typ, _ := catalog.ParseType(decl)
+		if decl == "" {
+			typ = catalog.Any
+		}
+		t.Columns = append(t.Columns, catalog.Column{Name: catalog.Normalize(col), Type: typ, DeclType: decl, Collation: "BINARY"})
+	}
+	if err := s.Catalog.CreateTable(t, st.IfNotExists); err != nil {
+		return Result{}, err
+	}
+	data := &tableData{}
+	s.Tables[catalog.Normalize(name)] = data
+	for {
+		values, ok := rows.Next()
+		if !ok {
+			break
+		}
+		row := make(map[string]any, len(t.Columns))
+		for i, col := range t.Columns {
+			if i < len(values) {
+				row[col.Name] = values[i]
+			}
+		}
+		rowid := t.NextRowID
+		data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+		t.NextRowID++
+	}
+	data.rebuildRuntime(t)
+	s.Pragmas.SchemaVer++
+	return Result{RowsAffected: int64(len(data.Rows))}, nil
+}
+
+func columnCollationFromCreate(rawSQL, colName string) string {
+	defs := tableDefinitionParts(rawSQL)
+	needle := catalog.Normalize(strings.Trim(colName, `"'[]`))
+	for _, def := range defs {
+		fields := strings.Fields(def)
+		if len(fields) < 3 || catalog.Normalize(strings.Trim(fields[0], `"'[]`)) != needle {
+			continue
+		}
+		for i := 1; i+1 < len(fields); i++ {
+			if strings.EqualFold(fields[i], "collate") {
+				switch strings.ToUpper(strings.Trim(fields[i+1], `"'[]`)) {
+				case "NOCASE":
+					return "NOCASE"
+				case "RTRIM":
+					return "RTRIM"
+				default:
+					return "BINARY"
+				}
+			}
+		}
+	}
+	return "BINARY"
+}
+
+func columnCheckFromCreate(rawSQL, colName string) string {
+	defs := tableDefinitionParts(rawSQL)
+	needle := catalog.Normalize(strings.Trim(colName, `"'[]`))
+	for _, def := range defs {
+		fields := strings.Fields(def)
+		if len(fields) == 0 || catalog.Normalize(strings.Trim(fields[0], `"'[]`)) != needle {
+			continue
+		}
+		return firstCheckExpression(def)
+	}
+	return ""
+}
+
+func tableChecksFromCreate(rawSQL string) []string {
+	var checks []string
+	for _, def := range tableDefinitionParts(rawSQL) {
+		fields := strings.Fields(def)
+		if len(fields) == 0 {
+			continue
+		}
+		head := strings.ToLower(strings.Trim(fields[0], `"'[]`))
+		if head != "check" && head != "constraint" {
+			continue
+		}
+		if check := firstCheckExpression(def); check != "" {
+			checks = append(checks, check)
+		}
+	}
+	return checks
+}
+
+func firstCheckExpression(def string) string {
+	lower := strings.ToLower(def)
+	idx := strings.Index(lower, "check")
+	if idx < 0 {
+		return ""
+	}
+	open := strings.Index(def[idx:], "(")
+	if open < 0 {
+		return ""
+	}
+	open += idx
+	depth := 0
+	inQuote := rune(0)
+	for i, r := range def[open:] {
+		pos := open + i
+		if inQuote != 0 {
+			if r == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			inQuote = r
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return strings.TrimSpace(def[open+1 : pos])
+			}
+		}
+	}
+	return ""
+}
+
+func tableDefinitionParts(rawSQL string) []string {
+	start := strings.Index(rawSQL, "(")
+	end := strings.LastIndex(rawSQL, ")")
+	if start < 0 || end <= start {
+		return nil
+	}
+	body := rawSQL[start+1 : end]
+	var parts []string
+	depth := 0
+	inQuote := rune(0)
+	last := 0
+	for i, r := range body {
+		if inQuote != 0 {
+			if r == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			inQuote = r
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(body[last:i]))
+				last = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(body[last:]))
+	return parts
+}
+
+func ctasDeclType(s *persistedState, sel *ast.SelectStmt, idx int) string {
+	if sel == nil || idx < 0 || idx >= len(sel.Columns) {
+		return ""
+	}
+	name := exprColumnName(sel.Columns[idx].Expr)
+	if name == "" {
+		return ""
+	}
+	for _, ref := range sel.From {
+		if simple, ok := ref.(*ast.SimpleTable); ok {
+			t, ok := s.Catalog.Table(qname(simple.Name))
+			if !ok {
+				continue
+			}
+			if col, _, ok := t.Column(name); ok {
+				switch col.Type {
+				case catalog.Integer:
+					return "INT"
+				case catalog.Real:
+					return "REAL"
+				case catalog.Text:
+					return "TEXT"
+				case catalog.Numeric:
+					return "NUM"
+				case catalog.Blob:
+					return ""
+				default:
+					return col.DeclType
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func execDropTable(s *persistedState, st *ast.DropTableStmt) (Result, error) {
@@ -830,6 +1656,79 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 	}
 	var affected int64
 	var last int64
+	insert := func(row map[string]any) (bool, int64, error) {
+		rowid := t.NextRowID
+		if pk := integerPrimaryKeyColumn(t); pk != "" {
+			if row[pk] == nil {
+				row[pk] = rowid
+			} else if id, ok := asInt(row[pk]); ok {
+				rowid = id
+			}
+		}
+		if err := validateRow(s, t, data, row, 0); err != nil {
+			if st.Replace {
+				deleteReplaceConflicts(s, t, data, row)
+				data.rebuildRuntime(t)
+			} else if st.OnConflictDoNothing || st.Ignore {
+				return false, 0, nil
+			} else if len(st.OnConflictUpdate) == 0 {
+				return false, 0, err
+			} else {
+				if err := applyUpsert(s, t, data, row, st.OnConflictUpdate, args); err != nil {
+					return false, 0, err
+				}
+				return true, 0, nil
+			}
+		}
+		if st.Replace {
+			if err := validateRow(s, t, data, row, 0); err != nil {
+				return false, 0, err
+			}
+		}
+		data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
+		if rowid >= t.NextRowID {
+			t.NextRowID = rowid + 1
+		}
+		data.addRuntime(t, len(data.Rows)-1)
+		return true, rowid, nil
+	}
+	if st.Select != nil {
+		rows, err := execSelect(s, st.Select, args)
+		if err != nil {
+			return Result{}, err
+		}
+		for {
+			values, ok := rows.Next()
+			if !ok {
+				break
+			}
+			if len(values) != len(cols) {
+				return Result{}, errors.New("insert column/value count mismatch")
+			}
+			row := make(map[string]any, len(t.Columns))
+			for _, col := range t.Columns {
+				row[col.Name] = col.Default
+			}
+			for i, v := range values {
+				cv, err := coerce(cols[i], v, t.Strict)
+				if err != nil {
+					return Result{}, err
+				}
+				row[cols[i].Name] = cv
+			}
+			ok, rowid, err := insert(row)
+			if err != nil {
+				return Result{}, err
+			}
+			if ok {
+				affected++
+				if rowid != 0 {
+					last = rowid
+				}
+			}
+		}
+		return Result{RowsAffected: affected, LastInsertID: last}, nil
+	}
 	bind := binder{args: args}
 	for _, values := range st.Values {
 		if len(values) != len(cols) {
@@ -850,34 +1749,16 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 			}
 			row[cols[i].Name] = cv
 		}
-		rowid := t.NextRowID
-		if pk := integerPrimaryKeyColumn(t); pk != "" {
-			if row[pk] == nil {
-				row[pk] = rowid
-			} else if id, ok := asInt(row[pk]); ok {
-				rowid = id
-			}
+		ok, rowid, err := insert(row)
+		if err != nil {
+			return Result{}, err
 		}
-		if err := validateRow(s, t, data, row, 0); err != nil {
-			if st.OnConflictDoNothing || st.Ignore {
-				continue
-			}
-			if len(st.OnConflictUpdate) == 0 {
-				return Result{}, err
-			}
-			if err := applyUpsert(s, t, data, row, st.OnConflictUpdate, args); err != nil {
-				return Result{}, err
-			}
+		if ok {
 			affected++
-			continue
+			if rowid != 0 {
+				last = rowid
+			}
 		}
-		last = rowid
-		data.Rows = append(data.Rows, rowVersion{RowID: rowid, Values: row, Created: s.NextTx})
-		if rowid >= t.NextRowID {
-			t.NextRowID = rowid + 1
-		}
-		data.addRuntime(t, len(data.Rows)-1)
-		affected++
 	}
 	return Result{RowsAffected: affected, LastInsertID: last}, nil
 }
@@ -890,7 +1771,7 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 		}
 		conflict := false
 		for _, col := range t.Columns {
-			if (col.PrimaryKey || col.Unique) && reflect.DeepEqual(row.Values[col.Name], incoming[col.Name]) {
+			if (col.PrimaryKey || col.Unique) && valuesEqual(row.Values[col.Name], incoming[col.Name], col.Collation) {
 				conflict = true
 				break
 			}
@@ -928,6 +1809,42 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 	return errors.New("upsert conflict row not found")
 }
 
+func deleteReplaceConflicts(s *persistedState, t *catalog.Table, data *tableData, incoming map[string]any) {
+	for i := range data.Rows {
+		row := &data.Rows[i]
+		if row.Deleted != 0 {
+			continue
+		}
+		if rowConflictsForReplace(t, row.Values, incoming) {
+			row.Deleted = s.NextTx
+		}
+	}
+}
+
+func rowConflictsForReplace(t *catalog.Table, existing, incoming map[string]any) bool {
+	for _, col := range t.Columns {
+		if (col.PrimaryKey || col.Unique) && incoming[col.Name] != nil && valuesEqual(existing[col.Name], incoming[col.Name], col.Collation) {
+			return true
+		}
+	}
+	for _, idx := range t.Indexes {
+		if !idx.Unique || len(idx.Columns) == 0 {
+			continue
+		}
+		same := true
+		for _, col := range idx.Columns {
+			if incoming[col] == nil || !valuesEqual(existing[col], incoming[col], columnCollation(t, col)) {
+				same = false
+				break
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
+}
+
 func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, error) {
 	name, err := tableNameFromRefs(st.Tables)
 	if err != nil {
@@ -937,15 +1854,21 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 	if err != nil {
 		return Result{}, err
 	}
-	bind := binder{args: args}
+	setParamCount := 0
+	for _, asn := range st.Set {
+		setParamCount += countParams(asn.Value)
+	}
 	var affected int64
-	for i := range data.Rows {
+	positions := mutationCandidatePositions(s, name, data, st.Where, args, setParamCount)
+	changed := false
+	runtimeTouched := updateTouchesRuntime(t, st.Set)
+	for _, i := range positions {
 		row := &data.Rows[i]
 		if row.Deleted != 0 {
 			continue
 		}
-		whereBind := bind
-		ok, err := matchWhere(st.Where, row.Values, &whereBind)
+		whereBind := binder{args: args, pos: setParamCount}
+		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
 		if err != nil {
 			return Result{}, err
 		}
@@ -953,12 +1876,13 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 			continue
 		}
 		next := cloneValues(row.Values)
+		setBind := binder{args: args}
 		for _, asn := range st.Set {
 			col, _, ok := t.Column(asn.Column.Unquoted)
 			if !ok {
 				return Result{}, fmt.Errorf("unknown column: %s", asn.Column.Unquoted)
 			}
-			v, err := evalExpr(asn.Value, next, &bind)
+			v, err := evalExpr(asn.Value, next, &setBind)
 			if err != nil {
 				return Result{}, err
 			}
@@ -977,10 +1901,35 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 			}
 		}
 		row.Values = next
-		data.rebuildRuntime(t)
+		changed = true
 		affected++
 	}
+	if changed && runtimeTouched {
+		data.rebuildRuntime(t)
+	}
 	return Result{RowsAffected: affected}, nil
+}
+
+func updateTouchesRuntime(t *catalog.Table, assigns []ast.Assignment) bool {
+	for _, asn := range assigns {
+		name := catalog.Normalize(asn.Column.Unquoted)
+		if pk := integerPrimaryKeyColumn(t); pk == name {
+			return true
+		}
+		for _, col := range t.Columns {
+			if col.Name == name && (col.PrimaryKey || col.Unique) {
+				return true
+			}
+		}
+		for _, idx := range t.Indexes {
+			for _, idxCol := range idx.Columns {
+				if idxCol == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, error) {
@@ -994,13 +1943,15 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 	}
 	bind := binder{args: args}
 	var affected int64
-	for i := range data.Rows {
+	positions := mutationCandidatePositions(s, name, data, st.Where, args, 0)
+	changed := false
+	for _, i := range positions {
 		row := &data.Rows[i]
 		if row.Deleted != 0 {
 			continue
 		}
 		whereBind := bind
-		ok, err := matchWhere(st.Where, row.Values, &whereBind)
+		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
 		if err != nil {
 			return Result{}, err
 		}
@@ -1011,11 +1962,35 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 				}
 			}
 			row.Deleted = s.NextTx
-			data.rebuildRuntime(s.Catalog.Tables[catalog.Normalize(name)])
+			changed = true
 			affected++
 		}
 	}
+	if changed {
+		data.rebuildRuntime(s.Catalog.Tables[catalog.Normalize(name)])
+	}
 	return Result{RowsAffected: affected}, nil
+}
+
+func mutationCandidatePositions(s *persistedState, table string, data *tableData, where ast.Expr, args []any, argOffset int) []int {
+	if argOffset == 0 {
+		if positions := candidatePositions(s, table, data, where, args); positions != nil {
+			return positions
+		}
+	}
+	if argOffset > 0 {
+		if argOffset <= len(args) {
+			args = args[argOffset:]
+			if positions := candidatePositions(s, table, data, where, args); positions != nil {
+				return positions
+			}
+		}
+	}
+	positions := make([]int, len(data.Rows))
+	for i := range data.Rows {
+		positions[i] = i
+	}
+	return positions
 }
 
 func validateDeleteReferences(s *persistedState, table string, old map[string]any) error {
@@ -1151,7 +2126,7 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 	var filtered []rowContext
 	for _, row := range contexts {
 		whereBind := bind
-		ok, err := matchWhere(st.Where, row.Values, &whereBind)
+		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
 		if err != nil {
 			return nil, err
 		}
@@ -1163,9 +2138,9 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 	if len(st.GroupBy) == 0 && !hasAggregate(exprs) && len(st.OrderBy) > 0 {
 		sort.SliceStable(filtered, func(i, j int) bool {
 			for _, item := range st.OrderBy {
-				lv, _ := evalExpr(item.Expr, filtered[i].Values, &binder{args: args})
-				rv, _ := evalExpr(item.Expr, filtered[j].Values, &binder{args: args})
-				c, _ := compareValues(lv, rv, "BINARY")
+				lv, _ := evalExprState(s, item.Expr, filtered[i].Values, &binder{args: args})
+				rv, _ := evalExprState(s, item.Expr, filtered[j].Values, &binder{args: args})
+				c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
 				if c == 0 {
 					continue
 				}
@@ -1180,7 +2155,7 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 	for _, row := range filtered {
 		values := make([]any, 0, len(exprs))
 		for _, expr := range exprs {
-			v, err := evalExpr(expr, row.Values, &bind)
+			v, err := evalExprState(s, expr, row.Values, &bind)
 			if err != nil {
 				return nil, err
 			}
@@ -1189,7 +2164,7 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 		out = append(out, values)
 	}
 	if len(st.GroupBy) > 0 || hasAggregate(exprs) {
-		out, cols, err = aggregateRows(contexts, st, cols, exprs, args)
+		out, cols, err = aggregateRows(s, contexts, st, cols, exprs, args)
 		if err != nil {
 			return nil, err
 		}
@@ -1199,9 +2174,9 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 			li := rowFromOutput(cols, out[i])
 			lj := rowFromOutput(cols, out[j])
 			for _, item := range st.OrderBy {
-				lv, _ := evalExpr(item.Expr, li, &binder{args: args})
-				rv, _ := evalExpr(item.Expr, lj, &binder{args: args})
-				c, _ := compareValues(lv, rv, "BINARY")
+				lv, _ := evalExprState(s, item.Expr, li, &binder{args: args})
+				rv, _ := evalExprState(s, item.Expr, lj, &binder{args: args})
+				c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
 				if c == 0 {
 					continue
 				}
@@ -1277,7 +2252,7 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 				continue
 			}
 			row := data.Rows[pos]
-			if row.Deleted != 0 || !predicate(row) {
+			if row.Deleted != 0 {
 				continue
 			}
 			for _, p := range projectors {
@@ -1516,27 +2491,54 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 	if !ok {
 		return nil, false, nil
 	}
-	col := exprColumnName(be.Left)
-	valueExpr := be.Right
-	if col == "" {
-		col = exprColumnName(be.Right)
-		valueExpr = be.Left
+	switch be.Op {
+	case lexer.AND, lexer.OR:
+		left, ok, err := fastPredicate(be.Left, args)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		right, ok, err := fastPredicate(be.Right, args)
+		if err != nil || !ok {
+			return nil, ok, err
+		}
+		if be.Op == lexer.AND {
+			return func(row rowVersion) bool { return left(row) && right(row) }, true, nil
+		}
+		return func(row rowVersion) bool { return left(row) || right(row) }, true, nil
 	}
-	if col == "" {
+
+	leftCol := exprColumnName(be.Left)
+	rightCol := exprColumnName(be.Right)
+	if leftCol == "" && rightCol == "" || leftCol != "" && rightCol != "" {
 		return nil, false, nil
+	}
+	col := leftCol
+	valueExpr := be.Right
+	columnOnLeft := true
+	if col == "" {
+		col = rightCol
+		valueExpr = be.Left
+		columnOnLeft = false
 	}
 	val, err := evalExpr(valueExpr, nil, &binder{args: args})
 	if err != nil {
+		if strings.Contains(err.Error(), "unsupported expression") {
+			return nil, false, nil
+		}
 		return nil, true, err
 	}
 	return func(row rowVersion) bool {
-		left := any(nil)
+		rv := any(nil)
 		if col == "rowid" || col == "_rowid_" || col == "oid" {
-			left = row.RowID
+			rv = row.RowID
 		} else {
-			left = row.Values[col]
+			rv = row.Values[col]
 		}
-		c, ok := compareValues(left, val, "BINARY")
+		left, right := rv, val
+		if !columnOnLeft {
+			left, right = val, rv
+		}
+		c, ok := compareValues(left, right, "BINARY")
 		if !ok {
 			return false
 		}
@@ -1561,7 +2563,13 @@ func fastPredicate(expr ast.Expr, args []any) (func(rowVersion) bool, bool, erro
 
 func candidatePositions(s *persistedState, table string, data *tableData, where ast.Expr, args []any) []int {
 	col, val, ok, err := indexedEqualityPredicate(where, args)
-	if err != nil || !ok {
+	if err != nil {
+		return nil
+	}
+	if !ok {
+		if rcol, start, end, rok, rerr := indexedRangePredicate(where, args); rerr == nil && rok {
+			return rangeCandidatePositions(s, table, data, rcol, start, end)
+		}
 		return nil
 	}
 	t, _ := s.Catalog.Table(table)
@@ -1570,7 +2578,7 @@ func candidatePositions(s *persistedState, table string, data *tableData, where 
 		if !ok {
 			return []int{}
 		}
-		pos, ok := data.rowids[id]
+		pos, ok := data.lookupRowID(id)
 		if !ok {
 			return []int{}
 		}
@@ -1581,7 +2589,56 @@ func candidatePositions(s *persistedState, table string, data *tableData, where 
 		return nil
 	}
 	idx := catalog.Index{Name: idxName, Columns: []string{col}}
-	return data.indexes[idxName][runtimeIndexLookupKey(idx, val)]
+	return data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, val))
+}
+
+type rangeBound struct {
+	value     any
+	inclusive bool
+}
+
+func rangeCandidatePositions(s *persistedState, table string, data *tableData, col string, start, end *rangeBound) []int {
+	t, _ := s.Catalog.Table(table)
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		var lo, hi *int64
+		if start != nil {
+			v, ok := asInt(start.value)
+			if !ok {
+				return []int{}
+			}
+			if !start.inclusive {
+				v++
+			}
+			lo = &v
+		}
+		if end != nil {
+			v, ok := asInt(end.value)
+			if !ok {
+				return []int{}
+			}
+			if end.inclusive {
+				v++
+			}
+			hi = &v
+		}
+		return data.rangeRowIDs(lo, hi)
+	}
+	idxName := usableIndexForColumn(s, table, col)
+	if idxName == "" {
+		return nil
+	}
+	var startKey, endKey []byte
+	if start != nil {
+		startKey = []byte(runtimeValueKey(start.value))
+	}
+	if end != nil {
+		if end.inclusive {
+			endKey = append([]byte(runtimeValueKey(end.value)), 0xff)
+		} else {
+			endKey = []byte(runtimeValueKey(end.value))
+		}
+	}
+	return data.rangeIndexPositions(idxName, startKey, endKey)
 }
 
 func runtimeIndexLookupKey(idx catalog.Index, val any) string {
@@ -1638,11 +2695,18 @@ func queryPlan(s *persistedState, query string) (*Rows, bool) {
 		case *ast.SimpleTable:
 			name := qname(r.Name)
 			detail := "SCAN " + name
-			if idx := usableIndexForWhere(s, name, sel.Where); idx != "" {
-				detail = "SEARCH " + name + " USING INDEX " + idx
+			if idx, primary := usableAccessForWhere(s, name, sel.Where); idx != "" {
+				if primary {
+					detail = "SEARCH " + name + " USING INTEGER PRIMARY KEY"
+				} else if coveringIndexForSelect(s, name, idx, sel.Columns) {
+					detail = "SEARCH " + name + " USING COVERING INDEX " + idx
+				} else {
+					detail = "SEARCH " + name + " USING INDEX " + idx
+				}
 			}
 			rows = append(rows, []any{int64(len(rows)), int64(0), int64(0), detail})
 		case *ast.JoinTable:
+			rows = append(rows, []any{int64(len(rows)), int64(0), int64(0), "NESTED LOOP JOIN"})
 			walk(r.Left)
 			walk(r.Right)
 		}
@@ -1650,7 +2714,7 @@ func queryPlan(s *persistedState, query string) (*Rows, bool) {
 	for _, ref := range sel.From {
 		walk(ref)
 	}
-	if len(sel.OrderBy) > 0 {
+	if len(sel.OrderBy) > 0 && !orderByUsesIndex(s, sel) {
 		rows = append(rows, []any{int64(len(rows)), int64(0), int64(0), "USE TEMP B-TREE FOR ORDER BY"})
 	}
 	if len(sel.GroupBy) > 0 {
@@ -1659,19 +2723,100 @@ func queryPlan(s *persistedState, query string) (*Rows, bool) {
 	return isql.NewRows([]string{"id", "parent", "notused", "detail"}, rows), true
 }
 
+func coveringIndexForSelect(s *persistedState, table, index string, cols []ast.SelectColumn) bool {
+	t, ok := s.Catalog.Table(table)
+	if !ok {
+		return false
+	}
+	var idx *catalog.Index
+	for i := range t.Indexes {
+		if t.Indexes[i].Name == index {
+			idx = &t.Indexes[i]
+			break
+		}
+	}
+	if idx == nil || len(idx.Columns) == 0 {
+		return false
+	}
+	indexCols := make(map[string]struct{}, len(idx.Columns))
+	for _, col := range idx.Columns {
+		indexCols[col] = struct{}{}
+	}
+	for _, sel := range cols {
+		if sel.Star {
+			return false
+		}
+		col := exprColumnName(sel.Expr)
+		if col == "" {
+			return false
+		}
+		if col == "rowid" || col == "_rowid_" || col == "oid" {
+			if integerPrimaryKeyColumn(t) != "" {
+				continue
+			}
+			return false
+		}
+		if _, ok := indexCols[col]; !ok {
+			return false
+		}
+	}
+	return len(cols) > 0
+}
+
+func orderByUsesIndex(s *persistedState, sel *ast.SelectStmt) bool {
+	if sel == nil || len(sel.From) != 1 || len(sel.OrderBy) != 1 {
+		return false
+	}
+	simple, ok := sel.From[0].(*ast.SimpleTable)
+	if !ok {
+		return false
+	}
+	table := qname(simple.Name)
+	col := exprColumnName(sel.OrderBy[0].Expr)
+	if col == "" {
+		return false
+	}
+	if _, primary := usableAccessForColumn(s, table, col); primary {
+		return true
+	}
+	if usableIndexForColumn(s, table, col) == "" {
+		return false
+	}
+	if sel.Where == nil {
+		return true
+	}
+	rcol, _, _, rok, _ := indexedRangePredicate(sel.Where, nil)
+	if rok {
+		return rcol == col
+	}
+	ecol, _, eok, _ := indexedEqualityPredicate(sel.Where, nil)
+	return eok && ecol == col
+}
+
 func usableIndexForWhere(s *persistedState, table string, expr ast.Expr) string {
-	if expr == nil {
+	idx, primary := usableAccessForWhere(s, table, expr)
+	if primary {
 		return ""
+	}
+	return idx
+}
+
+func usableAccessForWhere(s *persistedState, table string, expr ast.Expr) (string, bool) {
+	if expr == nil {
+		return "", false
+	}
+	if col, _, _, ok, err := indexedRangePredicate(expr, nil); err == nil && ok {
+		return usableAccessForColumn(s, table, col)
 	}
 	if be, ok := expr.(*ast.BinaryExpr); ok {
 		if col := exprColumnName(be.Left); col != "" {
-			return usableIndexForColumn(s, table, col)
+			return usableAccessForColumn(s, table, col)
 		}
 		if col := exprColumnName(be.Right); col != "" {
-			return usableIndexForColumn(s, table, col)
+			return usableAccessForColumn(s, table, col)
 		}
 	}
-	return ""
+	return "", false
 }
 
 func execPragma(s *persistedState, query string) (Result, bool, error) {
@@ -1733,6 +2878,10 @@ func queryPragma(s *persistedState, query string) (*Rows, bool, error) {
 			table := strings.TrimSuffix(strings.TrimPrefix(name, "index_list("), ")")
 			return pragmaIndexList(s, strings.Trim(table, `'"`)), true, nil
 		}
+		if strings.HasPrefix(name, "index_info(") {
+			index := strings.TrimSuffix(strings.TrimPrefix(name, "index_info("), ")")
+			return pragmaIndexInfo(s, strings.Trim(index, `'"`)), true, nil
+		}
 		if strings.HasPrefix(name, "foreign_key_list(") {
 			table := strings.TrimSuffix(strings.TrimPrefix(name, "foreign_key_list("), ")")
 			return pragmaForeignKeyList(s, strings.Trim(table, `'"`)), true, nil
@@ -1776,6 +2925,15 @@ func stripSQLiteStrict(query string) (string, bool) {
 		stripped += ";"
 	}
 	return stripped, true
+}
+
+func normalizeInsertOrReplace(query string) string {
+	q := strings.TrimSpace(query)
+	prefix := "insert or replace into "
+	if len(q) >= len(prefix) && strings.EqualFold(q[:len(prefix)], prefix) {
+		return "REPLACE INTO " + q[len(prefix):]
+	}
+	return query
 }
 
 func formatDefaultSQL(v any) string {
@@ -1831,6 +2989,27 @@ func pragmaIndexList(s *persistedState, table string) *Rows {
 		rows = append(rows, []any{int64(i), idx.Name, unique, "c", partial})
 	}
 	return isql.NewRows([]string{"seq", "name", "unique", "origin", "partial"}, rows)
+}
+
+func pragmaIndexInfo(s *persistedState, index string) *Rows {
+	cols := []string{"seqno", "cid", "name"}
+	for _, t := range s.Catalog.Tables {
+		for _, idx := range t.Indexes {
+			if idx.Name != catalog.Normalize(index) && idx.Name != index {
+				continue
+			}
+			rows := make([][]any, 0, len(idx.Columns))
+			for seq, name := range idx.Columns {
+				cid := int64(-1)
+				if _, i, ok := t.Column(name); ok {
+					cid = int64(i)
+				}
+				rows = append(rows, []any{int64(seq), cid, name})
+			}
+			return isql.NewRows(cols, rows)
+		}
+	}
+	return isql.NewRows(cols, nil)
 }
 
 func pragmaForeignKeyList(s *persistedState, table string) *Rows {
@@ -1904,7 +3083,7 @@ func selectVirtualSchema(s *persistedState, st *ast.SelectStmt, args []any) (*Ro
 	}
 	var out [][]any
 	for _, row := range contexts {
-		ok, err := matchWhere(st.Where, row.Values, &binder{args: args})
+		ok, err := matchWhereState(s, st.Where, row.Values, &binder{args: args})
 		if err != nil {
 			return nil, err
 		}
@@ -1959,10 +3138,44 @@ func buildRowSetForSelect(s *persistedState, refs []ast.TableRef, where ast.Expr
 					t, _ := s.Catalog.Table(name)
 					return []*catalog.Table{t}, rows, nil
 				}
+			} else if col, start, end, ok, err := indexedRangePredicate(where, args); err != nil {
+				return nil, nil, err
+			} else if ok {
+				if rows, used, err := buildRangeRows(s, simple, col, start, end); used || err != nil {
+					if err != nil {
+						return nil, nil, err
+					}
+					t, _ := s.Catalog.Table(name)
+					return []*catalog.Table{t}, rows, nil
+				}
 			}
 		}
 	}
 	return buildRowSet(s, refs)
+}
+
+func buildRangeRows(s *persistedState, simple *ast.SimpleTable, col string, start, end *rangeBound) ([]rowContext, bool, error) {
+	name := qname(simple.Name)
+	t, ok := s.Catalog.Table(name)
+	if !ok {
+		return nil, false, fmt.Errorf("table does not exist: %s", name)
+	}
+	data := s.Tables[catalog.Normalize(name)]
+	if data == nil {
+		return nil, false, nil
+	}
+	positions := rangeCandidatePositions(s, name, data, col, start, end)
+	if positions == nil {
+		return nil, false, nil
+	}
+	rows := make([]rowContext, 0, len(positions))
+	for _, pos := range positions {
+		if pos < 0 || pos >= len(data.Rows) || data.Rows[pos].Deleted != 0 {
+			continue
+		}
+		rows = append(rows, rowToContext(name, simple, t, data.Rows[pos]))
+	}
+	return rows, true, nil
 }
 
 func buildIndexedRows(s *persistedState, simple *ast.SimpleTable, col string, val any) ([]rowContext, bool, error) {
@@ -1980,7 +3193,7 @@ func buildIndexedRows(s *persistedState, simple *ast.SimpleTable, col string, va
 		if !ok {
 			return nil, true, nil
 		}
-		pos, ok := data.rowids[id]
+		pos, ok := data.lookupRowID(id)
 		if !ok || data.Rows[pos].Deleted != 0 {
 			return nil, true, nil
 		}
@@ -1992,14 +3205,14 @@ func buildIndexedRows(s *persistedState, simple *ast.SimpleTable, col string, va
 		return nil, false, nil
 	}
 	idx := catalog.Index{Name: idxName, Columns: []string{col}}
-	positions := data.indexes[idxName][runtimeIndexLookupKey(idx, val)]
-	rows := make([]rowContext, 0, len(positions))
-	for _, pos := range positions {
+	rows := make([]rowContext, 0, 4)
+	data.eachIndexPosition(idxName, runtimeIndexLookupKey(idx, val), func(pos int) bool {
 		if pos < 0 || pos >= len(data.Rows) || data.Rows[pos].Deleted != 0 {
-			continue
+			return true
 		}
 		rows = append(rows, rowToContext(name, simple, t, data.Rows[pos]))
-	}
+		return true
+	})
 	return rows, true, nil
 }
 
@@ -2010,13 +3223,115 @@ func indexedEqualityPredicate(expr ast.Expr, args []any) (string, any, bool, err
 	}
 	if col := exprColumnName(be.Left); col != "" {
 		v, err := evalExpr(be.Right, nil, &binder{args: args})
+		if err != nil && strings.Contains(err.Error(), "unsupported expression") {
+			return "", nil, false, nil
+		}
 		return col, v, err == nil, err
 	}
 	if col := exprColumnName(be.Right); col != "" {
 		v, err := evalExpr(be.Left, nil, &binder{args: args})
+		if err != nil && strings.Contains(err.Error(), "unsupported expression") {
+			return "", nil, false, nil
+		}
 		return col, v, err == nil, err
 	}
 	return "", nil, false, nil
+}
+
+func indexedRangePredicate(expr ast.Expr, args []any) (string, *rangeBound, *rangeBound, bool, error) {
+	be, ok := expr.(*ast.BinaryExpr)
+	if !ok {
+		return "", nil, nil, false, nil
+	}
+	if be.Op == lexer.AND {
+		lcol, lstart, lend, lok, err := indexedRangePredicate(be.Left, args)
+		if err != nil || !lok {
+			return "", nil, nil, lok, err
+		}
+		rcol, rstart, rend, rok, err := indexedRangePredicate(be.Right, args)
+		if err != nil || !rok || lcol != rcol {
+			return "", nil, nil, rok, err
+		}
+		return lcol, tighterStart(lstart, rstart), tighterEnd(lend, rend), true, nil
+	}
+	col, bound, isStart, ok, err := simpleRangeBound(be, args)
+	if err != nil || !ok {
+		return "", nil, nil, ok, err
+	}
+	if isStart {
+		return col, bound, nil, true, nil
+	}
+	return col, nil, bound, true, nil
+}
+
+func simpleRangeBound(be *ast.BinaryExpr, args []any) (string, *rangeBound, bool, bool, error) {
+	if col := exprColumnName(be.Left); col != "" {
+		v, err := evalExpr(be.Right, nil, &binder{args: args})
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported expression") {
+				return "", nil, false, false, nil
+			}
+			return "", nil, false, false, err
+		}
+		switch be.Op {
+		case lexer.GT:
+			return col, &rangeBound{value: v, inclusive: false}, true, true, nil
+		case lexer.GTE:
+			return col, &rangeBound{value: v, inclusive: true}, true, true, nil
+		case lexer.LT:
+			return col, &rangeBound{value: v, inclusive: false}, false, true, nil
+		case lexer.LTE:
+			return col, &rangeBound{value: v, inclusive: true}, false, true, nil
+		}
+	}
+	if col := exprColumnName(be.Right); col != "" {
+		v, err := evalExpr(be.Left, nil, &binder{args: args})
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported expression") {
+				return "", nil, false, false, nil
+			}
+			return "", nil, false, false, err
+		}
+		switch be.Op {
+		case lexer.GT:
+			return col, &rangeBound{value: v, inclusive: false}, false, true, nil
+		case lexer.GTE:
+			return col, &rangeBound{value: v, inclusive: true}, false, true, nil
+		case lexer.LT:
+			return col, &rangeBound{value: v, inclusive: false}, true, true, nil
+		case lexer.LTE:
+			return col, &rangeBound{value: v, inclusive: true}, true, true, nil
+		}
+	}
+	return "", nil, false, false, nil
+}
+
+func tighterStart(a, b *rangeBound) *rangeBound {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	c, ok := compareValues(a.value, b.value, "BINARY")
+	if !ok || c > 0 || (c == 0 && !a.inclusive) {
+		return a
+	}
+	return b
+}
+
+func tighterEnd(a, b *rangeBound) *rangeBound {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	c, ok := compareValues(a.value, b.value, "BINARY")
+	if !ok || c < 0 || (c == 0 && !a.inclusive) {
+		return a
+	}
+	return b
 }
 
 func exprColumnName(expr ast.Expr) string {
@@ -2029,6 +3344,58 @@ func exprColumnName(expr ast.Expr) string {
 		}
 	}
 	return ""
+}
+
+func countParams(expr ast.Expr) int {
+	switch e := expr.(type) {
+	case nil:
+		return 0
+	case *ast.Param:
+		return 1
+	case *ast.BinaryExpr:
+		return countParams(e.Left) + countParams(e.Right)
+	case *ast.UnaryExpr:
+		return countParams(e.Expr)
+	case *ast.BetweenExpr:
+		return countParams(e.Expr) + countParams(e.Lo) + countParams(e.Hi)
+	case *ast.InExpr:
+		n := countParams(e.Expr)
+		for _, item := range e.List {
+			n += countParams(item)
+		}
+		return n
+	case *ast.LikeExpr:
+		return countParams(e.Expr) + countParams(e.Pattern) + countParams(e.Escape)
+	case *ast.CaseExpr:
+		n := countParams(e.Operand) + countParams(e.Else)
+		for _, when := range e.Whens {
+			n += countParams(when.Cond) + countParams(when.Result)
+		}
+		return n
+	case *ast.CastExpr:
+		return countParams(e.Expr)
+	case *ast.FuncCall:
+		n := 0
+		for _, arg := range e.Args {
+			n += countParams(arg)
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+func collationForExpr(tables []*catalog.Table, expr ast.Expr) string {
+	col := exprColumnName(expr)
+	if col == "" {
+		return "BINARY"
+	}
+	for _, t := range tables {
+		if c, _, ok := t.Column(col); ok && c.Collation != "" {
+			return strings.ToUpper(c.Collation)
+		}
+	}
+	return "BINARY"
 }
 
 type qualifiedColumnRef struct {
@@ -2055,16 +3422,27 @@ func funcName(fn *ast.FuncCall) string {
 }
 
 func usableIndexForColumn(s *persistedState, table, col string) string {
+	idx, primary := usableAccessForColumn(s, table, col)
+	if primary {
+		return ""
+	}
+	return idx
+}
+
+func usableAccessForColumn(s *persistedState, table, col string) (string, bool) {
 	t, ok := s.Catalog.Table(table)
 	if !ok {
-		return ""
+		return "", false
+	}
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		return "PRIMARY", true
 	}
 	for _, idx := range t.Indexes {
 		if len(idx.Columns) > 0 && idx.Columns[0] == col {
-			return idx.Name
+			return idx.Name, false
 		}
 	}
-	return ""
+	return "", false
 }
 
 func buildRefRows(s *persistedState, ref ast.TableRef) ([]*catalog.Table, []rowContext, error) {
@@ -2181,6 +3559,9 @@ func tableForWrite(s *persistedState, name string) (*catalog.Table, *tableData, 
 }
 
 func validateRow(s *persistedState, t *catalog.Table, data *tableData, values map[string]any, self int64) error {
+	if err := validateChecks(t, values); err != nil {
+		return err
+	}
 	for _, col := range t.Columns {
 		v := values[col.Name]
 		if col.NotNull && v == nil {
@@ -2188,7 +3569,7 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 		}
 		if col.PrimaryKey || col.Unique {
 			for _, row := range data.Rows {
-				if row.Deleted == 0 && row.RowID != self && reflect.DeepEqual(row.Values[col.Name], v) {
+				if row.Deleted == 0 && row.RowID != self && valuesEqual(row.Values[col.Name], v, col.Collation) {
 					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
 				}
 			}
@@ -2204,7 +3585,7 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 			}
 			same := true
 			for _, col := range idx.Columns {
-				same = same && reflect.DeepEqual(row.Values[col], values[col])
+				same = same && valuesEqual(row.Values[col], values[col], columnCollation(t, col))
 			}
 			if same {
 				return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
@@ -2219,6 +3600,167 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 		}
 	}
 	return nil
+}
+
+func validateChecks(t *catalog.Table, values map[string]any) error {
+	for _, col := range t.Columns {
+		if col.Check == "" {
+			continue
+		}
+		ok, err := evalCheckExpression(col.Check, values)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("check constraint failed: %s", col.Name)
+		}
+	}
+	for i, check := range t.Checks {
+		ok, err := evalCheckExpression(check, values)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("check constraint failed: %s.%d", t.Name, i+1)
+		}
+	}
+	return nil
+}
+
+func evalCheckExpression(expr string, values map[string]any) (bool, error) {
+	expr = trimOuterParens(strings.TrimSpace(expr))
+	if expr == "" {
+		return true, nil
+	}
+	for _, part := range splitCheckAND(expr) {
+		part = trimOuterParens(strings.TrimSpace(part))
+		ok, err := evalCheckTerm(part, values)
+		if err != nil || !ok {
+			return ok, err
+		}
+	}
+	return true, nil
+}
+
+func evalCheckTerm(term string, values map[string]any) (bool, error) {
+	fields := strings.Fields(term)
+	if len(fields) == 4 && strings.EqualFold(fields[1], "is") && strings.EqualFold(fields[2], "not") && strings.EqualFold(fields[3], "null") {
+		return values[catalog.Normalize(strings.Trim(fields[0], `"'[]`))] != nil, nil
+	}
+	if len(fields) == 3 && strings.EqualFold(fields[1], "is") && strings.EqualFold(fields[2], "null") {
+		return values[catalog.Normalize(strings.Trim(fields[0], `"'[]`))] == nil, nil
+	}
+	for _, op := range []string{">=", "<=", "<>", "!=", "=", ">", "<"} {
+		if idx := strings.Index(term, op); idx >= 0 {
+			left, ok := checkOperandValue(strings.TrimSpace(term[:idx]), values)
+			if !ok {
+				return false, fmt.Errorf("unsupported check operand: %s", strings.TrimSpace(term[:idx]))
+			}
+			right, ok := checkOperandValue(strings.TrimSpace(term[idx+len(op):]), values)
+			if !ok {
+				return false, fmt.Errorf("unsupported check operand: %s", strings.TrimSpace(term[idx+len(op):]))
+			}
+			if left == nil || right == nil {
+				return true, nil
+			}
+			c, ok := compareValues(left, right, "BINARY")
+			if !ok {
+				return false, nil
+			}
+			switch op {
+			case "=":
+				return c == 0, nil
+			case "!=", "<>":
+				return c != 0, nil
+			case ">":
+				return c > 0, nil
+			case ">=":
+				return c >= 0, nil
+			case "<":
+				return c < 0, nil
+			case "<=":
+				return c <= 0, nil
+			}
+		}
+	}
+	v, ok := checkOperandValue(term, values)
+	if !ok {
+		return false, fmt.Errorf("unsupported check expression: %s", term)
+	}
+	if v == nil {
+		return true, nil
+	}
+	return truthy(v), nil
+}
+
+func checkOperandValue(raw string, values map[string]any) (any, bool) {
+	raw = trimOuterParens(strings.TrimSpace(raw))
+	if raw == "" {
+		return nil, false
+	}
+	name := catalog.Normalize(strings.Trim(raw, `"'[]`))
+	if v, ok := values[name]; ok && !isQuotedSQLString(raw) {
+		return v, true
+	}
+	return parseSimpleLiteral(raw)
+}
+
+func splitCheckAND(s string) []string {
+	var out []string
+	depth := 0
+	inQuote := rune(0)
+	last := 0
+	for i, r := range s {
+		if inQuote != 0 {
+			if r == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			inQuote = r
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 && i+5 <= len(s) && strings.EqualFold(s[i:i+5], " and ") {
+			out = append(out, s[last:i])
+			last = i + 5
+		}
+	}
+	out = append(out, s[last:])
+	return out
+}
+
+func trimOuterParens(s string) string {
+	for strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		depth := 0
+		wraps := true
+		for i, r := range s {
+			switch r {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && i != len(s)-1 {
+					wraps = false
+				}
+			}
+		}
+		if !wraps {
+			return s
+		}
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
+}
+
+func isQuotedSQLString(raw string) bool {
+	return len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\''
 }
 
 func validateForeignKey(s *persistedState, fk catalog.ForeignKey, values map[string]any) error {
@@ -2345,17 +3887,86 @@ func applyAffinity(col catalog.Column, v any) any {
 }
 
 type binder struct {
-	args []any
-	pos  int
+	args  []any
+	pos   int
+	named map[string]any
 }
 
 func (b *binder) next() (any, error) {
 	if b.pos >= len(b.args) {
 		return nil, errors.New("not enough bind parameters")
 	}
-	v := b.args[b.pos]
-	b.pos++
-	return v, nil
+	for b.pos < len(b.args) {
+		v := b.args[b.pos]
+		b.pos++
+		if _, ok := namedArg(v); ok {
+			continue
+		}
+		return v, nil
+	}
+	return nil, errors.New("not enough bind parameters")
+}
+
+func (b *binder) param(raw []byte) (any, error) {
+	name := parameterName(raw)
+	if name == "" {
+		return b.next()
+	}
+	if b.named == nil {
+		b.named = make(map[string]any)
+		for _, arg := range b.args {
+			n, ok := namedArg(arg)
+			if !ok || n.Name == "" {
+				continue
+			}
+			b.named[n.Name] = n.Value
+			b.named[catalog.Normalize(n.Name)] = n.Value
+		}
+	}
+	if v, ok := b.named[name]; ok {
+		return v, nil
+	}
+	if v, ok := b.named[catalog.Normalize(name)]; ok {
+		return v, nil
+	}
+	return nil, fmt.Errorf("missing named bind parameter: %s", name)
+}
+
+func namedArg(v any) (NamedArg, bool) {
+	switch x := v.(type) {
+	case NamedArg:
+		return x, true
+	case *NamedArg:
+		if x == nil {
+			return NamedArg{}, false
+		}
+		return *x, true
+	default:
+		return NamedArg{}, false
+	}
+}
+
+func hasNamedArgs(args []any) bool {
+	for _, arg := range args {
+		if _, ok := namedArg(arg); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func parameterName(raw []byte) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "?" {
+		return ""
+	}
+	if s[0] == ':' || s[0] == '@' || s[0] == '$' {
+		return strings.TrimSpace(s[1:])
+	}
+	if s[0] == '?' && len(s) > 1 {
+		return ""
+	}
+	return s
 }
 
 func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
@@ -2365,7 +3976,7 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 	case *ast.NullLit:
 		return nil, nil
 	case *ast.Param:
-		return b.next()
+		return b.param(e.Raw)
 	case *ast.Ident:
 		return row[catalog.Normalize(e.Unquoted)], nil
 	case *ast.QualifiedIdent:
@@ -2439,7 +4050,19 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		ok := like(fmt.Sprint(v), fmt.Sprint(pat))
+		escape := byte(0)
+		if e.Escape != nil {
+			ev, err := evalExpr(e.Escape, row, b)
+			if err != nil {
+				return nil, err
+			}
+			es := fmt.Sprint(ev)
+			if len(es) != 1 {
+				return nil, errors.New("LIKE ESCAPE expression must evaluate to a single character")
+			}
+			escape = es[0]
+		}
+		ok := likeWithEscape(fmt.Sprint(v), fmt.Sprint(pat), escape)
 		if e.Not {
 			return !ok, nil
 		}
@@ -2489,6 +4112,9 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 			case float64:
 				return -x, nil
 			}
+		}
+		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
+			return !truthy(v), nil
 		}
 		return nil, fmt.Errorf("unsupported unary operator: %s", e.Op)
 	default:
@@ -2623,6 +4249,13 @@ func compareValues(left, right any, collate string) (int, bool) {
 	return 0, false
 }
 
+func valuesEqual(left, right any, collate string) bool {
+	if c, ok := compareValues(left, right, collate); ok {
+		return c == 0
+	}
+	return reflect.DeepEqual(left, right)
+}
+
 func evalFunc(fn *ast.FuncCall, row map[string]any, b *binder) (any, error) {
 	name := ""
 	if fn.Name != nil && len(fn.Name.Parts) > 0 {
@@ -2737,10 +4370,17 @@ func sqliteTypeOf(v any) string {
 }
 
 func like(value, pattern string) bool {
+	return likeWithEscape(value, pattern, 0)
+}
+
+func likeWithEscape(value, pattern string, escape byte) bool {
 	var rec func(i, j int) bool
 	rec = func(i, j int) bool {
 		if j == len(pattern) {
 			return i == len(value)
+		}
+		if escape != 0 && pattern[j] == escape && j+1 < len(pattern) {
+			return i < len(value) && strings.EqualFold(value[i:i+1], pattern[j+1:j+2]) && rec(i+1, j+2)
 		}
 		switch pattern[j] {
 		case '%':
@@ -2862,14 +4502,133 @@ func truthy(v any) bool {
 }
 
 func matchWhere(expr ast.Expr, row map[string]any, b *binder) (bool, error) {
+	return matchWhereState(nil, expr, row, b)
+}
+
+func matchWhereState(s *persistedState, expr ast.Expr, row map[string]any, b *binder) (bool, error) {
 	if expr == nil {
 		return true, nil
 	}
-	v, err := evalExpr(expr, row, b)
+	v, err := evalExprState(s, expr, row, b)
 	if err != nil {
 		return false, err
 	}
 	return truthy(v), nil
+}
+
+func evalExprState(s *persistedState, expr ast.Expr, row map[string]any, b *binder) (any, error) {
+	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		left, err := evalExprState(s, e.Left, row, b)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalExprState(s, e.Right, row, b)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinary(left, right, e.Op)
+	case *ast.UnaryExpr:
+		v, err := evalExprState(s, e.Expr, row, b)
+		if err != nil {
+			return nil, err
+		}
+		if e.Op == lexer.MINUS {
+			switch x := v.(type) {
+			case int64:
+				return -x, nil
+			case float64:
+				return -x, nil
+			}
+		}
+		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
+			return !truthy(v), nil
+		}
+		return nil, fmt.Errorf("unsupported unary operator: %s", e.Op)
+	case *ast.InExpr:
+		return evalInExprState(s, e, row, b)
+	case *ast.SubqueryExpr:
+		return evalScalarSubquery(s, e)
+	case *ast.ExistsExpr:
+		return evalExistsSubquery(s, e)
+	default:
+		return evalExpr(expr, row, b)
+	}
+}
+
+func evalScalarSubquery(s *persistedState, e *ast.SubqueryExpr) (any, error) {
+	if s == nil {
+		return nil, errors.New("subquery requires database state")
+	}
+	rows, err := execSelect(s, e.Subq, nil)
+	if err != nil {
+		return nil, err
+	}
+	row, ok := rows.Next()
+	if !ok || len(row) == 0 {
+		return nil, nil
+	}
+	return row[0], nil
+}
+
+func evalExistsSubquery(s *persistedState, e *ast.ExistsExpr) (any, error) {
+	if s == nil {
+		return nil, errors.New("subquery requires database state")
+	}
+	rows, err := execSelect(s, e.Subq, nil)
+	if err != nil {
+		return nil, err
+	}
+	_, ok := rows.Next()
+	if e.Not {
+		return !ok, nil
+	}
+	return ok, nil
+}
+
+func evalInExprState(s *persistedState, e *ast.InExpr, row map[string]any, b *binder) (any, error) {
+	v, err := evalExprState(s, e.Expr, row, b)
+	if err != nil {
+		return nil, err
+	}
+	found := false
+	if e.Subq != nil {
+		if s == nil {
+			return nil, errors.New("subquery requires database state")
+		}
+		rows, err := execSelect(s, e.Subq, b.args)
+		if err != nil {
+			return nil, err
+		}
+		for {
+			subrow, ok := rows.Next()
+			if !ok {
+				break
+			}
+			if len(subrow) == 0 {
+				continue
+			}
+			if c, ok := compareValues(v, subrow[0], "BINARY"); ok && c == 0 {
+				found = true
+				break
+			}
+		}
+	} else {
+		for _, item := range e.List {
+			iv, err := evalExprState(s, item, row, b)
+			if err != nil {
+				return nil, err
+			}
+			if c, ok := compareValues(v, iv, "BINARY"); ok && c == 0 {
+				found = true
+				break
+			}
+		}
+	}
+	if e.Not {
+		return !found, nil
+	}
+	return found, nil
 }
 
 func hasAggregate(exprs []ast.Expr) bool {
@@ -2888,12 +4647,12 @@ func hasAggregate(exprs []ast.Expr) bool {
 	return false
 }
 
-func aggregateRows(contexts []rowContext, st *ast.SelectStmt, cols []string, exprs []ast.Expr, args []any) ([][]any, []string, error) {
+func aggregateRows(s *persistedState, contexts []rowContext, st *ast.SelectStmt, cols []string, exprs []ast.Expr, args []any) ([][]any, []string, error) {
 	groups := map[string][]rowContext{}
 	order := []string{}
 	for _, row := range contexts {
 		b := binder{args: args}
-		ok, err := matchWhere(st.Where, row.Values, &b)
+		ok, err := matchWhereState(s, st.Where, row.Values, &b)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -2933,8 +4692,7 @@ func aggregateRows(contexts []rowContext, st *ast.SelectStmt, cols []string, exp
 			values = append(values, v)
 		}
 		if st.Having != nil {
-			hrow := rowFromOutput(cols, values)
-			hv, err := evalExpr(st.Having, hrow, &binder{args: args})
+			hv, err := evalAggregateExpr(st.Having, group, args)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -2948,6 +4706,35 @@ func aggregateRows(contexts []rowContext, st *ast.SelectStmt, cols []string, exp
 }
 
 func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, error) {
+	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		left, err := evalAggregateExpr(e.Left, group, args)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalAggregateExpr(e.Right, group, args)
+		if err != nil {
+			return nil, err
+		}
+		return evalBinary(left, right, e.Op)
+	case *ast.UnaryExpr:
+		v, err := evalAggregateExpr(e.Expr, group, args)
+		if err != nil {
+			return nil, err
+		}
+		if e.Op == lexer.MINUS {
+			switch x := v.(type) {
+			case int64:
+				return -x, nil
+			case float64:
+				return -x, nil
+			}
+		}
+		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
+			return !truthy(v), nil
+		}
+		return nil, fmt.Errorf("unsupported unary operator: %s", e.Op)
+	}
 	fn, ok := expr.(*ast.FuncCall)
 	if !ok {
 		if len(group) == 0 {

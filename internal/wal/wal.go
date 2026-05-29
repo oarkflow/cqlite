@@ -19,6 +19,7 @@ type RecordType uint8
 const (
 	RecordSnapshot RecordType = 1
 	RecordCommit   RecordType = 2
+	RecordPage     RecordType = 3
 )
 
 type Record struct {

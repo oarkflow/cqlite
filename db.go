@@ -25,17 +25,21 @@ import (
 )
 
 type DB struct {
-	mu      sync.RWMutex
-	path    string
-	opts    Options
-	wal     *wal.Log
-	pager   *pager.Pager
-	buffer  *buffer.Pool
-	txmgr   *txn.Manager
-	state   persistedState
-	opened  time.Time
-	closed  atomic.Bool
-	applied uint64
+	mu           sync.RWMutex
+	path         string
+	opts         Options
+	wal          *wal.Log
+	pager        *pager.Pager
+	lock         *os.File
+	buffer       *buffer.Pool
+	txmgr        *txn.Manager
+	state        persistedState
+	opened       time.Time
+	closed       atomic.Bool
+	explicitMu   sync.Mutex
+	explicitTx   *Tx
+	applied      uint64
+	checkpointed uint64
 }
 
 type logicalRecord struct {
@@ -44,6 +48,7 @@ type logicalRecord struct {
 }
 
 const simpleWALMagic byte = 0xA5
+const txWALMagic byte = 0xA6
 
 func Open(path string, opts Options) (*DB, error) {
 	if path == "" {
@@ -70,13 +75,23 @@ func Open(path string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
 	}
+	var lock *os.File
+	if !opts.DisableFileLock {
+		var err error
+		lock, err = acquireDatabaseLock(path)
+		if err != nil {
+			return nil, err
+		}
+	}
 	log, err := wal.Open(filepath.Join(path, "db.wal"))
 	if err != nil {
+		_ = releaseDatabaseLock(lock)
 		return nil, err
 	}
 	pg, err := pager.Open(filepath.Join(path, "db.pages"), opts.PageSize)
 	if err != nil {
 		_ = log.Close()
+		_ = releaseDatabaseLock(lock)
 		return nil, err
 	}
 	d := &DB{
@@ -84,6 +99,7 @@ func Open(path string, opts Options) (*DB, error) {
 		opts:   opts,
 		wal:    log,
 		pager:  pg,
+		lock:   lock,
 		buffer: buffer.New(opts.BufferPoolSize),
 		txmgr:  txn.NewManager(),
 		state:  newState(),
@@ -92,11 +108,13 @@ func Open(path string, opts Options) (*DB, error) {
 	if err := d.loadSnapshot(); err != nil {
 		_ = log.Close()
 		_ = pg.Close()
+		_ = releaseDatabaseLock(lock)
 		return nil, err
 	}
 	if err := d.replay(); err != nil {
 		_ = log.Close()
 		_ = pg.Close()
+		_ = releaseDatabaseLock(lock)
 		return nil, err
 	}
 	if d.state.Pragmas.PageSize == 0 {
@@ -127,6 +145,9 @@ func (d *DB) Begin(ctx context.Context, opts TxOptions) (*Tx, error) {
 }
 
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error) {
+	if res, ok, err := d.execExplicitTransaction(ctx, query, args...); ok || err != nil {
+		return res, err
+	}
 	if res, ok, err := d.execDirect(ctx, query, args...); ok || err != nil {
 		return res, err
 	}
@@ -145,6 +166,122 @@ func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error
 	return res, nil
 }
 
+type txCommand struct {
+	kind string
+	name string
+}
+
+func classifyTxCommand(query string) (txCommand, bool) {
+	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	if q == "" {
+		return txCommand{}, false
+	}
+	fields := strings.Fields(q)
+	if len(fields) == 0 {
+		return txCommand{}, false
+	}
+	first := strings.ToLower(fields[0])
+	switch first {
+	case "begin":
+		if len(fields) == 1 {
+			return txCommand{kind: "begin"}, true
+		}
+		second := strings.ToLower(fields[1])
+		switch second {
+		case "transaction", "deferred", "immediate", "exclusive":
+			return txCommand{kind: "begin"}, true
+		default:
+			return txCommand{}, false
+		}
+	case "start":
+		if len(fields) >= 2 && strings.EqualFold(fields[1], "transaction") {
+			return txCommand{kind: "begin"}, true
+		}
+	case "commit", "end":
+		return txCommand{kind: "commit"}, true
+	case "rollback":
+		if len(fields) >= 3 && strings.EqualFold(fields[1], "to") {
+			return txCommand{kind: "rollback_to", name: cleanTxName(fields[len(fields)-1])}, true
+		}
+		return txCommand{kind: "rollback"}, true
+	case "savepoint":
+		if len(fields) >= 2 {
+			return txCommand{kind: "savepoint", name: cleanTxName(fields[1])}, true
+		}
+		return txCommand{kind: "savepoint"}, true
+	case "release":
+		if len(fields) >= 3 && strings.EqualFold(fields[1], "savepoint") {
+			return txCommand{kind: "release", name: cleanTxName(fields[2])}, true
+		}
+		if len(fields) >= 2 {
+			return txCommand{kind: "release", name: cleanTxName(fields[1])}, true
+		}
+		return txCommand{kind: "release"}, true
+	}
+	return txCommand{}, false
+}
+
+func cleanTxName(name string) string {
+	return strings.ToLower(strings.Trim(name, `"'[]`))
+}
+
+func (d *DB) execExplicitTransaction(ctx context.Context, query string, args ...any) (Result, bool, error) {
+	cmd, isTxCommand := classifyTxCommand(query)
+	if !isTxCommand {
+		d.explicitMu.Lock()
+		tx := d.explicitTx
+		if tx == nil {
+			d.explicitMu.Unlock()
+			return Result{}, false, nil
+		}
+		defer d.explicitMu.Unlock()
+		res, err := tx.Exec(ctx, query, args...)
+		return res, true, err
+	}
+	if len(args) != 0 {
+		return Result{}, true, errors.New("transaction control statements do not accept parameters")
+	}
+	d.explicitMu.Lock()
+	defer d.explicitMu.Unlock()
+	switch cmd.kind {
+	case "begin":
+		if d.explicitTx != nil {
+			return Result{}, true, ErrTransactionActive
+		}
+		tx, err := d.Begin(ctx, TxOptions{})
+		if err != nil {
+			return Result{}, true, err
+		}
+		d.explicitTx = tx
+		return Result{}, true, nil
+	case "commit":
+		if d.explicitTx == nil {
+			return Result{}, true, errors.New("no active transaction")
+		}
+		tx := d.explicitTx
+		if err := tx.Commit(); err != nil {
+			return Result{}, true, err
+		}
+		d.explicitTx = nil
+		return Result{}, true, nil
+	case "rollback":
+		if d.explicitTx == nil {
+			return Result{}, true, errors.New("no active transaction")
+		}
+		err := d.explicitTx.Rollback()
+		d.explicitTx = nil
+		return Result{}, true, err
+	case "savepoint", "rollback_to", "release":
+		if d.explicitTx == nil {
+			return Result{}, true, errors.New("no active transaction")
+		}
+		res, err := d.explicitTx.execTransactionCommand(cmd)
+		return res, true, err
+	default:
+		return Result{}, true, nil
+	}
+}
+
 func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result, bool, error) {
 	if err := d.checkOpen(); err != nil {
 		return Result{}, true, err
@@ -157,6 +294,8 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 	if res, ok, err := d.execSimpleDirect(query, args...); ok || err != nil {
 		return res, ok, err
 	}
+	parseMu.Lock()
+	defer parseMu.Unlock()
 	stmt, err := parseStatementCached(stripStrictOnly(query))
 	if err != nil {
 		return Result{}, false, nil
@@ -226,6 +365,9 @@ func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
 	data := make([]byte, 0, 64+len(args)*16)
 	data = append(data, simpleWALMagic, plan.kind)
 	data = appendString16(data, plan.table)
+	if plan.kind == 'd' {
+		data = appendString16(data, plan.where)
+	}
 	if plan.kind == 'u' {
 		data = appendString16(data, plan.col)
 		data = appendString16(data, plan.where)
@@ -263,6 +405,13 @@ func decodeSimpleWAL(data []byte) (string, []any, bool, error) {
 	query := ""
 	switch kind {
 	case 'i':
+	case 'd':
+		var where string
+		where, rest, err = readString16(rest)
+		if err != nil {
+			return "", nil, true, err
+		}
+		query = "DELETE FROM " + table + " WHERE " + where + " = ?"
 	case 'u':
 		var col, where string
 		col, rest, err = readString16(rest)
@@ -355,6 +504,28 @@ func appendWALValue(dst []byte, v any) ([]byte, bool) {
 	}
 }
 
+func encodeTransactionWAL(ops []logicalRecord) ([]byte, error) {
+	data, err := json.Marshal(ops)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 1+len(data))
+	out = append(out, txWALMagic)
+	out = append(out, data...)
+	return out, nil
+}
+
+func decodeTransactionWAL(data []byte) ([]logicalRecord, bool, error) {
+	if len(data) == 0 || data[0] != txWALMagic {
+		return nil, false, nil
+	}
+	var ops []logicalRecord
+	if err := json.Unmarshal(data[1:], &ops); err != nil {
+		return nil, true, err
+	}
+	return ops, true, nil
+}
+
 func readWALValue(data []byte) (any, []byte, error) {
 	if len(data) < 1 {
 		return nil, nil, errors.New("truncated simple WAL value")
@@ -419,6 +590,14 @@ func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error
 		return nil, ctx.Err()
 	default:
 	}
+	d.explicitMu.Lock()
+	if tx := d.explicitTx; tx != nil {
+		defer d.explicitMu.Unlock()
+		return tx.Query(ctx, query, args...)
+	}
+	d.explicitMu.Unlock()
+	parseMu.Lock()
+	defer parseMu.Unlock()
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return queryRows(ctx, &d.state, query, args...)
@@ -428,17 +607,29 @@ func (d *DB) Close() error {
 	if d.closed.Swap(true) {
 		return nil
 	}
+	d.explicitMu.Lock()
+	if d.explicitTx != nil {
+		_ = d.explicitTx.Rollback()
+		d.explicitTx = nil
+	}
+	d.explicitMu.Unlock()
 	d.mu.Lock()
-	if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
-		d.mu.Unlock()
-		_ = d.wal.Close()
-		_ = d.pager.Close()
-		return err
+	if d.applied != d.checkpointed {
+		if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
+			d.mu.Unlock()
+			_ = d.wal.Close()
+			_ = d.pager.Close()
+			_ = releaseDatabaseLock(d.lock)
+			return err
+		}
 	}
 	d.mu.Unlock()
 	err := d.wal.Close()
 	if perr := d.pager.Close(); err == nil {
 		err = perr
+	}
+	if lerr := releaseDatabaseLock(d.lock); err == nil {
+		err = lerr
 	}
 	return err
 }
@@ -474,13 +665,17 @@ func (d *DB) loadSnapshot() error {
 		d.state.NextTx = meta.NextTx
 		d.state.Pragmas = meta.Pragmas
 		d.applied = meta.Applied
+		d.checkpointed = meta.Applied
 		d.state.Tables = make(map[string]*tableData)
-		for name := range d.state.Catalog.Tables {
-			td, err := d.loadTablePages(name)
+		for name, schema := range d.state.Catalog.Tables {
+			td, err := d.loadTablePages(name, schema, meta.Generation)
 			if err != nil {
 				return err
 			}
 			d.state.Tables[name] = td
+			if err := d.verifyIndexPages(name, schema, meta.Generation); err != nil {
+				return err
+			}
 		}
 		d.state.rebuildRuntime()
 		return nil
@@ -507,6 +702,22 @@ func (d *DB) replay() error {
 			return nil
 		}
 		if rec.Type == wal.RecordCommit && rec.TxID > d.applied {
+			if ops, ok, err := decodeTransactionWAL(rec.Data); err != nil {
+				return err
+			} else if ok {
+				d.state.NextTx = rec.TxID
+				parseMu.Lock()
+				for _, op := range ops {
+					if _, err := execute(context.Background(), &d.state, op.SQL, op.Args...); err != nil {
+						parseMu.Unlock()
+						return err
+					}
+				}
+				parseMu.Unlock()
+				d.state.rebuildRuntime()
+				d.applied = rec.TxID
+				return nil
+			}
 			if query, args, ok, err := decodeSimpleWAL(rec.Data); err != nil {
 				return err
 			} else if ok {
@@ -524,9 +735,12 @@ func (d *DB) replay() error {
 				return err
 			}
 			d.state.NextTx = rec.TxID
+			parseMu.Lock()
 			if _, err := execute(context.Background(), &d.state, logical.SQL, logical.Args...); err != nil {
+				parseMu.Unlock()
 				return err
 			}
+			parseMu.Unlock()
 			d.state.rebuildRuntime()
 			d.applied = rec.TxID
 		}
@@ -540,26 +754,42 @@ func (d *DB) commit(tx *Tx) error {
 	if err := d.checkOpen(); err != nil {
 		return err
 	}
-	tx.writes.NextTx++
-	data, err := json.Marshal(tx.writes)
+	if len(tx.ops) == 0 {
+		return nil
+	}
+	next := d.applied + 1
+	tx.writes.NextTx = next
+	data, err := encodeTransactionWAL(tx.ops)
 	if err != nil {
 		return err
 	}
-	if err := d.wal.Append(wal.Record{Type: wal.RecordSnapshot, TxID: tx.tx.ID, Data: data}, d.opts.SyncPolicy == SyncFull); err != nil {
+	if err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: next, Data: data}, d.opts.SyncPolicy == SyncFull); err != nil {
 		return err
 	}
-	d.state = tx.writes.clone()
-	d.state.rebuildRuntime()
-	d.applied = tx.tx.ID
+	d.state = tx.writes
+	d.applied = next
 	return nil
 }
 
 func (d *DB) writeCheckpointPages(state persistedState, applied uint64) error {
+	generation := uint64(time.Now().UnixNano())
+	if generation == 0 {
+		generation = applied
+	}
+	for name, table := range state.Tables {
+		if err := d.writeTablePages(name, state.Catalog.Tables[name], table, generation); err != nil {
+			return err
+		}
+		if err := d.writeIndexPages(name, state.Catalog.Tables[name], table, generation); err != nil {
+			return err
+		}
+	}
 	meta := checkpointMeta{
-		Catalog: state.Catalog,
-		NextTx:  state.NextTx,
-		Pragmas: state.Pragmas,
-		Applied: applied,
+		Catalog:    state.Catalog,
+		NextTx:     state.NextTx,
+		Pragmas:    state.Pragmas,
+		Applied:    applied,
+		Generation: generation,
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
@@ -568,34 +798,53 @@ func (d *DB) writeCheckpointPages(state persistedState, applied uint64) error {
 	if err := d.pager.WriteBlob(data); err != nil {
 		return err
 	}
-	for name, table := range state.Tables {
-		if err := d.writeTablePages(name, table); err != nil {
-			return err
-		}
-		if err := d.writeIndexPages(name, state.Catalog.Tables[name], table); err != nil {
-			return err
-		}
+	d.checkpointed = applied
+	if err := d.cleanupCheckpointGenerations(state, generation); err != nil {
+		return err
 	}
 	return nil
 }
 
 func (d *DB) tablePager(name string) (*pager.Pager, error) {
-	return pager.Open(filepath.Join(d.path, "table_"+safeName(name)+".pages"), d.opts.PageSize)
+	return d.tablePagerFor(name, 0)
+}
+
+func (d *DB) tablePagerFor(name string, generation uint64) (*pager.Pager, error) {
+	return pager.Open(d.tablePagerPath(name, generation), d.opts.PageSize)
+}
+
+func (d *DB) tablePagerPath(name string, generation uint64) string {
+	if generation == 0 {
+		return filepath.Join(d.path, "table_"+safeName(name)+".pages")
+	}
+	return filepath.Join(d.path, "table_"+safeName(name)+"_"+strconv.FormatUint(generation, 10)+".pages")
 }
 
 func (d *DB) indexPager(table, index string) (*pager.Pager, error) {
-	return pager.Open(filepath.Join(d.path, "index_"+safeName(table)+"_"+safeName(index)+".pages"), d.opts.PageSize)
+	return d.indexPagerFor(table, index, 0)
 }
 
-func (d *DB) writeTablePages(name string, table *tableData) error {
-	pg, err := d.tablePager(name)
+func (d *DB) indexPagerFor(table, index string, generation uint64) (*pager.Pager, error) {
+	return pager.Open(d.indexPagerPath(table, index, generation), d.opts.PageSize)
+}
+
+func (d *DB) indexPagerPath(table, index string, generation uint64) string {
+	base := "index_" + safeName(table) + "_" + safeName(index)
+	if generation != 0 {
+		base += "_" + strconv.FormatUint(generation, 10)
+	}
+	return filepath.Join(d.path, base+".pages")
+}
+
+func (d *DB) writeTablePages(name string, schema *catalog.Table, table *tableData, generation uint64) error {
+	pg, err := d.tablePagerFor(name, generation)
 	if err != nil {
 		return err
 	}
 	defer pg.Close()
 	records := make([]pager.Record, 0, len(table.Rows))
 	for _, row := range table.Rows {
-		data, err := json.Marshal(row)
+		data, err := encodeRowVersion(schema, row)
 		if err != nil {
 			return err
 		}
@@ -604,8 +853,8 @@ func (d *DB) writeTablePages(name string, table *tableData) error {
 	return pg.WriteRecords(records)
 }
 
-func (d *DB) loadTablePages(name string) (*tableData, error) {
-	pg, err := d.tablePager(name)
+func (d *DB) loadTablePages(name string, schema *catalog.Table, generation uint64) (*tableData, error) {
+	pg, err := d.tablePagerFor(name, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -621,8 +870,8 @@ func (d *DB) loadTablePages(name string) (*tableData, error) {
 		}
 		table := &tableData{Rows: make([]rowVersion, 0, len(records))}
 		for _, rec := range records {
-			var row rowVersion
-			if err := json.Unmarshal(rec.Values, &row); err != nil {
+			row, err := decodeRowVersion(schema, rec.Values)
+			if err != nil {
 				return nil, err
 			}
 			table.Rows = append(table.Rows, row)
@@ -636,12 +885,12 @@ func (d *DB) loadTablePages(name string) (*tableData, error) {
 	return &table, nil
 }
 
-func (d *DB) writeIndexPages(name string, table *catalog.Table, data *tableData) error {
+func (d *DB) writeIndexPages(name string, table *catalog.Table, data *tableData, generation uint64) error {
 	if table == nil {
 		return nil
 	}
 	for _, idx := range table.Indexes {
-		pg, err := d.indexPager(name, idx.Name)
+		pg, err := d.indexPagerFor(name, idx.Name, generation)
 		if err != nil {
 			return err
 		}
@@ -650,8 +899,7 @@ func (d *DB) writeIndexPages(name string, table *catalog.Table, data *tableData)
 			if row.Deleted != 0 {
 				continue
 			}
-			entry := map[string]any{"rowid": row.RowID, "key": indexKey(idx, row.Values)}
-			payload, err := json.Marshal(entry)
+			payload, err := encodeIndexRecord(row.RowID, indexKey(idx, row.Values))
 			if err != nil {
 				_ = pg.Close()
 				return err
@@ -665,6 +913,74 @@ func (d *DB) writeIndexPages(name string, table *catalog.Table, data *tableData)
 		if err := pg.Close(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d *DB) verifyIndexPages(name string, table *catalog.Table, generation uint64) error {
+	if table == nil {
+		return nil
+	}
+	for _, idx := range table.Indexes {
+		path := d.indexPagerPath(name, idx.Name, generation)
+		info, err := os.Stat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		if info.Size() == 0 {
+			continue
+		}
+		pg, err := pager.Open(path, d.opts.PageSize)
+		if err != nil {
+			return err
+		}
+		records, readErr := pg.ReadRecords()
+		closeErr := pg.Close()
+		if readErr != nil {
+			return readErr
+		}
+		for _, rec := range records {
+			if _, err := decodeIndexRecord(rec.Values); err != nil {
+				return err
+			}
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}
+
+func (d *DB) cleanupCheckpointGenerations(state persistedState, keep uint64) error {
+	for name, table := range state.Catalog.Tables {
+		if err := removeOldGenerationFiles(filepath.Join(d.path, "table_"+safeName(name)+"_*.pages"), d.tablePagerPath(name, keep)); err != nil {
+			return err
+		}
+		for _, idx := range table.Indexes {
+			if err := removeOldGenerationFiles(filepath.Join(d.path, "index_"+safeName(name)+"_"+safeName(idx.Name)+"_*.pages"), d.indexPagerPath(name, idx.Name, keep)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func removeOldGenerationFiles(pattern, keep string) error {
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, match := range matches {
+		if match == keep {
+			continue
+		}
+		if err := os.Remove(match); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		_ = os.Remove(match + ".free")
 	}
 	return nil
 }
@@ -708,36 +1024,57 @@ type Tx struct {
 	tx         *txn.Tx
 	writes     persistedState
 	savepoints []savepoint
+	ops        []logicalRecord
 	closed     bool
 }
 
 type savepoint struct {
 	name  string
 	state persistedState
+	ops   int
 }
 
 func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error) {
 	if err := t.check(); err != nil {
 		return Result{}, err
 	}
+	parseMu.Lock()
+	defer parseMu.Unlock()
 	if ok, err := t.execTransactionControl(query); ok || err != nil {
 		return Result{}, err
 	}
 	if res, fast, err := fastSimpleDML(&t.writes, query, args); fast || err != nil {
+		if err == nil {
+			t.logOp(query, args)
+		}
 		return res, err
 	}
 	if stmt, err := parseStatementCached(stripStrictOnly(query)); err == nil {
 		if res, fast, err := fastDirectDML(&t.writes, stmt, args); fast || err != nil {
+			if err == nil {
+				t.logOp(query, args)
+			}
 			return res, err
 		}
 	}
-	return execute(ctx, &t.writes, query, args...)
+	res, err := execute(ctx, &t.writes, query, args...)
+	if err == nil {
+		t.logOp(query, args)
+	}
+	return res, err
+}
+
+func (t *Tx) logOp(query string, args []any) {
+	copied := append([]any(nil), args...)
+	t.ops = append(t.ops, logicalRecord{SQL: query, Args: copied})
 }
 
 func (t *Tx) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if err := t.check(); err != nil {
 		return nil, err
 	}
+	parseMu.Lock()
+	defer parseMu.Unlock()
 	return queryRows(ctx, &t.writes, query, args...)
 }
 
@@ -760,6 +1097,10 @@ func (t *Tx) Rollback() error {
 }
 
 func (t *Tx) execTransactionControl(query string) (bool, error) {
+	if cmd, ok := classifyTxCommand(query); ok {
+		_, err := t.execTransactionCommand(cmd)
+		return true, err
+	}
 	stmt, err := parseStatementCached(query)
 	if err != nil {
 		return false, nil
@@ -780,11 +1121,13 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		if name == "" {
 			t.writes = t.db.state.clone()
 			t.savepoints = nil
+			t.ops = nil
 			return true, nil
 		}
 		for i := len(t.savepoints) - 1; i >= 0; i-- {
 			if t.savepoints[i].name == name {
 				t.writes = t.savepoints[i].state.clone()
+				t.ops = t.ops[:t.savepoints[i].ops]
 				t.savepoints = t.savepoints[:i+1]
 				return true, nil
 			}
@@ -794,7 +1137,7 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		if name == "" {
 			return true, errors.New("savepoint name is required")
 		}
-		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone()})
+		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone(), ops: len(t.ops)})
 		return true, nil
 	case "release", "release_savepoint":
 		if name == "" {
@@ -809,6 +1152,52 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		return true, errors.New("no such savepoint: " + name)
 	default:
 		return true, nil
+	}
+}
+
+func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
+	switch cmd.kind {
+	case "begin":
+		return Result{}, nil
+	case "commit":
+		return Result{}, nil
+	case "rollback":
+		t.writes = t.db.state.clone()
+		t.savepoints = nil
+		t.ops = nil
+		return Result{}, nil
+	case "rollback_to":
+		if cmd.name == "" {
+			return Result{}, errors.New("savepoint name is required")
+		}
+		for i := len(t.savepoints) - 1; i >= 0; i-- {
+			if t.savepoints[i].name == cmd.name {
+				t.writes = t.savepoints[i].state.clone()
+				t.ops = t.ops[:t.savepoints[i].ops]
+				t.savepoints = t.savepoints[:i+1]
+				return Result{}, nil
+			}
+		}
+		return Result{}, errors.New("no such savepoint: " + cmd.name)
+	case "savepoint":
+		if cmd.name == "" {
+			return Result{}, errors.New("savepoint name is required")
+		}
+		t.savepoints = append(t.savepoints, savepoint{name: cmd.name, state: t.writes.clone(), ops: len(t.ops)})
+		return Result{}, nil
+	case "release":
+		if cmd.name == "" {
+			return Result{}, errors.New("savepoint name is required")
+		}
+		for i := len(t.savepoints) - 1; i >= 0; i-- {
+			if t.savepoints[i].name == cmd.name {
+				t.savepoints = t.savepoints[:i]
+				return Result{}, nil
+			}
+		}
+		return Result{}, errors.New("no such savepoint: " + cmd.name)
+	default:
+		return Result{}, nil
 	}
 }
 

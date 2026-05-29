@@ -64,6 +64,7 @@ type Table struct {
 	Strict      bool         `json:"strict"`
 	SQL         string       `json:"sql,omitempty"`
 	ForeignKeys []ForeignKey `json:"foreign_keys,omitempty"`
+	Checks      []string     `json:"checks,omitempty"`
 }
 
 type Catalog struct {
