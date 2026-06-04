@@ -233,6 +233,8 @@ var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, status TEXT NOT NULL, total REAL NOT NULL, created_at TEXT NOT NULL, metadata TEXT)`,
 	`CREATE TABLE IF NOT EXISTS account_settings (account_id INTEGER PRIMARY KEY, retention_days INTEGER NOT NULL, updated_by TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS system_settings (tenant_id INTEGER PRIMARY KEY, days INTEGER NOT NULL, hours INTEGER NOT NULL)`,
+	`DROP VIEW IF EXISTS active_orders`,
+	`CREATE VIEW active_orders AS SELECT id, account_id, status, total FROM orders WHERE status = 'open'`,
 	`DROP INDEX IF EXISTS idx_orders_account_status_param`,
 	`CREATE INDEX idx_orders_account_status_param ON orders (account_id, status)`,
 }

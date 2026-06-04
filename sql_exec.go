@@ -75,6 +75,9 @@ func execute(ctx context.Context, s *persistedState, query string, args ...any) 
 		if res, ok, manualErr := execManualCreateIndex(s, query); ok {
 			return res, manualErr
 		}
+		if res, ok, manualErr := execManualDropView(s, query); ok {
+			return res, manualErr
+		}
 		return Result{}, err
 	}
 	select {
@@ -85,8 +88,10 @@ func execute(ctx context.Context, s *persistedState, query string, args ...any) 
 	switch st := stmt.(type) {
 	case *ast.CreateTableStmt:
 		return execCreateTable(s, st, strictTable, query)
+	case *ast.CreateViewStmt:
+		return execCreateView(s, st, query)
 	case *ast.DropTableStmt:
-		return execDropTable(s, st)
+		return execDropTable(s, st, query)
 	case *ast.CreateIndexStmt:
 		return execCreateIndex(s, st, query)
 	case *ast.DropIndexStmt:
@@ -749,6 +754,9 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 	}
 	t, ok := s.Catalog.Table(plan.table)
 	if !ok {
+		if _, viewOK := s.Catalog.View(plan.table); viewOK {
+			return nil, false, nil
+		}
 		return nil, true, fmt.Errorf("table does not exist: %s", plan.table)
 	}
 	data := s.Tables[catalog.Normalize(plan.table)]
@@ -1746,7 +1754,71 @@ func ctasDeclType(s *persistedState, sel *ast.SelectStmt, idx int) string {
 	return ""
 }
 
-func execDropTable(s *persistedState, st *ast.DropTableStmt) (Result, error) {
+func execCreateView(s *persistedState, st *ast.CreateViewStmt, rawSQL string) (Result, error) {
+	name := qname(st.Name)
+	selectSQL := selectSQLFromCreateView(rawSQL)
+	if strings.TrimSpace(selectSQL) == "" {
+		return Result{}, errors.New("invalid CREATE VIEW")
+	}
+	cols, err := inferViewColumns(s, st)
+	if err != nil {
+		return Result{}, err
+	}
+	view := &catalog.View{
+		Name:      name,
+		Columns:   cols,
+		SQL:       strings.TrimSpace(rawSQL),
+		SelectSQL: selectSQL,
+	}
+	if err := s.Catalog.CreateView(view, st.OrReplace); err != nil {
+		return Result{}, err
+	}
+	s.Pragmas.SchemaVer++
+	return Result{}, nil
+}
+
+func inferViewColumns(s *persistedState, st *ast.CreateViewStmt) ([]catalog.Column, error) {
+	tables, _, err := buildRowSet(s, st.Select.From)
+	if err != nil {
+		return nil, err
+	}
+	names, _, err := selectList(tables, st.Select.Columns)
+	if err != nil {
+		return nil, err
+	}
+	if len(st.Columns) > 0 {
+		names = names[:0]
+		for _, id := range st.Columns {
+			names = append(names, catalog.Normalize(id.Unquoted))
+		}
+	}
+	cols := make([]catalog.Column, 0, len(names))
+	for _, name := range names {
+		cols = append(cols, catalog.Column{Name: catalog.Normalize(name), Type: catalog.Any, DeclType: "ANY"})
+	}
+	return cols, nil
+}
+
+func selectSQLFromCreateView(rawSQL string) string {
+	q := strings.TrimSpace(strings.TrimSuffix(rawSQL, ";"))
+	lower := strings.ToLower(q)
+	idx := strings.Index(lower, " as ")
+	if idx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(q[idx+len(" as "):])
+}
+
+func execDropTable(s *persistedState, st *ast.DropTableStmt, rawSQL string) (Result, error) {
+	if isDropViewSQL(rawSQL) {
+		for _, view := range st.Tables {
+			if err := s.Catalog.DropView(qname(view), st.IfExists); err != nil {
+				return Result{}, err
+			}
+			s.Pragmas.SchemaVer++
+		}
+		return Result{}, nil
+	}
 	for _, table := range st.Tables {
 		name := catalog.Normalize(qname(table))
 		if err := s.Catalog.DropTable(name, st.IfExists); err != nil {
@@ -1756,6 +1828,35 @@ func execDropTable(s *persistedState, st *ast.DropTableStmt) (Result, error) {
 		delete(s.Tables, name)
 	}
 	return Result{}, nil
+}
+
+func isDropViewSQL(query string) bool {
+	q := strings.ToLower(strings.TrimSpace(query))
+	return strings.HasPrefix(q, "drop view ") || strings.HasPrefix(q, "drop materialized view ")
+}
+
+func execManualDropView(s *persistedState, query string) (Result, bool, error) {
+	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	lower := strings.ToLower(q)
+	prefix := "drop view "
+	if !strings.HasPrefix(lower, prefix) {
+		return Result{}, false, nil
+	}
+	rest := strings.TrimSpace(q[len(prefix):])
+	ifExists := false
+	if strings.HasPrefix(strings.ToLower(rest), "if exists ") {
+		ifExists = true
+		rest = strings.TrimSpace(rest[len("if exists "):])
+	}
+	if rest == "" || strings.Contains(rest, ",") {
+		return Result{}, true, errors.New("invalid DROP VIEW")
+	}
+	name := strings.Trim(rest, `"'`)
+	if err := s.Catalog.DropView(name, ifExists); err != nil {
+		return Result{}, true, err
+	}
+	s.Pragmas.SchemaVer++
+	return Result{}, true, nil
 }
 
 func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) (Result, error) {
@@ -2580,6 +2681,10 @@ func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error
 	if rows, ok, err := fastSingleTableSelect(s, st, args); ok || err != nil {
 		return rows, err
 	}
+	return execSelectGeneric(s, st, args)
+}
+
+func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error) {
 	tables, contexts, err := buildRowSetForSelect(s, st.From, st.Where, args)
 	if err != nil {
 		return nil, err
@@ -2676,6 +2781,9 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 	name := qname(simple.Name)
 	t, ok := s.Catalog.Table(name)
 	if !ok {
+		if _, viewOK := s.Catalog.View(name); viewOK {
+			return nil, false, nil
+		}
 		return nil, true, fmt.Errorf("table does not exist: %s", name)
 	}
 	data := s.Tables[catalog.Normalize(name)]
@@ -3477,6 +3585,13 @@ func formatDefaultSQL(v any) string {
 func pragmaTableInfo(s *persistedState, table string) *Rows {
 	t, ok := s.Catalog.Table(table)
 	if !ok {
+		if v, viewOK := s.Catalog.View(table); viewOK {
+			var rows [][]any
+			for i, col := range v.Columns {
+				rows = append(rows, []any{int64(i), col.Name, col.DeclType, int64(0), nil, int64(0)})
+			}
+			return isql.NewRows([]string{"cid", "name", "type", "notnull", "dflt_value", "pk"}, rows)
+		}
 		return isql.NewRows([]string{"cid", "name", "type", "notnull", "dflt_value", "pk"}, nil)
 	}
 	var rows [][]any
@@ -3604,6 +3719,15 @@ func selectVirtualSchema(s *persistedState, st *ast.SelectStmt, args []any) (*Ro
 			}})
 		}
 	}
+	for _, v := range s.Catalog.Views {
+		sql := v.SQL
+		if sql == "" {
+			sql = "CREATE VIEW " + v.Name + " AS " + v.SelectSQL
+		}
+		contexts = append(contexts, rowContext{Values: map[string]any{
+			"type": "view", "name": v.Name, "tbl_name": v.Name, "rootpage": int64(0), "sql": sql,
+		}})
+	}
 	cols, exprs, err := selectList([]*catalog.Table{{Columns: []catalog.Column{{Name: "type"}, {Name: "name"}, {Name: "tbl_name"}, {Name: "rootpage"}, {Name: "sql"}}}}, st.Columns)
 	if err != nil {
 		return nil, err
@@ -3685,6 +3809,9 @@ func buildRangeRows(s *persistedState, simple *ast.SimpleTable, col string, star
 	name := qname(simple.Name)
 	t, ok := s.Catalog.Table(name)
 	if !ok {
+		if _, viewOK := s.Catalog.View(name); viewOK {
+			return nil, false, nil
+		}
 		return nil, false, fmt.Errorf("table does not exist: %s", name)
 	}
 	data := s.Tables[catalog.Normalize(name)]
@@ -3709,6 +3836,9 @@ func buildIndexedRows(s *persistedState, simple *ast.SimpleTable, col string, va
 	name := qname(simple.Name)
 	t, ok := s.Catalog.Table(name)
 	if !ok {
+		if _, viewOK := s.Catalog.View(name); viewOK {
+			return nil, false, nil
+		}
 		return nil, false, fmt.Errorf("table does not exist: %s", name)
 	}
 	data := s.Tables[catalog.Normalize(name)]
@@ -4017,6 +4147,9 @@ func buildSimpleRows(s *persistedState, r *ast.SimpleTable, keep func(rowVersion
 	name := qname(r.Name)
 	t, ok := s.Catalog.Table(name)
 	if !ok {
+		if view, viewOK := s.Catalog.View(name); viewOK {
+			return buildViewRows(s, r, view)
+		}
 		return nil, nil, fmt.Errorf("table does not exist: %s", name)
 	}
 	data := s.Tables[catalog.Normalize(name)]
@@ -4031,6 +4164,61 @@ func buildSimpleRows(s *persistedState, r *ast.SimpleTable, keep func(rowVersion
 		rows = append(rows, rowToContext(name, r, t, row))
 	}
 	return []*catalog.Table{t}, rows, nil
+}
+
+func buildViewRows(s *persistedState, r *ast.SimpleTable, view *catalog.View) ([]*catalog.Table, []rowContext, error) {
+	s.ensureRuntime()
+	stmt, err := parseViewSelectStatement(view.SelectSQL)
+	if err != nil {
+		return nil, nil, err
+	}
+	sel, ok := stmt.(*ast.SelectStmt)
+	if !ok {
+		return nil, nil, fmt.Errorf("view is not a SELECT: %s", view.Name)
+	}
+	rows, err := execSelectGeneric(s, sel, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	cols := view.Columns
+	if len(cols) == 0 {
+		for _, name := range rows.Columns {
+			cols = append(cols, catalog.Column{Name: catalog.Normalize(name), Type: catalog.Any, DeclType: "ANY"})
+		}
+	}
+	t := &catalog.Table{Name: view.Name, Columns: cols, SQL: view.SQL}
+	var contexts []rowContext
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			break
+		}
+		contexts = append(contexts, viewRowToContext(view.Name, r, t, row))
+	}
+	return []*catalog.Table{t}, contexts, nil
+}
+
+func parseViewSelectStatement(sql string) (ast.Statement, error) {
+	parser := sqlparser.NewString(sql)
+	return parser.Next()
+}
+
+func viewRowToContext(name string, r *ast.SimpleTable, t *catalog.Table, row []any) rowContext {
+	alias := name
+	if r.Alias != nil {
+		alias = catalog.Normalize(r.Alias.Unquoted)
+	}
+	vals := make(map[string]any, len(t.Columns)*3)
+	for i, col := range t.Columns {
+		var v any
+		if i < len(row) {
+			v = row[i]
+		}
+		vals[col.Name] = v
+		vals[name+"."+col.Name] = v
+		vals[alias+"."+col.Name] = v
+	}
+	return rowContext{Values: vals}
 }
 
 func rowToContext(name string, r *ast.SimpleTable, t *catalog.Table, row rowVersion) rowContext {

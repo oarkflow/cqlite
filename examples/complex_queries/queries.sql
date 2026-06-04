@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS system_settings (
 CREATE INDEX idx_orders_account_status_param
 ON orders (account_id, status);
 
+DROP VIEW IF EXISTS active_orders;
+
+CREATE VIEW active_orders AS
+SELECT id, account_id, status, total
+FROM orders
+WHERE status = 'open';
+
 -- Mixed named and positional binds. Use sqlite.Named("since", value), not $1,
 -- unless you intentionally pass sqlite.Named("1", value).
 SELECT id, account_id, status, total

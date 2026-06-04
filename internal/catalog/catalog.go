@@ -67,12 +67,21 @@ type Table struct {
 	Checks      []string     `json:"checks,omitempty"`
 }
 
+type View struct {
+	Name       string   `json:"name"`
+	Columns    []Column `json:"columns,omitempty"`
+	SQL        string   `json:"sql,omitempty"`
+	SelectSQL  string   `json:"select_sql,omitempty"`
+	SchemaVers uint64   `json:"schema_version"`
+}
+
 type Catalog struct {
 	Tables map[string]*Table `json:"tables"`
+	Views  map[string]*View  `json:"views,omitempty"`
 }
 
 func New() Catalog {
-	return Catalog{Tables: make(map[string]*Table)}
+	return Catalog{Tables: make(map[string]*Table), Views: make(map[string]*View)}
 }
 
 func Normalize(name string) string {
@@ -116,6 +125,14 @@ func (c Catalog) Table(name string) (*Table, bool) {
 	return t, ok
 }
 
+func (c Catalog) View(name string) (*View, bool) {
+	if c.Views == nil {
+		return nil, false
+	}
+	v, ok := c.Views[Normalize(name)]
+	return v, ok
+}
+
 func (c Catalog) CreateTable(t *Table, ifNotExists bool) error {
 	name := Normalize(t.Name)
 	if _, ok := c.Tables[name]; ok {
@@ -124,10 +141,33 @@ func (c Catalog) CreateTable(t *Table, ifNotExists bool) error {
 		}
 		return errors.New("table already exists: " + t.Name)
 	}
+	if _, ok := c.View(name); ok {
+		return errors.New("view already exists: " + t.Name)
+	}
 	t.Name = name
 	t.NextRowID = 1
 	t.SchemaVers = 1
 	c.Tables[name] = t
+	return nil
+}
+
+func (c Catalog) CreateView(v *View, orReplace bool) error {
+	if c.Views == nil {
+		c.Views = make(map[string]*View)
+	}
+	name := Normalize(v.Name)
+	if _, ok := c.Tables[name]; ok {
+		return errors.New("table already exists: " + v.Name)
+	}
+	if _, ok := c.Views[name]; ok && !orReplace {
+		return errors.New("view already exists: " + v.Name)
+	}
+	v.Name = name
+	v.SchemaVers++
+	if v.SchemaVers == 0 {
+		v.SchemaVers = 1
+	}
+	c.Views[name] = v
 	return nil
 }
 
@@ -140,6 +180,24 @@ func (c Catalog) DropTable(name string, ifExists bool) error {
 		return errors.New("table does not exist: " + name)
 	}
 	delete(c.Tables, key)
+	return nil
+}
+
+func (c Catalog) DropView(name string, ifExists bool) error {
+	key := Normalize(name)
+	if c.Views == nil {
+		if ifExists {
+			return nil
+		}
+		return errors.New("view does not exist: " + name)
+	}
+	if _, ok := c.Views[key]; !ok {
+		if ifExists {
+			return nil
+		}
+		return errors.New("view does not exist: " + name)
+	}
+	delete(c.Views, key)
 	return nil
 }
 

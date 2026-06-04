@@ -17,7 +17,6 @@ func TestSQLiteUnsupportedFeatureAllowlist(t *testing.T) {
 		name string
 		sql  string
 	}{
-		{name: "views", sql: `CREATE VIEW v AS SELECT 1`},
 		{name: "triggers", sql: `CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END`},
 		{name: "virtual tables", sql: `CREATE VIRTUAL TABLE ft USING fts5(body)`},
 		{name: "recursive CTE execution", sql: `WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 3) SELECT x FROM c`},

@@ -543,6 +543,65 @@ func TestSingleFileDatabasePersists(t *testing.T) {
 	}
 }
 
+func TestCreateViewPersistsAndQueries(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir()
+	d, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE view_orders (id INTEGER PRIMARY KEY, status TEXT, total REAL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO view_orders VALUES (1, 'open', 12.5)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO view_orders VALUES (2, 'closed', 3.5)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE VIEW active_view_orders AS SELECT id, total FROM view_orders WHERE status = 'open'`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.Query(ctx, `SELECT id, total FROM active_view_orders`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != int64(1) || row[1] != 12.5 {
+		t.Fatalf("row = %#v ok=%v", row, ok)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	rows, err = d.Query(ctx, `SELECT type, name FROM sqlite_schema WHERE type = 'view'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok = rows.Next()
+	if !ok || row[0] != "view" || row[1] != "active_view_orders" {
+		t.Fatalf("schema row = %#v ok=%v", row, ok)
+	}
+	rows, err = d.Query(ctx, `PRAGMA table_info(active_view_orders)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok = rows.Next()
+	if !ok || row[1] != "id" {
+		t.Fatalf("view table_info row = %#v ok=%v", row, ok)
+	}
+	if _, err := d.Exec(ctx, `DROP VIEW IF EXISTS active_view_orders`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Query(ctx, `SELECT id FROM active_view_orders`); err == nil {
+		t.Fatal("expected dropped view query to fail")
+	}
+}
+
 func TestSavepoints(t *testing.T) {
 	ctx := context.Background()
 	d, err := Open(t.TempDir(), Options{})

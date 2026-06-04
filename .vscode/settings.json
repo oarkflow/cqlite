@@ -1,0 +1,6 @@
+{
+	"sujitSqlite.database": "/Users/sujit/Sites/sqlite/examples/complex_queries/data/complex_driver.db",
+	"workbench.editorAssociations": {
+		"*.db": "sujitSqlite.databaseViewer"
+	}
+}

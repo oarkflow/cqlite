@@ -82,6 +82,11 @@ func (s persistedState) clone() persistedState {
 		cp.Indexes = append([]catalog.Index(nil), tbl.Indexes...)
 		out.Catalog.Tables[name] = &cp
 	}
+	for name, view := range s.Catalog.Views {
+		cp := *view
+		cp.Columns = append([]catalog.Column(nil), view.Columns...)
+		out.Catalog.Views[name] = &cp
+	}
 	for name, data := range s.Tables {
 		td := &tableData{Rows: data.Rows[:len(data.Rows):len(data.Rows)]}
 		if len(data.Pending) > 0 {
