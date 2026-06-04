@@ -90,6 +90,16 @@ func (t *Tree) Delete(key []byte) bool {
 }
 
 func (t *Tree) Scan(start, end []byte, fn func(key, value []byte) bool) {
+	t.scan(start, end, func(key, value []byte) bool {
+		return fn(clone(key), clone(value))
+	})
+}
+
+func (t *Tree) ViewScan(start, end []byte, fn func(key, value []byte) bool) {
+	t.scan(start, end, fn)
+}
+
+func (t *Tree) scan(start, end []byte, fn func(key, value []byte) bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	leaf := t.leftmostLeaf()
@@ -104,7 +114,7 @@ func (t *Tree) Scan(start, end []byte, fn func(key, value []byte) bool) {
 			if len(end) > 0 && bytes.Compare(key, end) >= 0 {
 				return
 			}
-			if !fn(clone(key), clone(leaf.values[i])) {
+			if !fn(key, leaf.values[i]) {
 				return
 			}
 		}

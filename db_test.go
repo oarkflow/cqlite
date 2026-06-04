@@ -374,6 +374,137 @@ func TestNamedParameters(t *testing.T) {
 	}
 }
 
+func TestNamedParameterMapAndStructSources(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE named_sources (id INTEGER PRIMARY KEY, account_id INTEGER, status TEXT, total REAL)`); err != nil {
+		t.Fatal(err)
+	}
+	type orderParams struct {
+		ID        int64   `db:"id"`
+		AccountID int64   `db:"account_id"`
+		Status    string  `json:"status"`
+		Total     float64 `sql:"total"`
+	}
+	if _, err := d.Exec(ctx,
+		`INSERT INTO named_sources VALUES (:id, :account_id, @status, ?)`,
+		orderParams{ID: 1, AccountID: 101, Status: "open"},
+		42.5,
+	); err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]any{
+		"account_id": int64(101),
+		"status":     "open",
+		"min_total":  40.0,
+	}
+	rows, err := d.Query(ctx,
+		`SELECT id, status, total FROM named_sources WHERE account_id = :account_id AND status = @status AND total >= $min_total`,
+		params,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != int64(1) || row[1] != "open" || row[2] != 42.5 {
+		t.Fatalf("row = %#v ok=%v", row, ok)
+	}
+}
+
+func TestInsertValuesNamedRowAndRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE insert_named_rows (id INTEGER PRIMARY KEY, account_id INTEGER, status TEXT, total REAL)`); err != nil {
+		t.Fatal(err)
+	}
+	type orderRow struct {
+		ID        int64   `db:"id"`
+		AccountID int64   `db:"account_id"`
+		Status    string  `json:"status"`
+		Total     float64 `sql:"total"`
+	}
+	if _, err := d.Exec(ctx,
+		`INSERT INTO insert_named_rows (id, account_id, status, total) VALUES :row`,
+		Named("row", orderRow{ID: 1, AccountID: 101, Status: "open", Total: 12.5}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx,
+		`INSERT INTO insert_named_rows (id, account_id, status, total) VALUES :row`,
+		map[string]any{"row": map[string]any{"id": int64(2), "account_id": int64(101), "status": "review", "total": 19.25}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx,
+		`INSERT INTO insert_named_rows (id, account_id, status, total) VALUES :rows`,
+		Named("rows", []orderRow{
+			{ID: 3, AccountID: 102, Status: "open", Total: 7.75},
+			{ID: 4, AccountID: 102, Status: "closed", Total: 33},
+		}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx,
+		`INSERT INTO insert_named_rows (id, account_id, status, total) VALUES :rows`,
+		map[string]any{"rows": []map[string]any{
+			{"id": int64(5), "account_id": int64(103), "status": "open", "total": 44.5},
+			{"id": int64(6), "account_id": int64(103), "status": "closed", "total": 55.5},
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.Query(ctx, `SELECT id, account_id, status, total FROM insert_named_rows ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for wantID := int64(1); wantID <= 6; wantID++ {
+		row, ok := rows.Next()
+		if !ok {
+			t.Fatalf("missing row id %d", wantID)
+		}
+		if row[0] != wantID {
+			t.Fatalf("row id = %#v, want %d", row[0], wantID)
+		}
+	}
+	if row, ok := rows.Next(); ok {
+		t.Fatalf("unexpected row: %#v", row)
+	}
+}
+
+func TestCreateTableIfNotExistsPreservesRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE preserve_rows (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO preserve_rows VALUES (?, ?)`, int64(1), "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE IF NOT EXISTS preserve_rows (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.Query(ctx, `SELECT name FROM preserve_rows WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "Ada" {
+		t.Fatalf("row = %#v ok=%v", row, ok)
+	}
+}
+
 func TestSavepoints(t *testing.T) {
 	ctx := context.Background()
 	d, err := Open(t.TempDir(), Options{})
@@ -568,6 +699,7 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 	var snapshots int
 	var txBatches int
 	var simpleTxBatches int
+	var stateBatches int
 	if err := log.Replay(func(rec wal.Record) error {
 		if rec.Type == wal.RecordSnapshot {
 			snapshots++
@@ -585,6 +717,11 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 		} else if ok {
 			txBatches++
 		}
+		if _, ok, err := decodeStateWAL(rec.Data); err != nil {
+			return err
+		} else if ok {
+			stateBatches++
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -592,7 +729,7 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 	if snapshots != 0 {
 		t.Fatalf("transaction commit wrote %d state snapshot WAL records", snapshots)
 	}
-	if txBatches+simpleTxBatches == 0 {
+	if txBatches+simpleTxBatches+stateBatches == 0 {
 		t.Fatal("expected at least one transaction batch WAL record")
 	}
 
@@ -681,6 +818,71 @@ func TestParameterizedTransactionUsesSimpleMutationWAL(t *testing.T) {
 	if !ok || row[0] != "two" {
 		t.Fatalf("recovered simple mutation WAL row = %#v ok=%v", row, ok)
 	}
+}
+
+func TestNonSimpleDMLUsesBinaryStateWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE state_wal (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO state_wal (msg, id) VALUES (?, ?)`, "from-state", int64(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var stateRecords int
+	var logicalRecords int
+	if err := log.Replay(func(rec wal.Record) error {
+		if rec.Type != wal.RecordCommit {
+			return nil
+		}
+		if _, ok, err := decodeStateWAL(rec.Data); err != nil {
+			return err
+		} else if ok {
+			stateRecords++
+			return nil
+		}
+		var logical logicalRecord
+		if err := json.Unmarshal(rec.Data, &logical); err == nil && logical.SQL != "" {
+			logicalRecords++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stateRecords == 0 {
+		t.Fatal("expected non-simple DML to write binary state WAL")
+	}
+	if logicalRecords != 0 {
+		t.Fatalf("non-simple DML wrote %d logical SQL WAL records", logicalRecords)
+	}
+
+	reopened, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err := reopened.Query(ctx, `SELECT msg FROM state_wal WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "from-state" {
+		t.Fatalf("recovered state WAL row = %#v ok=%v", row, ok)
+	}
+	_ = d.Close()
 }
 
 func TestFailedPendingOnlyCommitDoesNotAppendRecoverableWAL(t *testing.T) {

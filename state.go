@@ -7,6 +7,7 @@ import (
 
 	"github.com/sujit/sqlite/internal/btree"
 	"github.com/sujit/sqlite/internal/catalog"
+	"github.com/sujit/sqlite/internal/pager"
 )
 
 type rowVersion struct {
@@ -28,6 +29,10 @@ type tableData struct {
 	baseRows     int                    `json:"-"`
 	deferRuntime bool                   `json:"-"`
 	rowsShared   bool                   `json:"-"`
+	lazyRecords  []pager.Record         `json:"-"`
+	lazyPath     string                 `json:"-"`
+	lazyPageSize int                    `json:"-"`
+	lazyCount    int                    `json:"-"`
 }
 
 type persistedState struct {
@@ -82,6 +87,12 @@ func (s persistedState) clone() persistedState {
 		if len(data.Pending) > 0 {
 			td.Pending = append([]rowVersion(nil), data.Pending...)
 		}
+		if len(data.lazyRecords) > 0 {
+			td.lazyRecords = append([]pager.Record(nil), data.lazyRecords...)
+		}
+		td.lazyPath = data.lazyPath
+		td.lazyPageSize = data.lazyPageSize
+		td.lazyCount = data.lazyCount
 		if len(data.pendingRowID) > 0 {
 			td.pendingRowID = make(map[int64]struct{}, len(data.pendingRowID))
 			for rowid := range data.pendingRowID {
@@ -116,7 +127,7 @@ func (t *tableData) copyRow(pos int) {
 }
 
 func (t *tableData) runtimeDeferred() bool {
-	return t != nil && t.deferRuntime
+	return t != nil && (t.deferRuntime || len(t.lazyRecords) > 0 || t.lazyPath != "")
 }
 
 func cloneValues(in map[string]any) map[string]any {
@@ -234,8 +245,37 @@ func (s *persistedState) rebuildRuntime() {
 	s.materializePending()
 	for name, data := range s.Tables {
 		if tbl := s.Catalog.Tables[name]; tbl != nil {
+			data.materializeLazy(tbl)
 			data.rebuildRuntime(tbl)
 		}
+	}
+}
+
+func (s *persistedState) deferRuntime() {
+	for _, data := range s.Tables {
+		if data == nil {
+			continue
+		}
+		data.rowids = nil
+		data.indexes = nil
+		data.baseRows = len(data.Rows)
+		data.deferRuntime = true
+		data.rowsShared = false
+	}
+}
+
+func (s *persistedState) hasDeferredRuntime() bool {
+	for _, data := range s.Tables {
+		if data != nil && data.deferRuntime {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *persistedState) ensureRuntime() {
+	if s.hasDeferredRuntime() {
+		s.rebuildRuntime()
 	}
 }
 
@@ -325,6 +365,7 @@ func (t *tableData) pendingRowIDConflict(rowid int64) bool {
 }
 
 func (t *tableData) rebuildRuntime(schema *catalog.Table) {
+	t.materializeLazy(schema)
 	t.rowids = btree.New()
 	t.indexes = make(map[string]*btree.Tree, len(schema.Indexes))
 	t.baseRows = len(t.Rows)
@@ -350,6 +391,79 @@ func (t *tableData) rebuildRuntime(schema *catalog.Table) {
 			t.addIndexPosition(idx, i)
 		}
 	}
+}
+
+func (t *tableData) materializeLazy(schema *catalog.Table) error {
+	if t == nil || (len(t.lazyRecords) == 0 && t.lazyPath == "") {
+		return nil
+	}
+	records := t.lazyRecords
+	if len(records) == 0 {
+		pg, err := pager.Open(t.lazyPath, t.lazyPageSize)
+		if err != nil {
+			return err
+		}
+		records, err = pg.ReadRecords()
+		closeErr := pg.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	rows := make([]rowVersion, 0, len(records))
+	for _, rec := range records {
+		row, err := decodeRowVersionLazy(schema, rec.Values)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row)
+	}
+	t.Rows = rows
+	t.lazyRecords = nil
+	t.lazyPath = ""
+	t.lazyPageSize = 0
+	t.lazyCount = 0
+	return nil
+}
+
+func (t *tableData) lazyRowByID(schema *catalog.Table, rowid int64) (rowVersion, bool, error) {
+	if t == nil || (len(t.lazyRecords) == 0 && t.lazyPath == "") {
+		return rowVersion{}, false, nil
+	}
+	for _, rec := range t.lazyRecords {
+		if rec.Key != rowid {
+			continue
+		}
+		row, err := decodeRowVersionLazy(schema, rec.Values)
+		if err != nil {
+			return rowVersion{}, false, err
+		}
+		return row, true, nil
+	}
+	if t.lazyPath != "" && rowid > 0 && rowid <= int64(t.lazyCount) {
+		pg, err := pager.Open(t.lazyPath, t.lazyPageSize)
+		if err != nil {
+			return rowVersion{}, false, err
+		}
+		rec, ok, err := pg.ReadRecordAtOrdinal(int(rowid - 1))
+		closeErr := pg.Close()
+		if err != nil {
+			return rowVersion{}, false, err
+		}
+		if closeErr != nil {
+			return rowVersion{}, false, closeErr
+		}
+		if ok && rec.Key == rowid {
+			row, err := decodeRowVersionLazy(schema, rec.Values)
+			if err != nil {
+				return rowVersion{}, false, err
+			}
+			return row, true, nil
+		}
+	}
+	return rowVersion{}, false, nil
 }
 
 func (t *tableData) addRuntime(schema *catalog.Table, pos int) {
@@ -406,13 +520,34 @@ func (t *tableData) rangeRowIDs(start *int64, end *int64) []int {
 		endKey = encodeInt64Key(*end)
 	}
 	var out []int
-	t.rowids.Scan(startKey, endKey, func(_, raw []byte) bool {
+	t.rowids.ViewScan(startKey, endKey, func(_, raw []byte) bool {
 		if pos, ok := decodeIntPosition(raw); ok {
 			out = append(out, pos)
 		}
 		return true
 	})
 	return out
+}
+
+func (t *tableData) eachRangeRowID(start *int64, end *int64, fn func(int) bool) bool {
+	if t == nil || t.rowids == nil {
+		return false
+	}
+	var startKey, endKey []byte
+	if start != nil {
+		startKey = encodeInt64Key(*start)
+	}
+	if end != nil {
+		endKey = encodeInt64Key(*end)
+	}
+	t.rowids.ViewScan(startKey, endKey, func(_, raw []byte) bool {
+		pos, ok := decodeIntPosition(raw)
+		if !ok {
+			return true
+		}
+		return fn(pos)
+	})
+	return true
 }
 
 func (t *tableData) addIndexPosition(idx catalog.Index, pos int) {
@@ -460,7 +595,7 @@ func (t *tableData) rangeIndexPositions(indexName string, start, end []byte) []i
 		return nil
 	}
 	var out []int
-	t.indexes[indexName].Scan(start, end, func(_, raw []byte) bool {
+	t.indexes[indexName].ViewScan(start, end, func(_, raw []byte) bool {
 		eachEncodedIndexPosition(raw, func(pos int) bool {
 			out = append(out, pos)
 			return true
@@ -468,6 +603,21 @@ func (t *tableData) rangeIndexPositions(indexName string, start, end []byte) []i
 		return true
 	})
 	return out
+}
+
+func (t *tableData) eachRangeIndexPosition(indexName string, start, end []byte, fn func(int) bool) bool {
+	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
+		return false
+	}
+	t.indexes[indexName].ViewScan(start, end, func(_, raw []byte) bool {
+		keepGoing := true
+		eachEncodedIndexPosition(raw, func(pos int) bool {
+			keepGoing = fn(pos)
+			return keepGoing
+		})
+		return keepGoing
+	})
+	return true
 }
 
 func indexRuntimeKey(idx catalog.Index, values map[string]any) string {

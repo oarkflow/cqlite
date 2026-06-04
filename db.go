@@ -41,6 +41,7 @@ type DB struct {
 	explicitTx   *Tx
 	applied      uint64
 	checkpointed uint64
+	clean        bool
 }
 
 type logicalRecord struct {
@@ -51,6 +52,7 @@ type logicalRecord struct {
 const simpleWALMagic byte = 0xA5
 const txWALMagic byte = 0xA6
 const txSimpleWALMagic byte = 0xA7
+const stateWALMagic byte = 0xA8
 
 type simpleWALRecord struct {
 	plan simpleDMLPlan
@@ -112,17 +114,18 @@ func Open(path string, opts Options) (*DB, error) {
 		state:  newState(),
 		opened: time.Now(),
 	}
-	if err := d.replayPhysicalPages(); err != nil {
-		_ = log.Close()
-		_ = pg.Close()
-		_ = releaseDatabaseLock(lock)
-		return nil, err
-	}
 	if err := d.loadSnapshot(); err != nil {
 		if walHasRecords(filepath.Join(path, "db.wal")) {
+			if replayErr := d.replayPhysicalPages(); replayErr != nil {
+				_ = log.Close()
+				_ = pg.Close()
+				_ = releaseDatabaseLock(lock)
+				return nil, replayErr
+			}
 			d.state = newState()
 			d.applied = 0
 			d.checkpointed = 0
+			_ = d.loadSnapshot()
 		} else {
 			_ = log.Close()
 			_ = pg.Close()
@@ -130,11 +133,20 @@ func Open(path string, opts Options) (*DB, error) {
 			return nil, err
 		}
 	}
-	if err := d.replay(); err != nil {
+	if clean, err := d.hasCleanCheckpointMarker(); err != nil {
 		_ = log.Close()
 		_ = pg.Close()
 		_ = releaseDatabaseLock(lock)
 		return nil, err
+	} else if !clean {
+		if err := d.replay(); err != nil {
+			_ = log.Close()
+			_ = pg.Close()
+			_ = releaseDatabaseLock(lock)
+			return nil, err
+		}
+	} else {
+		d.clean = true
 	}
 	if d.state.Pragmas.PageSize == 0 {
 		d.state.Pragmas.PageSize = opts.PageSize
@@ -199,49 +211,85 @@ func classifyTxCommand(query string) (txCommand, bool) {
 	if q == "" {
 		return txCommand{}, false
 	}
-	fields := strings.Fields(q)
-	if len(fields) == 0 {
-		return txCommand{}, false
-	}
-	first := strings.ToLower(fields[0])
-	switch first {
-	case "begin":
-		if len(fields) == 1 {
+	first, rest := nextSQLField(q)
+	switch {
+	case strings.EqualFold(first, "begin"):
+		second, _ := nextSQLField(rest)
+		if second == "" {
 			return txCommand{kind: "begin"}, true
 		}
-		second := strings.ToLower(fields[1])
-		switch second {
+		switch strings.ToLower(second) {
 		case "transaction", "deferred", "immediate", "exclusive":
 			return txCommand{kind: "begin"}, true
 		default:
 			return txCommand{}, false
 		}
-	case "start":
-		if len(fields) >= 2 && strings.EqualFold(fields[1], "transaction") {
+	case strings.EqualFold(first, "start"):
+		second, _ := nextSQLField(rest)
+		if strings.EqualFold(second, "transaction") {
 			return txCommand{kind: "begin"}, true
 		}
-	case "commit", "end":
+	case strings.EqualFold(first, "commit"), strings.EqualFold(first, "end"):
 		return txCommand{kind: "commit"}, true
-	case "rollback":
-		if len(fields) >= 3 && strings.EqualFold(fields[1], "to") {
-			return txCommand{kind: "rollback_to", name: cleanTxName(fields[len(fields)-1])}, true
+	case strings.EqualFold(first, "rollback"):
+		second, rest := nextSQLField(rest)
+		if strings.EqualFold(second, "to") {
+			if savepoint, afterSavepoint := nextSQLField(rest); strings.EqualFold(savepoint, "savepoint") {
+				rest = afterSavepoint
+			}
+			name, _ := lastSQLField(rest)
+			return txCommand{kind: "rollback_to", name: cleanTxName(name)}, true
 		}
 		return txCommand{kind: "rollback"}, true
-	case "savepoint":
-		if len(fields) >= 2 {
-			return txCommand{kind: "savepoint", name: cleanTxName(fields[1])}, true
+	case strings.EqualFold(first, "savepoint"):
+		name, _ := nextSQLField(rest)
+		if name != "" {
+			return txCommand{kind: "savepoint", name: cleanTxName(name)}, true
 		}
 		return txCommand{kind: "savepoint"}, true
-	case "release":
-		if len(fields) >= 3 && strings.EqualFold(fields[1], "savepoint") {
-			return txCommand{kind: "release", name: cleanTxName(fields[2])}, true
+	case strings.EqualFold(first, "release"):
+		name, rest := nextSQLField(rest)
+		if strings.EqualFold(name, "savepoint") {
+			name, _ = nextSQLField(rest)
 		}
-		if len(fields) >= 2 {
-			return txCommand{kind: "release", name: cleanTxName(fields[1])}, true
+		if name != "" {
+			return txCommand{kind: "release", name: cleanTxName(name)}, true
 		}
 		return txCommand{kind: "release"}, true
 	}
 	return txCommand{}, false
+}
+
+func nextSQLField(s string) (string, string) {
+	s = strings.TrimLeft(s, " \t\n\r")
+	if s == "" {
+		return "", ""
+	}
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r':
+			return s[:i], s[i+1:]
+		}
+		i++
+	}
+	return s, ""
+}
+
+func lastSQLField(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	end := len(s)
+	for end > 0 {
+		switch s[end-1] {
+		case ' ', '\t', '\n', '\r':
+			return s[end:], s[:end-1]
+		}
+		end--
+	}
+	return s, ""
 }
 
 func cleanTxName(name string) string {
@@ -336,6 +384,7 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	d.state.NextTx = next
+	d.state.ensureRuntime()
 	res, fast, err := fastDirectDML(&d.state, stmt, args)
 	if err != nil {
 		return Result{}, true, err
@@ -346,6 +395,9 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 			d.state.rebuildRuntime()
 			return Result{}, true, err
 		}
+	}
+	if err := d.markDirty(); err != nil {
+		return Result{}, true, err
 	}
 	if err := d.appendLogical(next, query, args); err != nil {
 		return Result{}, true, err
@@ -366,12 +418,16 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
 	d.state.NextTx = next
+	d.state.ensureRuntime()
 	res, fast, err := fastSimpleDML(&d.state, query, args)
 	if err != nil {
 		return Result{}, true, err
 	}
 	if !fast {
 		return Result{}, false, nil
+	}
+	if err := d.markDirty(); err != nil {
+		return Result{}, true, err
 	}
 	if err := d.appendLogical(next, query, args); err != nil {
 		return Result{}, true, err
@@ -387,11 +443,134 @@ func (d *DB) appendLogical(txid uint64, query string, args []any) error {
 	if data, ok := encodeSimpleWAL(query, args); ok {
 		return d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
 	}
-	data, err := json.Marshal(logicalRecord{SQL: query, Args: args})
+	data, err := encodeStateWAL(&d.state)
 	if err != nil {
 		return err
 	}
 	return d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
+}
+
+func encodeStateWAL(s *persistedState) ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("missing state")
+	}
+	s.materializePending()
+	out := []byte{stateWALMagic}
+	catalogData, err := json.Marshal(s.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	out = appendBytes32(out, catalogData)
+	out = binary.LittleEndian.AppendUint64(out, s.NextTx)
+	pragmaData, err := json.Marshal(s.Pragmas)
+	if err != nil {
+		return nil, err
+	}
+	out = appendBytes32(out, pragmaData)
+	tableNames := make([]string, 0, len(s.Tables))
+	for name, data := range s.Tables {
+		if data != nil && s.Catalog.Tables[name] != nil {
+			tableNames = append(tableNames, name)
+		}
+	}
+	if len(tableNames) > math.MaxUint32 {
+		return nil, errors.New("too many tables for state WAL")
+	}
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(tableNames)))
+	for _, name := range tableNames {
+		data := s.Tables[name]
+		table := s.Catalog.Tables[name]
+		if err := data.materializeLazy(table); err != nil {
+			return nil, err
+		}
+		var ok bool
+		out, ok = appendString16OK(out, name)
+		if !ok {
+			return nil, errors.New("table name too long for state WAL")
+		}
+		if len(data.Rows) > math.MaxUint32 {
+			return nil, errors.New("too many rows for state WAL")
+		}
+		out = binary.LittleEndian.AppendUint32(out, uint32(len(data.Rows)))
+		for _, row := range data.Rows {
+			rowData, err := encodeRowVersion(table, row)
+			if err != nil {
+				return nil, err
+			}
+			out = appendBytes32(out, rowData)
+		}
+	}
+	return out, nil
+}
+
+func decodeStateWAL(data []byte) (persistedState, bool, error) {
+	if len(data) == 0 || data[0] != stateWALMagic {
+		return persistedState{}, false, nil
+	}
+	data = data[1:]
+	var catalogData []byte
+	var err error
+	catalogData, data, err = readBytes32(data)
+	if err != nil {
+		return persistedState{}, true, err
+	}
+	state := newState()
+	if err := json.Unmarshal(catalogData, &state.Catalog); err != nil {
+		return persistedState{}, true, err
+	}
+	if len(data) < 8 {
+		return persistedState{}, true, errors.New("truncated state WAL next tx")
+	}
+	state.NextTx = binary.LittleEndian.Uint64(data[:8])
+	data = data[8:]
+	var pragmaData []byte
+	pragmaData, data, err = readBytes32(data)
+	if err != nil {
+		return persistedState{}, true, err
+	}
+	if err := json.Unmarshal(pragmaData, &state.Pragmas); err != nil {
+		return persistedState{}, true, err
+	}
+	if len(data) < 4 {
+		return persistedState{}, true, errors.New("truncated state WAL table count")
+	}
+	n := int(binary.LittleEndian.Uint32(data[:4]))
+	data = data[4:]
+	state.Tables = make(map[string]*tableData, n)
+	for i := 0; i < n; i++ {
+		name, rest, err := readString16(data)
+		if err != nil {
+			return persistedState{}, true, err
+		}
+		data = rest
+		if len(data) < 4 {
+			return persistedState{}, true, errors.New("truncated state WAL row count")
+		}
+		rows := int(binary.LittleEndian.Uint32(data[:4]))
+		data = data[4:]
+		table := state.Catalog.Tables[name]
+		if table == nil {
+			return persistedState{}, true, fmt.Errorf("state WAL references unknown table: %s", name)
+		}
+		td := &tableData{Rows: make([]rowVersion, 0, rows)}
+		for j := 0; j < rows; j++ {
+			var rowData []byte
+			rowData, data, err = readBytes32(data)
+			if err != nil {
+				return persistedState{}, true, err
+			}
+			row, err := decodeRowVersion(table, rowData)
+			if err != nil {
+				return persistedState{}, true, err
+			}
+			td.Rows = append(td.Rows, row)
+		}
+		state.Tables[name] = td
+	}
+	if len(data) != 0 {
+		return persistedState{}, true, errors.New("trailing state WAL bytes")
+	}
+	return state, true, nil
 }
 
 func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
@@ -507,6 +686,7 @@ func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
 	case 'i':
 		res, fast, err = fastInsertValues(s, rec.plan.table, rec.args)
 	case 'u':
+		s.ensureRuntime()
 		res, fast, err = fastIncrementUpdate(s, simpleIncrementUpdate{
 			table: rec.plan.table,
 			col:   rec.plan.col,
@@ -514,6 +694,7 @@ func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
 			inc:   rec.plan.inc,
 		}, rec.args)
 	case 'd':
+		s.ensureRuntime()
 		res, fast, err = fastDeleteWhere(s, rec.plan.table, rec.plan.where, rec.args)
 	default:
 		return errors.New("unknown simple WAL mutation")
@@ -531,6 +712,23 @@ func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
 func appendString16(dst []byte, s string) []byte {
 	dst, _ = appendString16OK(dst, s)
 	return dst
+}
+
+func appendBytes32(dst []byte, data []byte) []byte {
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(data)))
+	return append(dst, data...)
+}
+
+func readBytes32(data []byte) ([]byte, []byte, error) {
+	if len(data) < 4 {
+		return nil, nil, errors.New("truncated length-prefixed payload")
+	}
+	n := int(binary.LittleEndian.Uint32(data[:4]))
+	data = data[4:]
+	if len(data) < n {
+		return nil, nil, errors.New("truncated length-prefixed payload bytes")
+	}
+	return data[:n], data[n:], nil
 }
 
 func appendString16OK(dst []byte, s string) ([]byte, bool) {
@@ -695,7 +893,10 @@ func encodeTxWAL(tx *Tx) ([]byte, error) {
 		}
 	}
 	tx.flushPendingInsertLogs()
-	return encodeTransactionWAL(tx.ops)
+	if data, ok := encodeSimpleTransactionWAL(tx.ops); ok {
+		return data, nil
+	}
+	return encodeStateWAL(&tx.writes)
 }
 
 func encodePendingInsertTransactionWAL(tx *Tx) ([]byte, bool) {
@@ -855,6 +1056,53 @@ func walHasRecords(path string) bool {
 	return err == nil && info.Size() >= 21
 }
 
+func (d *DB) cleanCheckpointMarkerPath() string {
+	return filepath.Join(d.path, "db.clean")
+}
+
+func (d *DB) hasCleanCheckpointMarker() (bool, error) {
+	if d.applied == 0 || d.applied != d.checkpointed {
+		return false, nil
+	}
+	data, err := os.ReadFile(d.cleanCheckpointMarkerPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	txid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return false, nil
+	}
+	return txid == d.applied, nil
+}
+
+func (d *DB) writeCleanCheckpointMarker(applied uint64) error {
+	tmp := d.cleanCheckpointMarkerPath() + ".tmp"
+	data := []byte(strconv.FormatUint(applied, 10))
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, d.cleanCheckpointMarkerPath()); err != nil {
+		return err
+	}
+	d.clean = true
+	return nil
+}
+
+func (d *DB) markDirty() error {
+	if !d.clean {
+		return nil
+	}
+	err := os.Remove(d.cleanCheckpointMarkerPath())
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		d.clean = false
+		return nil
+	}
+	return err
+}
+
 func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if err := d.checkOpen(); err != nil {
 		return nil, err
@@ -951,7 +1199,7 @@ func (d *DB) loadSnapshot() error {
 		d.checkpointed = meta.Applied
 		d.state.Tables = make(map[string]*tableData)
 		for name, schema := range d.state.Catalog.Tables {
-			td, err := d.loadTablePages(name, schema, meta.Generation)
+			td, err := d.loadTablePagesLazy(name, schema, meta.Generation)
 			if err != nil {
 				return err
 			}
@@ -960,7 +1208,7 @@ func (d *DB) loadSnapshot() error {
 				return err
 			}
 		}
-		d.state.rebuildRuntime()
+		d.state.deferRuntime()
 		return nil
 	}
 	if err := json.Unmarshal(data, &d.state); err != nil {
@@ -1015,6 +1263,14 @@ func (d *DB) replay() error {
 					}
 				}
 				d.state.materializePending()
+				d.applied = rec.TxID
+				return nil
+			}
+			if state, ok, err := decodeStateWAL(rec.Data); err != nil {
+				return err
+			} else if ok {
+				d.state = state
+				d.state.rebuildRuntime()
 				d.applied = rec.TxID
 				return nil
 			}
@@ -1084,6 +1340,9 @@ func (d *DB) commit(tx *Tx) error {
 	}
 	data, err := encodeTxWAL(tx)
 	if err != nil {
+		return err
+	}
+	if err := d.markDirty(); err != nil {
 		return err
 	}
 	if err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: next, Data: data}, d.opts.SyncPolicy == SyncFull); err != nil {
@@ -1259,7 +1518,7 @@ func (d *DB) writeCheckpointPages(state persistedState, applied uint64) error {
 	if err := d.cleanupCheckpointGenerations(state, generation); err != nil {
 		return err
 	}
-	return nil
+	return d.writeCleanCheckpointMarker(applied)
 }
 
 func (d *DB) appendPhysicalPagerWAL(txid uint64) error {
@@ -1336,6 +1595,14 @@ func (d *DB) writeTablePages(name string, schema *catalog.Table, table *tableDat
 }
 
 func (d *DB) loadTablePages(name string, schema *catalog.Table, generation uint64) (*tableData, error) {
+	return d.loadTablePagesWithOptions(name, schema, generation, true)
+}
+
+func (d *DB) loadTablePagesLazy(name string, schema *catalog.Table, generation uint64) (*tableData, error) {
+	return d.loadTablePagesWithOptions(name, schema, generation, false)
+}
+
+func (d *DB) loadTablePagesWithOptions(name string, schema *catalog.Table, generation uint64, includeValues bool) (*tableData, error) {
 	pg, err := d.tablePagerFor(name, generation)
 	if err != nil {
 		return nil, err
@@ -1343,6 +1610,25 @@ func (d *DB) loadTablePages(name string, schema *catalog.Table, generation uint6
 	defer pg.Close()
 	data, err := pg.ReadBlob()
 	if err != nil {
+		if !includeValues && walHasRecords(filepath.Join(d.path, "db.wal")) {
+			count, countErr := pg.ReadRecordCount()
+			if countErr != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if generation != 0 {
+						return nil, fmt.Errorf("missing checkpoint table pages for %s generation %d", name, generation)
+					}
+					return &tableData{}, nil
+				}
+				return nil, countErr
+			}
+			return &tableData{
+				deferRuntime: true,
+				baseRows:     count,
+				lazyPath:     d.tablePagerPath(name, generation),
+				lazyPageSize: d.opts.PageSize,
+				lazyCount:    count,
+			}, nil
+		}
 		records, rerr := pg.ReadRecords()
 		if rerr != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1353,9 +1639,17 @@ func (d *DB) loadTablePages(name string, schema *catalog.Table, generation uint6
 			}
 			return nil, err
 		}
+		if !includeValues {
+			return &tableData{lazyRecords: records, deferRuntime: true, baseRows: len(records)}, nil
+		}
 		table := &tableData{Rows: make([]rowVersion, 0, len(records))}
 		for _, rec := range records {
-			row, err := decodeRowVersion(schema, rec.Values)
+			var row rowVersion
+			if includeValues {
+				row, err = decodeRowVersion(schema, rec.Values)
+			} else {
+				row, err = decodeRowVersionLazy(schema, rec.Values)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1536,6 +1830,9 @@ func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error
 	if ok, err := t.execTransactionControl(query); ok || err != nil {
 		return Result{}, err
 	}
+	if plan, ok := simplePlan(query); ok && plan.kind != 'i' {
+		t.writes.ensureRuntime()
+	}
 	if res, fast, err := fastSimpleDML(&t.writes, query, args); fast || err != nil {
 		if err == nil {
 			t.logOp(query, args)
@@ -1543,6 +1840,9 @@ func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error
 		return res, err
 	}
 	if stmt, err := parseStatementCached(stripStrictOnly(query)); err == nil {
+		if _, insert := stmt.(*ast.InsertStmt); !insert {
+			t.writes.ensureRuntime()
+		}
 		if res, fast, err := fastDirectDML(&t.writes, stmt, args); fast || err != nil {
 			if err == nil {
 				t.logOp(query, args)

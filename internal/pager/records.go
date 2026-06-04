@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 
 	"github.com/sujit/sqlite/internal/page"
 )
@@ -38,10 +39,14 @@ func (p *Pager) WriteRecords(records []Record) error {
 }
 
 func (p *Pager) ReadRecords() ([]Record, error) {
-	header, err := p.Read(1)
+	pages, err := p.readAllRecordPages()
 	if err != nil {
 		return nil, err
 	}
+	if len(pages) == 0 {
+		return nil, errors.New("not a record pager")
+	}
+	header := pages[0]
 	if string(header.Data[0:8]) != recordHeaderMagic {
 		return nil, errors.New("not a record pager")
 	}
@@ -49,7 +54,7 @@ func (p *Pager) ReadRecords() ([]Record, error) {
 	records := make([]Record, 0, n)
 	nextPage := page.ID(2)
 	for i := 0; i < n; i++ {
-		payload, used, err := p.readRecordPayload(nextPage)
+		payload, used, err := readRecordPayloadFromPages(pages, nextPage, p.pageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -61,6 +66,60 @@ func (p *Pager) ReadRecords() ([]Record, error) {
 		nextPage += page.ID(used)
 	}
 	return records, nil
+}
+
+func (p *Pager) ReadRecordCount() (int, error) {
+	header, err := p.Read(1)
+	if err != nil {
+		return 0, err
+	}
+	if string(header.Data[0:8]) != recordHeaderMagic {
+		return 0, errors.New("not a record pager")
+	}
+	return int(binary.LittleEndian.Uint64(header.Data[8:16])), nil
+}
+
+func (p *Pager) ReadRecordAtOrdinal(ord int) (Record, bool, error) {
+	if ord < 0 {
+		return Record{}, false, nil
+	}
+	payload, _, err := p.readRecordPayload(page.ID(ord + 2))
+	if err != nil {
+		return Record{}, false, err
+	}
+	rec, err := decodeRecord(payload)
+	if err != nil {
+		return Record{}, false, err
+	}
+	return rec, true, nil
+}
+
+func (p *Pager) readAllRecordPages() ([]page.Page, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	info, err := p.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() == 0 {
+		return nil, nil
+	}
+	if info.Size()%int64(p.pageSize) != 0 {
+		return nil, errors.New("pager file is not page aligned")
+	}
+	raw := make([]byte, int(info.Size()))
+	if _, err := p.file.ReadAt(raw, 0); err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	pages := make([]page.Page, 0, len(raw)/p.pageSize)
+	for off := 0; off < len(raw); off += p.pageSize {
+		pg, err := page.Decode(raw[off : off+p.pageSize])
+		if err != nil {
+			return nil, err
+		}
+		pages = append(pages, pg)
+	}
+	return pages, nil
 }
 
 func (p *Pager) writeRecordPayload(start page.ID, data []byte) (int, error) {
@@ -122,6 +181,47 @@ func (p *Pager) readRecordPayload(start page.ID) ([]byte, int, error) {
 			if string(pg.Data[0:8]) != recordPageMagic {
 				return nil, 0, errors.New("invalid record overflow page")
 			}
+		}
+		remaining := size - len(out)
+		n := chunkSize
+		if remaining < n {
+			n = remaining
+		}
+		out = append(out, pg.Data[16:16+n]...)
+	}
+	return out, count, nil
+}
+
+func readRecordPayloadFromPages(pages []page.Page, start page.ID, pageSize int) ([]byte, int, error) {
+	firstIdx := int(start) - 1
+	if firstIdx < 0 || firstIdx >= len(pages) {
+		return nil, 0, errors.New("invalid record page")
+	}
+	first := pages[firstIdx]
+	if string(first.Data[0:8]) != recordPageMagic {
+		return nil, 0, errors.New("invalid record page")
+	}
+	size := int(binary.LittleEndian.Uint64(first.Data[8:16]))
+	if size < 0 {
+		return nil, 0, errors.New("invalid record size")
+	}
+	chunkSize := pageSize - page.HeaderSize - 16
+	if chunkSize <= 0 {
+		return nil, 0, errors.New("page size too small for record")
+	}
+	count := (size + chunkSize - 1) / chunkSize
+	if count == 0 {
+		count = 1
+	}
+	out := make([]byte, 0, size)
+	for i := 0; i < count; i++ {
+		idx := firstIdx + i
+		if idx < 0 || idx >= len(pages) {
+			return nil, 0, errors.New("invalid record overflow page")
+		}
+		pg := pages[idx]
+		if i > 0 && string(pg.Data[0:8]) != recordPageMagic {
+			return nil, 0, errors.New("invalid record overflow page")
 		}
 		remaining := size - len(out)
 		n := chunkSize

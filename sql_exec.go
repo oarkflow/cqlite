@@ -467,6 +467,9 @@ func fastInsertDML(s *persistedState, st *ast.InsertStmt, args []any) (Result, b
 	if st.Replace || st.OnConflictDoNothing || st.Ignore || len(st.OnConflictUpdate) > 0 || len(st.Values) != 1 {
 		return Result{}, false, nil
 	}
+	if st.ValuesExpr != nil {
+		return Result{}, false, nil
+	}
 	t, data, err := tableForWrite(s, qname(st.Table))
 	if err != nil {
 		return Result{}, true, err
@@ -763,19 +766,36 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 		return nil, false, nil
 	}
 	width := len(projectors)
-	out := make([]any, 0, 16*width)
+	if row, used, err := simpleSelectLazyPointRow(t, data, plan, args); used || err != nil {
+		if err != nil {
+			return nil, true, err
+		}
+		if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
+			return isql.NewFlatRows(cols, nil), true, nil
+		}
+		out := make([]any, 0, width)
+		for _, p := range projectors {
+			out = append(out, p(row))
+		}
+		return isql.NewFlatRows(cols, out), true, nil
+	}
+	if len(data.lazyRecords) > 0 {
+		data.rebuildRuntime(t)
+	}
+	out := make([]any, 0, simpleSelectStreamCap(plan, data, args)*width)
 	emit := func(row rowVersion) {
 		for _, p := range projectors {
 			out = append(out, p(row))
 		}
 	}
+	postFilter := !simpleSelectAccessCoversConditions(plan, args)
 	if plan.order.col == "" {
 		if used := simpleSelectEachCandidatePosition(s, plan, data, args, func(pos int) bool {
 			if pos < 0 || pos >= len(data.Rows) {
 				return true
 			}
 			row := data.Rows[pos]
-			if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
+			if row.Deleted != 0 || (postFilter && !simpleSelectMatches(t, plan, row, args)) {
 				return true
 			}
 			emit(row)
@@ -824,6 +844,77 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 		out = applySimpleFlatLimit(out, width, plan.limit, plan.offset)
 	}
 	return isql.NewFlatRows(cols, out), true, nil
+}
+
+func simpleSelectLazyPointRow(t *catalog.Table, data *tableData, plan simpleSelectPlan, args []any) (rowVersion, bool, error) {
+	if data == nil || (len(data.lazyRecords) == 0 && data.lazyPath == "") || plan.order.col != "" || len(plan.conds) != 1 {
+		return rowVersion{}, false, nil
+	}
+	cond := plan.conds[0]
+	if cond.op != "=" {
+		return rowVersion{}, false, nil
+	}
+	pk := integerPrimaryKeyColumn(t)
+	if cond.col != pk && cond.col != "rowid" && cond.col != "_rowid_" && cond.col != "oid" {
+		col, _, ok := t.Column(cond.col)
+		if !ok || !col.PrimaryKey {
+			return rowVersion{}, false, nil
+		}
+	}
+	v, ok := simpleSelectCondValue(cond, args)
+	if !ok {
+		return rowVersion{}, true, nil
+	}
+	id, ok := asInt(v)
+	if !ok {
+		return rowVersion{}, true, nil
+	}
+	row, found, err := data.lazyRowByID(t, id)
+	if !found {
+		return rowVersion{}, true, nil
+	}
+	return row, true, err
+}
+
+func simpleSelectAccessCoversConditions(plan simpleSelectPlan, args []any) bool {
+	if len(plan.conds) == 0 {
+		return false
+	}
+	if len(plan.conds) == 1 && plan.conds[0].op == "=" {
+		_, ok := simpleSelectCondValue(plan.conds[0], args)
+		return ok
+	}
+	rangeCol, _, _, ok := simpleSelectRange(plan.conds, args)
+	if !ok {
+		return false
+	}
+	for _, cond := range plan.conds {
+		switch cond.op {
+		case "<", "<=", ">", ">=":
+			if cond.col != rangeCol {
+				return false
+			}
+			if _, ok := simpleSelectCondValue(cond, args); !ok {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func simpleSelectStreamCap(plan simpleSelectPlan, data *tableData, args []any) int {
+	if data == nil || len(data.Rows) == 0 {
+		return 0
+	}
+	if _, _, _, ok := simpleSelectRange(plan.conds, args); ok {
+		if len(data.Rows) < 128 {
+			return len(data.Rows)
+		}
+		return 128
+	}
+	return 16
 }
 
 func parseSimpleSelectPlanCached(query string) (simpleSelectPlan, bool) {
@@ -1083,7 +1174,28 @@ func simpleSelectEachCandidatePosition(s *persistedState, plan simpleSelectPlan,
 			return true
 		}
 	}
-	return false
+	col, start, end, ok := simpleSelectRange(plan.conds, args)
+	if !ok {
+		return false
+	}
+	return eachRangeCandidatePosition(s, plan.table, data, col, start, end, fn)
+}
+
+func eachRangeCandidatePosition(s *persistedState, table string, data *tableData, col string, start, end *rangeBound, fn func(int) bool) bool {
+	t, _ := s.Catalog.Table(table)
+	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
+		lo, hi, ok := rowidRangeBounds(start, end)
+		if !ok {
+			return true
+		}
+		return data.eachRangeRowID(lo, hi, fn)
+	}
+	idxName := usableIndexForColumn(s, table, col)
+	if idxName == "" {
+		return false
+	}
+	startKey, endKey := indexRangeKeys(start, end)
+	return data.eachRangeIndexPosition(idxName, startKey, endKey, fn)
 }
 
 func simpleSelectOrderPositions(s *persistedState, plan simpleSelectPlan, data *tableData) []int {
@@ -1297,6 +1409,7 @@ func queryRows(ctx context.Context, s *persistedState, query string, args ...any
 	if rows, ok, err := execSimpleSelectPlan(s, query, args); ok || err != nil {
 		return rows, err
 	}
+	s.ensureRuntime()
 	stmt, err := parseStatementCached(query)
 	if err != nil {
 		return nil, err
@@ -1320,6 +1433,11 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 	name := qname(st.Table)
 	if st.Select != nil {
 		return execCreateTableAsSelect(s, st, rawSQL)
+	}
+	if st.IfNotExists {
+		if _, ok := s.Catalog.Table(name); ok {
+			return Result{}, nil
+		}
 	}
 	t := &catalog.Table{Name: name, Strict: strict, SQL: strings.TrimSpace(rawSQL)}
 	seenPK := false
@@ -1860,7 +1978,25 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 	}
 	var affected int64
 	var last int64
-	insert := func(row map[string]any) (bool, int64, error) {
+	var insert func(row map[string]any) (bool, int64, error)
+	insertValues := func(values []any) (bool, int64, error) {
+		if len(values) != len(cols) {
+			return false, 0, errors.New("insert column/value count mismatch")
+		}
+		row := make(map[string]any, len(t.Columns))
+		for _, col := range t.Columns {
+			row[col.Name] = col.Default
+		}
+		for i, v := range values {
+			cv, err := coerce(cols[i], v, t.Strict)
+			if err != nil {
+				return false, 0, err
+			}
+			row[cols[i].Name] = cv
+		}
+		return insert(row)
+	}
+	insert = func(row map[string]any) (bool, int64, error) {
 		rowid := t.NextRowID
 		if pk := integerPrimaryKeyColumn(t); pk != "" {
 			if row[pk] == nil {
@@ -1909,18 +2045,26 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 			if len(values) != len(cols) {
 				return Result{}, errors.New("insert column/value count mismatch")
 			}
-			row := make(map[string]any, len(t.Columns))
-			for _, col := range t.Columns {
-				row[col.Name] = col.Default
+			ok, rowid, err := insertValues(values)
+			if err != nil {
+				return Result{}, err
 			}
-			for i, v := range values {
-				cv, err := coerce(cols[i], v, t.Strict)
-				if err != nil {
-					return Result{}, err
+			if ok {
+				affected++
+				if rowid != 0 {
+					last = rowid
 				}
-				row[cols[i].Name] = cv
 			}
-			ok, rowid, err := insert(row)
+		}
+		return Result{RowsAffected: affected, LastInsertID: last}, nil
+	}
+	if st.ValuesExpr != nil {
+		rows, err := expandInsertValuesExpr(st.ValuesExpr, args, cols)
+		if err != nil {
+			return Result{}, err
+		}
+		for _, values := range rows {
+			ok, rowid, err := insertValues(values)
 			if err != nil {
 				return Result{}, err
 			}
@@ -1938,22 +2082,15 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 		if len(values) != len(cols) {
 			return Result{}, errors.New("insert column/value count mismatch")
 		}
-		row := make(map[string]any, len(t.Columns))
-		for _, col := range t.Columns {
-			row[col.Name] = col.Default
-		}
+		rawValues := make([]any, len(values))
 		for i, expr := range values {
 			v, err := evalExpr(expr, nil, &bind)
 			if err != nil {
 				return Result{}, err
 			}
-			cv, err := coerce(cols[i], v, t.Strict)
-			if err != nil {
-				return Result{}, err
-			}
-			row[cols[i].Name] = cv
+			rawValues[i] = v
 		}
-		ok, rowid, err := insert(row)
+		ok, rowid, err := insertValues(rawValues)
 		if err != nil {
 			return Result{}, err
 		}
@@ -1965,6 +2102,110 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 		}
 	}
 	return Result{RowsAffected: affected, LastInsertID: last}, nil
+}
+
+func expandInsertValuesExpr(expr ast.Expr, args []any, cols []catalog.Column) ([][]any, error) {
+	bind := binder{args: args}
+	value, err := evalExpr(expr, nil, &bind)
+	if err != nil {
+		return nil, err
+	}
+	if rows, ok, err := insertObjectRows(value, cols); ok || err != nil {
+		return rows, err
+	}
+	if len(cols) == 1 {
+		return [][]any{{value}}, nil
+	}
+	return nil, errors.New("insert column/value count mismatch")
+}
+
+func insertObjectRows(value any, cols []catalog.Column) ([][]any, bool, error) {
+	if values, ok, err := insertRowObjectValues(value, cols); ok || err != nil {
+		return [][]any{values}, ok, err
+	}
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() {
+		return nil, false, nil
+	}
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil, false, nil
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return nil, false, nil
+		}
+		fallthrough
+	case reflect.Array:
+		rows := make([][]any, 0, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			elem := rv.Index(i).Interface()
+			values, ok, err := insertRowObjectValues(elem, cols)
+			if err != nil {
+				return nil, true, err
+			}
+			if !ok {
+				if len(cols) == 1 {
+					rows = append(rows, []any{elem})
+					continue
+				}
+				return nil, true, errors.New("insert row source must be a map or struct")
+			}
+			rows = append(rows, values)
+		}
+		return rows, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func insertRowObjectValues(value any, cols []catalog.Column) ([]any, bool, error) {
+	named := make(map[string]any, len(cols)*2)
+	if !addRowNamedSource(named, value) {
+		return nil, false, nil
+	}
+	values := make([]any, len(cols))
+	for i, col := range cols {
+		if v, ok := named[col.Name]; ok {
+			values[i] = v
+			continue
+		}
+		if v, ok := named[catalog.Normalize(col.Name)]; ok {
+			values[i] = v
+			continue
+		}
+		return nil, true, fmt.Errorf("missing insert row value for column: %s", col.Name)
+	}
+	return values, true, nil
+}
+
+func addRowNamedSource(out map[string]any, value any) bool {
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() {
+		return false
+	}
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return false
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return false
+		}
+		addNamedSource(out, rv.Interface())
+		return true
+	case reflect.Struct:
+		addStructNamedValues(out, rv)
+		return true
+	default:
+		return false
+	}
 }
 
 func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming map[string]any, assigns []ast.Assignment, args []any) error {
@@ -2850,26 +3091,9 @@ type rangeBound struct {
 func rangeCandidatePositions(s *persistedState, table string, data *tableData, col string, start, end *rangeBound) []int {
 	t, _ := s.Catalog.Table(table)
 	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
-		var lo, hi *int64
-		if start != nil {
-			v, ok := asInt(start.value)
-			if !ok {
-				return []int{}
-			}
-			if !start.inclusive {
-				v++
-			}
-			lo = &v
-		}
-		if end != nil {
-			v, ok := asInt(end.value)
-			if !ok {
-				return []int{}
-			}
-			if end.inclusive {
-				v++
-			}
-			hi = &v
+		lo, hi, ok := rowidRangeBounds(start, end)
+		if !ok {
+			return []int{}
 		}
 		return data.rangeRowIDs(lo, hi)
 	}
@@ -2877,6 +3101,36 @@ func rangeCandidatePositions(s *persistedState, table string, data *tableData, c
 	if idxName == "" {
 		return nil
 	}
+	startKey, endKey := indexRangeKeys(start, end)
+	return data.rangeIndexPositions(idxName, startKey, endKey)
+}
+
+func rowidRangeBounds(start, end *rangeBound) (*int64, *int64, bool) {
+	var lo, hi *int64
+	if start != nil {
+		v, ok := asInt(start.value)
+		if !ok {
+			return nil, nil, false
+		}
+		if !start.inclusive {
+			v++
+		}
+		lo = &v
+	}
+	if end != nil {
+		v, ok := asInt(end.value)
+		if !ok {
+			return nil, nil, false
+		}
+		if end.inclusive {
+			v++
+		}
+		hi = &v
+	}
+	return lo, hi, true
+}
+
+func indexRangeKeys(start, end *rangeBound) ([]byte, []byte) {
 	var startKey, endKey []byte
 	if start != nil {
 		startKey = []byte(runtimeValueKey(start.value))
@@ -2888,7 +3142,7 @@ func rangeCandidatePositions(s *persistedState, table string, data *tableData, c
 			endKey = []byte(runtimeValueKey(end.value))
 		}
 	}
-	return data.rangeIndexPositions(idxName, startKey, endKey)
+	return startKey, endKey
 }
 
 func runtimeIndexLookupKey(idx catalog.Index, val any) string {
@@ -4194,7 +4448,7 @@ func (b *binder) next() (any, error) {
 	for b.pos < len(b.args) {
 		v := b.args[b.pos]
 		b.pos++
-		if _, ok := namedArg(v); ok {
+		if isNamedSource(v) {
 			continue
 		}
 		return v, nil
@@ -4210,12 +4464,7 @@ func (b *binder) param(raw []byte) (any, error) {
 	if b.named == nil {
 		b.named = make(map[string]any)
 		for _, arg := range b.args {
-			n, ok := namedArg(arg)
-			if !ok || n.Name == "" {
-				continue
-			}
-			b.named[n.Name] = n.Value
-			b.named[catalog.Normalize(n.Name)] = n.Value
+			addNamedSource(b.named, arg)
 		}
 	}
 	if v, ok := b.named[name]; ok {
@@ -4241,9 +4490,113 @@ func namedArg(v any) (NamedArg, bool) {
 	}
 }
 
+func isNamedSource(v any) bool {
+	if _, ok := namedArg(v); ok {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return false
+	}
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return false
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		return rv.Type().Key().Kind() == reflect.String
+	case reflect.Struct:
+		return true
+	default:
+		return false
+	}
+}
+
+func addNamedSource(out map[string]any, v any) {
+	if n, ok := namedArg(v); ok {
+		addNamedValue(out, n.Name, n.Value)
+		return
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return
+	}
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return
+		}
+		iter := rv.MapRange()
+		for iter.Next() {
+			addNamedValue(out, iter.Key().String(), iter.Value().Interface())
+		}
+	case reflect.Struct:
+		addStructNamedValues(out, rv)
+	}
+}
+
+func addStructNamedValues(out map[string]any, rv reflect.Value) {
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		if field.PkgPath != "" || field.Anonymous {
+			continue
+		}
+		value := rv.Field(i).Interface()
+		addNamedValue(out, field.Name, value)
+		addNamedValue(out, camelToSnake(field.Name), value)
+		for _, tagName := range []string{"db", "sql", "json"} {
+			name := tagBindName(field.Tag.Get(tagName))
+			if name != "" {
+				addNamedValue(out, name, value)
+			}
+		}
+	}
+}
+
+func tagBindName(tag string) string {
+	if tag == "" || tag == "-" {
+		return ""
+	}
+	if i := strings.IndexByte(tag, ','); i >= 0 {
+		tag = tag[:i]
+	}
+	if tag == "-" {
+		return ""
+	}
+	return strings.TrimSpace(tag)
+}
+
+func addNamedValue(out map[string]any, name string, value any) {
+	if name == "" {
+		return
+	}
+	out[name] = value
+	out[catalog.Normalize(name)] = value
+}
+
+func camelToSnake(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			b.WriteByte('_')
+		}
+		b.WriteRune(r)
+	}
+	return strings.ToLower(b.String())
+}
+
 func hasNamedArgs(args []any) bool {
 	for _, arg := range args {
-		if _, ok := namedArg(arg); ok {
+		if isNamedSource(arg) {
 			return true
 		}
 	}

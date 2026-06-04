@@ -45,6 +45,14 @@ func encodeRowVersion(schema *catalog.Table, row rowVersion) ([]byte, error) {
 }
 
 func decodeRowVersion(schema *catalog.Table, data []byte) (rowVersion, error) {
+	return decodeRowVersionWithOptions(schema, data, true)
+}
+
+func decodeRowVersionLazy(schema *catalog.Table, data []byte) (rowVersion, error) {
+	return decodeRowVersionWithOptions(schema, data, false)
+}
+
+func decodeRowVersionWithOptions(schema *catalog.Table, data []byte, includeValues bool) (rowVersion, error) {
 	if schema == nil {
 		return rowVersion{}, errors.New("missing table schema")
 	}
@@ -83,7 +91,9 @@ func decodeRowVersion(schema *catalog.Table, data []byte) (rowVersion, error) {
 	if pos != len(data) {
 		return rowVersion{}, errors.New("trailing row bytes")
 	}
-	row.ensureValues(schema)
+	if includeValues {
+		row.ensureValues(schema)
+	}
 	return row, nil
 }
 

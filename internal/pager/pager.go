@@ -12,11 +12,12 @@ import (
 )
 
 type Pager struct {
-	mu       sync.Mutex
-	path     string
-	file     *os.File
-	pageSize int
-	free     []page.ID
+	mu        sync.Mutex
+	path      string
+	file      *os.File
+	pageSize  int
+	free      []page.ID
+	freeDirty bool
 }
 
 const blobMagic = "SQLTBLB1"
@@ -74,6 +75,7 @@ func (p *Pager) Allocate() (page.ID, error) {
 	if n := len(p.free); n > 0 {
 		id := p.free[n-1]
 		p.free = p.free[:n-1]
+		p.freeDirty = true
 		if err := p.persistFreeListLocked(); err != nil {
 			return 0, err
 		}
@@ -98,6 +100,7 @@ func (p *Pager) Free(id page.ID) error {
 		}
 	}
 	p.free = append(p.free, id)
+	p.freeDirty = true
 	return p.persistFreeListLocked()
 }
 
@@ -137,6 +140,9 @@ func (p *Pager) loadFreeList() error {
 }
 
 func (p *Pager) persistFreeListLocked() error {
+	if !p.freeDirty {
+		return nil
+	}
 	raw := make([]uint64, len(p.free))
 	for i, id := range p.free {
 		raw[i] = uint64(id)
@@ -149,7 +155,11 @@ func (p *Pager) persistFreeListLocked() error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, p.path+".free")
+	if err := os.Rename(tmp, p.path+".free"); err != nil {
+		return err
+	}
+	p.freeDirty = false
+	return nil
 }
 
 func (p *Pager) WriteBlob(data []byte) error {
