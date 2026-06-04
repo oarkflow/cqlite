@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	sqlite "github.com/sujit/sqlite"
 )
@@ -17,19 +18,24 @@ type response struct {
 	Database     string      `json:"database,omitempty"`
 	Objects      []tableInfo `json:"objects,omitempty"`
 	Tables       []tableInfo `json:"tables,omitempty"`
+	Results      []response  `json:"results,omitempty"`
 	Columns      []string    `json:"columns,omitempty"`
 	Rows         [][]any     `json:"rows,omitempty"`
 	RowsAffected int64       `json:"rowsAffected,omitempty"`
 	LastInsertID int64       `json:"lastInsertId,omitempty"`
 	SQL          string      `json:"sql,omitempty"`
+	DurationMS   int64       `json:"durationMs,omitempty"`
+	PreviewSQL   []string    `json:"previewSql,omitempty"`
 }
 
 type tableInfo struct {
-	Name    string       `json:"name"`
-	Type    string       `json:"type,omitempty"`
-	SQL     string       `json:"sql,omitempty"`
-	Columns []columnInfo `json:"columns,omitempty"`
-	Indexes []indexInfo  `json:"indexes,omitempty"`
+	Name        string           `json:"name"`
+	Type        string           `json:"type,omitempty"`
+	SQL         string           `json:"sql,omitempty"`
+	Columns     []columnInfo     `json:"columns,omitempty"`
+	Indexes     []indexInfo      `json:"indexes,omitempty"`
+	ForeignKeys []foreignKeyInfo `json:"foreignKeys,omitempty"`
+	Triggers    []triggerInfo    `json:"triggers,omitempty"`
 }
 
 type columnInfo struct {
@@ -47,12 +53,40 @@ type indexInfo struct {
 	SQL     string   `json:"sql,omitempty"`
 }
 
+type foreignKeyInfo struct {
+	ID       any    `json:"id,omitempty"`
+	Seq      any    `json:"seq,omitempty"`
+	Table    string `json:"table,omitempty"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
+	OnUpdate string `json:"onUpdate,omitempty"`
+	OnDelete string `json:"onDelete,omitempty"`
+	Match    string `json:"match,omitempty"`
+}
+
+type triggerInfo struct {
+	Name string `json:"name"`
+	SQL  string `json:"sql,omitempty"`
+}
+
+type statementPayload struct {
+	SQL        string   `json:"sql,omitempty"`
+	Statements []string `json:"statements,omitempty"`
+	PreviewSQL []string `json:"previewSql,omitempty"`
+	Table      string   `json:"table,omitempty"`
+	Limit      int      `json:"limit,omitempty"`
+	Offset     int      `json:"offset,omitempty"`
+	Sort       string   `json:"sort,omitempty"`
+	Where      string   `json:"where,omitempty"`
+}
+
 func main() {
-	var dbPath, sql, table string
+	var dbPath, sql, table, payload string
 	var limit int
 	flag.StringVar(&dbPath, "db", "", "database file or directory")
 	flag.StringVar(&sql, "sql", "", "SQL to execute")
 	flag.StringVar(&table, "table", "", "table name")
+	flag.StringVar(&payload, "payload", "", "JSON payload")
 	flag.IntVar(&limit, "limit", 200, "maximum rows to return")
 	flag.Parse()
 
@@ -78,20 +112,45 @@ func main() {
 
 	var res response
 	switch cmd {
-	case "schema":
+	case "schema", "schemaDetail":
 		res, err = schema(ctx, database, dbPath)
-	case "query":
+	case "query", "execute":
 		if strings.TrimSpace(sql) == "" {
 			err = fmt.Errorf("missing -sql")
 			break
 		}
 		res, err = runSQL(ctx, database, dbPath, sql, limit)
+	case "executeBatch":
+		stmts := splitStatements(sql)
+		if len(stmts) == 0 && payload != "" {
+			var req statementPayload
+			if decErr := json.Unmarshal([]byte(payload), &req); decErr != nil {
+				err = decErr
+				break
+			}
+			stmts = req.statements()
+		}
+		if len(stmts) == 0 {
+			err = fmt.Errorf("missing statements")
+			break
+		}
+		res, err = runBatch(ctx, database, dbPath, stmts, limit)
+	case "browseRows":
+		res, err = browseRows(ctx, database, dbPath, table, payload, limit)
 	case "table":
 		if table == "" {
 			err = fmt.Errorf("missing -table")
 			break
 		}
 		res, err = runSQL(ctx, database, dbPath, "SELECT * FROM "+quoteIdent(table)+" LIMIT "+fmt.Sprint(limit), limit)
+	case "applyDataEdits", "applySchemaChange":
+		res, err = applyStatements(ctx, database, dbPath, payload)
+	case "explain":
+		if strings.TrimSpace(sql) == "" {
+			err = fmt.Errorf("missing -sql")
+			break
+		}
+		res, err = runSQL(ctx, database, dbPath, "EXPLAIN QUERY PLAN "+strings.TrimSpace(strings.TrimSuffix(sql, ";")), limit)
 	default:
 		err = fmt.Errorf("unknown command: %s", cmd)
 	}
@@ -127,6 +186,8 @@ func schema(ctx context.Context, database *sqlite.DB, dbPath string) (response, 
 			info.SQL = fmt.Sprint(row[2])
 		}
 		info.Columns, _ = tableColumns(ctx, database, name)
+		info.ForeignKeys, _ = tableForeignKeys(ctx, database, name)
+		info.Triggers, _ = tableTriggers(ctx, database, name)
 		if kind == "table" {
 			info.Indexes, _ = tableIndexes(ctx, database, name)
 			tables = append(tables, info)
@@ -134,6 +195,70 @@ func schema(ctx context.Context, database *sqlite.DB, dbPath string) (response, 
 		objects = append(objects, info)
 	}
 	return response{OK: true, Database: dbPath, Objects: objects, Tables: tables}, nil
+}
+
+func tableForeignKeys(ctx context.Context, database *sqlite.DB, table string) ([]foreignKeyInfo, error) {
+	rows, err := database.Query(ctx, `PRAGMA foreign_key_list(`+quoteIdent(table)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	var keys []foreignKeyInfo
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			break
+		}
+		fk := foreignKeyInfo{}
+		if len(row) > 0 {
+			fk.ID = row[0]
+		}
+		if len(row) > 1 {
+			fk.Seq = row[1]
+		}
+		if len(row) > 2 {
+			fk.Table = fmt.Sprint(row[2])
+		}
+		if len(row) > 3 {
+			fk.From = fmt.Sprint(row[3])
+		}
+		if len(row) > 4 {
+			fk.To = fmt.Sprint(row[4])
+		}
+		if len(row) > 5 {
+			fk.OnUpdate = fmt.Sprint(row[5])
+		}
+		if len(row) > 6 {
+			fk.OnDelete = fmt.Sprint(row[6])
+		}
+		if len(row) > 7 {
+			fk.Match = fmt.Sprint(row[7])
+		}
+		keys = append(keys, fk)
+	}
+	return keys, nil
+}
+
+func tableTriggers(ctx context.Context, database *sqlite.DB, table string) ([]triggerInfo, error) {
+	rows, err := database.Query(ctx, `SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = `+sqlString(table)+` ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	var triggers []triggerInfo
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			break
+		}
+		tr := triggerInfo{}
+		if len(row) > 0 {
+			tr.Name = fmt.Sprint(row[0])
+		}
+		if len(row) > 1 && row[1] != nil {
+			tr.SQL = fmt.Sprint(row[1])
+		}
+		triggers = append(triggers, tr)
+	}
+	return triggers, nil
 }
 
 func tableColumns(ctx context.Context, database *sqlite.DB, table string) ([]columnInfo, error) {
@@ -211,6 +336,7 @@ func indexColumns(ctx context.Context, database *sqlite.DB, index string) ([]str
 }
 
 func runSQL(ctx context.Context, database *sqlite.DB, dbPath, sql string, limit int) (response, error) {
+	started := time.Now()
 	if queryLike(sql) {
 		rows, err := database.Query(ctx, sql)
 		if err != nil {
@@ -224,13 +350,144 @@ func runSQL(ctx context.Context, database *sqlite.DB, dbPath, sql string, limit 
 			}
 			out.Rows = append(out.Rows, normalizeRow(row))
 		}
+		out.DurationMS = time.Since(started).Milliseconds()
 		return out, nil
 	}
 	result, err := database.Exec(ctx, sql)
 	if err != nil {
 		return response{}, err
 	}
-	return response{OK: true, Database: dbPath, SQL: sql, RowsAffected: result.RowsAffected, LastInsertID: result.LastInsertID}, nil
+	return response{OK: true, Database: dbPath, SQL: sql, RowsAffected: result.RowsAffected, LastInsertID: result.LastInsertID, DurationMS: time.Since(started).Milliseconds()}, nil
+}
+
+func runBatch(ctx context.Context, database *sqlite.DB, dbPath string, stmts []string, limit int) (response, error) {
+	started := time.Now()
+	out := response{OK: true, Database: dbPath}
+	for _, stmt := range stmts {
+		res, err := runSQL(ctx, database, dbPath, stmt, limit)
+		if err != nil {
+			res = response{OK: false, Database: dbPath, SQL: stmt, Error: err.Error()}
+		}
+		out.Results = append(out.Results, res)
+	}
+	out.DurationMS = time.Since(started).Milliseconds()
+	return out, nil
+}
+
+func browseRows(ctx context.Context, database *sqlite.DB, dbPath, table, payload string, limit int) (response, error) {
+	var req statementPayload
+	if payload != "" {
+		if err := json.Unmarshal([]byte(payload), &req); err != nil {
+			return response{}, err
+		}
+	}
+	if table == "" {
+		table = req.Table
+	}
+	if table == "" {
+		return response{}, fmt.Errorf("missing -table")
+	}
+	if req.Limit > 0 {
+		limit = req.Limit
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	var q strings.Builder
+	q.WriteString("SELECT * FROM ")
+	q.WriteString(quoteIdent(table))
+	if strings.TrimSpace(req.Where) != "" {
+		q.WriteString(" WHERE ")
+		q.WriteString(req.Where)
+	}
+	if strings.TrimSpace(req.Sort) != "" {
+		q.WriteString(" ORDER BY ")
+		q.WriteString(req.Sort)
+	}
+	q.WriteString(" LIMIT ")
+	q.WriteString(fmt.Sprint(limit))
+	if req.Offset > 0 {
+		q.WriteString(" OFFSET ")
+		q.WriteString(fmt.Sprint(req.Offset))
+	}
+	return runSQL(ctx, database, dbPath, q.String(), limit)
+}
+
+func applyStatements(ctx context.Context, database *sqlite.DB, dbPath, payload string) (response, error) {
+	started := time.Now()
+	var req statementPayload
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		return response{}, err
+	}
+	stmts := req.statements()
+	if len(stmts) == 0 {
+		return response{}, fmt.Errorf("missing statements")
+	}
+	tx, err := database.Begin(ctx, sqlite.TxOptions{})
+	if err != nil {
+		return response{}, err
+	}
+	var out response
+	out = response{OK: true, Database: dbPath, PreviewSQL: req.PreviewSQL}
+	for _, stmt := range stmts {
+		started := time.Now()
+		result, err := tx.Exec(ctx, stmt)
+		if err != nil {
+			_ = tx.Rollback()
+			return response{}, err
+		}
+		out.Results = append(out.Results, response{OK: true, Database: dbPath, SQL: stmt, RowsAffected: result.RowsAffected, LastInsertID: result.LastInsertID, DurationMS: time.Since(started).Milliseconds()})
+		out.RowsAffected += result.RowsAffected
+		out.LastInsertID = result.LastInsertID
+	}
+	if err := tx.Commit(); err != nil {
+		return response{}, err
+	}
+	out.DurationMS = time.Since(started).Milliseconds()
+	return out, nil
+}
+
+func (p statementPayload) statements() []string {
+	var stmts []string
+	if strings.TrimSpace(p.SQL) != "" {
+		stmts = append(stmts, splitStatements(p.SQL)...)
+	}
+	for _, stmt := range p.Statements {
+		if strings.TrimSpace(stmt) != "" {
+			stmts = append(stmts, stmt)
+		}
+	}
+	return stmts
+}
+
+func splitStatements(sql string) []string {
+	var stmts []string
+	var b strings.Builder
+	var quote rune
+	for _, r := range sql {
+		b.WriteRune(r)
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r == ';' {
+			stmt := strings.TrimSpace(b.String())
+			if stmt != "" {
+				stmts = append(stmts, stmt)
+			}
+			b.Reset()
+		}
+	}
+	if stmt := strings.TrimSpace(b.String()); stmt != "" {
+		stmts = append(stmts, stmt)
+	}
+	return stmts
 }
 
 func queryLike(sql string) bool {
@@ -265,6 +522,10 @@ func normalizeRow(row []any) []any {
 
 func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+func sqlString(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `''`) + `'`
 }
 
 func truthy(v any) bool {

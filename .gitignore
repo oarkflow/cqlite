@@ -1,4 +1,5 @@
 .gocache/
+bin/
 data/
 sqlite-cli
 sqlited

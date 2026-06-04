@@ -3,6 +3,8 @@ const cp = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+let extensionContext;
+
 class SqliteExplorer {
   constructor() {
     this.emitter = new vscode.EventEmitter();
@@ -94,7 +96,7 @@ async function renderDatabasePanel(explorer, webviewPanel, dbPath, preferredObje
   const objects = schemaObjects(schema);
   const selected = objects.some(obj => obj.name === preferredObject) ? preferredObject : (objects[0] ? objects[0].name : '');
   const preview = selected ? await loadObjectRows(dbPath, selected).catch(err => ({ error: err.message })) : null;
-  webviewPanel.webview.html = databaseHtml(dbPath, schema, selected, preview);
+  webviewPanel.webview.html = databaseHtml(dbPath, schema, selected, preview, queryLogs(dbPath));
   webviewPanel.webview.onDidReceiveMessage(async message => handleDatabaseMessage(explorer, webviewPanel, dbPath, message));
 }
 
@@ -104,15 +106,34 @@ async function handleDatabaseMessage(explorer, webviewPanel, dbPath, message) {
     const nextObjects = schemaObjects(nextSchema);
     const nextSelected = nextObjects.some(obj => obj.name === message.selected) ? message.selected : (nextObjects[0] ? nextObjects[0].name : '');
     const nextPreview = nextSelected ? await loadObjectRows(dbPath, nextSelected).catch(err => ({ error: err.message })) : null;
-    webviewPanel.webview.html = databaseHtml(dbPath, nextSchema, nextSelected, nextPreview);
+    webviewPanel.webview.html = databaseHtml(dbPath, nextSchema, nextSelected, nextPreview, queryLogs(dbPath));
   }
   if (message.type === 'select' && message.name) {
     const nextPreview = await loadObjectRows(dbPath, message.name).catch(err => ({ error: err.message }));
     webviewPanel.webview.postMessage({ type: 'preview', name: message.name, sql: defaultObjectSQL(message.name), preview: nextPreview });
   }
   if (message.type === 'runSql') {
-    const nextPreview = await runSQLForDatabase(dbPath, message.sql).catch(err => ({ error: err.message, sql: message.sql }));
+    const nextPreview = await runSQLForDatabase(dbPath, message.sql, message.source || 'query').catch(async err => {
+      const failed = { error: err.message, sql: message.sql };
+      await appendQueryLog(dbPath, failed, message.source || 'query');
+      return failed;
+    });
     webviewPanel.webview.postMessage({ type: 'preview', name: message.name || '', preview: nextPreview });
+  }
+  if (message.type === 'applyStatements') {
+    const applied = await applyStatements(dbPath, message.command || 'applyDataEdits', message.statements || [], message.previewSql || [], message.source || 'manage').catch(async err => {
+      const failed = { error: err.message, sql: (message.statements || []).join('\n') };
+      await appendQueryLog(dbPath, failed, message.source || 'manage');
+      return failed;
+    });
+    webviewPanel.webview.postMessage({ type: 'applied', preview: applied, logs: queryLogs(dbPath) });
+  }
+  if (message.type === 'logs') {
+    webviewPanel.webview.postMessage({ type: 'logs', logs: queryLogs(dbPath) });
+  }
+  if (message.type === 'clearLogs') {
+    await clearQueryLogs(dbPath);
+    webviewPanel.webview.postMessage({ type: 'logs', logs: [] });
   }
   if (message.type === 'query') {
     await openSQLEditorPanel(dbPath, message.sql || defaultQuerySQL(), message.name || 'SQL Editor');
@@ -132,6 +153,7 @@ async function openDatabaseObjectPanel(explorer, dbPath, objectName) {
 }
 
 function activate(context) {
+  extensionContext = context;
   const explorer = new SqliteExplorer();
   const dbEditorProvider = new DatabaseEditorProvider(explorer);
   vscode.window.registerTreeDataProvider('sujitSqliteExplorer', explorer);
@@ -223,7 +245,11 @@ async function openSQLEditorPanel(dbPath, initialSQL, title) {
     if (message.type !== 'runSql') {
       return;
     }
-    const nextPreview = await runSQLForDatabase(dbPath, message.sql).catch(err => ({ error: err.message, sql: message.sql }));
+    const nextPreview = await runSQLForDatabase(dbPath, message.sql, 'sql-editor').catch(async err => {
+      const failed = { error: err.message, sql: message.sql };
+      await appendQueryLog(dbPath, failed, 'sql-editor');
+      return failed;
+    });
     panel.webview.postMessage({ type: 'preview', preview: nextPreview });
   });
 }
@@ -245,14 +271,30 @@ async function showObject(name) {
 }
 
 async function loadObjectRows(db, name) {
-  return runSQLForDatabase(db, defaultObjectSQL(name));
+  const limit = config().get('resultLimit', 200);
+  const result = await bridge(['browseRows', '-table', name, '-limit', String(limit)], { db });
+  result.latencyMs = typeof result.durationMs === 'number' ? result.durationMs : 0;
+  return result;
 }
 
-async function runSQLForDatabase(db, sql) {
+async function runSQLForDatabase(db, sql, source = '') {
   const limit = config().get('resultLimit', 200);
   const started = Date.now();
-  const result = await bridge(['query', '-sql', sql, '-limit', String(limit)], { db });
-  result.latencyMs = Date.now() - started;
+  const result = await bridge(['execute', '-sql', sql, '-limit', String(limit)], { db });
+  result.latencyMs = typeof result.durationMs === 'number' ? result.durationMs : 0;
+  if (source) {
+    await appendQueryLog(db, result, source);
+  }
+  return result;
+}
+
+async function applyStatements(db, command, statements, previewSql, source) {
+  const started = Date.now();
+  const payload = JSON.stringify({ statements, previewSql });
+  const result = await bridge([command, '-payload', payload], { db });
+  result.sql = statements.join('\n');
+  result.latencyMs = typeof result.durationMs === 'number' ? result.durationMs : Date.now() - started;
+  await appendQueryLog(db, result, source);
   return result;
 }
 
@@ -293,7 +335,7 @@ function showResultPanel(title, result) {
   `);
 }
 
-function databaseHtml(dbPath, schema, selected, preview) {
+function databaseHtml(dbPath, schema, selected, preview, logs = []) {
   const objects = schemaObjects(schema);
   const options = objects.map(obj => `<button type="button" data-name="${escAttr(obj.name)}"><span>${esc(obj.name)}</span><small>${esc(obj.type || 'table')}</small></button>`).join('');
   const empty = objects.length === 0 ? '<p class="empty">No tables or views found.</p>' : '';
@@ -301,6 +343,8 @@ function databaseHtml(dbPath, schema, selected, preview) {
   const initialSQL = selected ? defaultObjectSQL(selected) : '';
   const initialPreview = jsJSON(preview || null);
   const objectNames = jsJSON(objects.map(obj => obj.name));
+  const schemaJSON = jsJSON({ objects });
+  const logsJSON = jsJSON(logs);
   return page('Database', `
     <section class="app">
       <header class="topbar">
@@ -316,28 +360,73 @@ function databaseHtml(dbPath, schema, selected, preview) {
           <button id="open" class="icon-button" title="Open selected object in a new tab" aria-label="Open selected object in a new tab">↗</button>
         </div>
       </header>
-      ${empty}
-      <section class="sql-editor">
-        <div class="editor-shell">
-          <textarea id="sql" spellcheck="false">${esc(initialSQL)}</textarea>
-          <div class="editor-buttons">
-            <button id="execute" class="icon-button" title="Execute SQL" aria-label="Execute SQL">▶</button>
-            <button id="query" class="icon-button" title="Open SQL in a separate editor" aria-label="Open SQL in a separate editor">↗</button>
-          </div>
-        </div>
+      <nav class="main-tabs">
+        <button data-main-tab="structure">Structure</button>
+        <button data-main-tab="data" class="active">Data</button>
+        <button data-main-tab="query">Query</button>
+        <button data-main-tab="logs">Logs</button>
+        <button data-main-tab="manage">Design/Manage</button>
+      </nav>
+      <section id="tab-structure" class="main-tab" hidden>
+        <div id="structureView"></div>
       </section>
-      <main class="preview">
-        <nav id="resultTabs" class="result-tabs"></nav>
+      <section id="tab-data" class="main-tab">
+        ${empty}
+        <div class="data-actions">
+          <button id="addRow" title="Add staged row">Add Row</button>
+          <button id="deleteRows" title="Stage selected rows for delete">Delete Selected</button>
+          <button id="saveEdits" title="Preview and save staged data edits">Save</button>
+          <button id="revertEdits" title="Revert staged edits">Revert</button>
+        </div>
         <section class="resultbar">
-          <div id="response" class="summary"></div>
-          <div class="actions export-actions">
-            <button id="exportCsv" title="Export rows as CSV" aria-label="Export rows as CSV">CSV</button>
-            <button id="exportJson" title="Export rows as JSON" aria-label="Export rows as JSON">JSON</button>
-            <button id="exportSql" title="Export rows as SQL INSERT statements" aria-label="Export rows as SQL INSERT statements">SQL</button>
+          <div id="dataSummary" class="summary"></div>
+          <div class="actions export-actions data-export-actions">
+            <button id="dataExportCsv" title="Export rows as CSV" aria-label="Export rows as CSV">CSV</button>
+            <button id="dataExportJson" title="Export rows as JSON" aria-label="Export rows as JSON">JSON</button>
+            <button id="dataExportSql" title="Export rows as SQL INSERT statements" aria-label="Export rows as SQL INSERT statements">SQL</button>
           </div>
         </section>
-        <div id="result"></div>
-      </main>
+        <div id="dataResult"></div>
+      </section>
+      <section id="tab-query" class="main-tab" hidden>
+        <section class="sql-editor">
+          <div class="editor-shell">
+            <textarea id="sql" spellcheck="false">${esc(initialSQL)}</textarea>
+            <div class="editor-buttons">
+              <button id="execute" class="icon-button" title="Execute SQL" aria-label="Execute SQL">▶</button>
+              <button id="query" class="icon-button" title="Open SQL in a separate editor" aria-label="Open SQL in a separate editor">↗</button>
+            </div>
+          </div>
+        </section>
+        <main class="preview">
+          <nav id="resultTabs" class="result-tabs"></nav>
+          <section class="resultbar">
+            <div id="response" class="summary"></div>
+            <div class="actions export-actions">
+              <button id="exportCsv" title="Export rows as CSV" aria-label="Export rows as CSV">CSV</button>
+              <button id="exportJson" title="Export rows as JSON" aria-label="Export rows as JSON">JSON</button>
+              <button id="exportSql" title="Export rows as SQL INSERT statements" aria-label="Export rows as SQL INSERT statements">SQL</button>
+            </div>
+          </section>
+          <div id="result"></div>
+        </main>
+      </section>
+      <section id="tab-logs" class="main-tab" hidden>
+        <div class="data-actions">
+          <input id="logFilter" type="search" placeholder="Search logs" />
+          <button id="clearLogs">Clear Logs</button>
+          <button id="exportLogs">Export Logs</button>
+        </div>
+        <div id="logsView"></div>
+      </section>
+      <section id="tab-manage" class="main-tab manage-tab" hidden>
+        <label>SQL Preview<textarea id="manageSql" spellcheck="false" placeholder="CREATE INDEX ...; DROP TABLE ...;"></textarea></label>
+        <div class="data-actions">
+          <button id="previewCreateIndex">Create Index Template</button>
+          <button id="previewDropObject">Drop Selected Object Template</button>
+          <button id="applySchema">Apply Schema SQL</button>
+        </div>
+      </section>
     </section>
     <script>
       const vscode = acquireVsCodeApi();
@@ -348,12 +437,22 @@ function databaseHtml(dbPath, schema, selected, preview) {
       const resultTabs = document.getElementById('resultTabs');
       const response = document.getElementById('response');
       const result = document.getElementById('result');
+      const dataSummary = document.getElementById('dataSummary');
+      const dataResult = document.getElementById('dataResult');
       const exportActions = document.querySelector('.export-actions');
+      const dataExportActions = document.querySelector('.data-export-actions');
+      const structureView = document.getElementById('structureView');
+      const logsView = document.getElementById('logsView');
+      const logFilter = document.getElementById('logFilter');
+      const manageSql = document.getElementById('manageSql');
       const objectNames = ${objectNames};
+      const schemaState = ${schemaJSON};
+      let logsState = ${logsJSON};
       let currentResult = ${initialPreview};
       let results = [];
       let activeResult = -1;
       let currentObject = object ? object.value : '';
+      let pendingEdits = [];
       document.getElementById('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh', selected: object ? object.value : '' }));
       document.getElementById('query').addEventListener('click', () => vscode.postMessage({ type: 'query', name: currentObject, sql: sql.value }));
       document.getElementById('open').addEventListener('click', () => object && vscode.postMessage({ type: 'open', name: object.value }));
@@ -361,6 +460,27 @@ function databaseHtml(dbPath, schema, selected, preview) {
       document.getElementById('exportCsv').addEventListener('click', () => exportRows('csv'));
       document.getElementById('exportJson').addEventListener('click', () => exportRows('json'));
       document.getElementById('exportSql').addEventListener('click', () => exportRows('sql'));
+      document.getElementById('dataExportCsv').addEventListener('click', () => exportRows('csv'));
+      document.getElementById('dataExportJson').addEventListener('click', () => exportRows('json'));
+      document.getElementById('dataExportSql').addEventListener('click', () => exportRows('sql'));
+      document.getElementById('addRow').addEventListener('click', addRow);
+      document.getElementById('deleteRows').addEventListener('click', deleteSelectedRows);
+      document.getElementById('saveEdits').addEventListener('click', saveEdits);
+      document.getElementById('revertEdits').addEventListener('click', () => { pendingEdits = []; renderData(currentResult); });
+      document.getElementById('clearLogs').addEventListener('click', () => vscode.postMessage({ type: 'clearLogs' }));
+      document.getElementById('exportLogs').addEventListener('click', () => download('query-logs.json', JSON.stringify(logsState, null, 2), 'application/json'));
+      document.getElementById('previewCreateIndex').addEventListener('click', () => {
+        manageSql.value = 'CREATE INDEX ' + quoteIdent('idx_' + currentObject + '_column') + ' ON ' + quoteIdent(currentObject) + ' (' + quoteIdent('column_name') + ');';
+      });
+      document.getElementById('previewDropObject').addEventListener('click', () => {
+        const obj = currentSchemaObject();
+        manageSql.value = 'DROP ' + ((obj && obj.type === 'view') ? 'VIEW' : 'TABLE') + ' ' + quoteIdent(currentObject) + ';';
+      });
+      document.getElementById('applySchema').addEventListener('click', () => applySchemaSql());
+      logFilter.addEventListener('input', renderLogs);
+      for (const tab of document.querySelectorAll('[data-main-tab]')) {
+        tab.addEventListener('click', () => activateMainTab(tab.dataset.mainTab));
+      }
       if (object) {
         object.addEventListener('focus', filterObjects);
         object.addEventListener('input', filterObjects);
@@ -387,6 +507,7 @@ function databaseHtml(dbPath, schema, selected, preview) {
         hideObjectOptions();
         currentObject = name;
         sql.value = defaultSelect(name);
+        renderStructure();
         showLoading();
         vscode.postMessage({ type: 'select', name });
       }
@@ -421,7 +542,21 @@ function databaseHtml(dbPath, schema, selected, preview) {
         if (message.type !== 'preview') return;
         if (message.name) currentObject = message.name;
         if (message.sql) sql.value = message.sql;
+        renderStructure();
         upsertResult(message.preview || null);
+      });
+      window.addEventListener('message', event => {
+        const message = event.data;
+        if (message.type === 'logs') {
+          logsState = message.logs || [];
+          renderLogs();
+        }
+        if (message.type === 'applied') {
+          pendingEdits = [];
+          if (message.logs) logsState = message.logs;
+          upsertResult(message.preview || null);
+          renderLogs();
+        }
       });
       resultTabs.addEventListener('click', event => {
         const close = event.target.closest('button[data-close]');
@@ -441,14 +576,38 @@ function databaseHtml(dbPath, schema, selected, preview) {
       } else {
         renderResult(currentResult);
       }
-      function runSql() {
-        showLoading();
-        vscode.postMessage({ type: 'runSql', name: currentObject, sql: sql.value });
+      renderStructure();
+      renderLogs();
+      renderData(currentResult);
+      activateMainTab('data');
+      vscode.postMessage({ type: 'logs' });
+      function activateMainTab(name) {
+        for (const button of document.querySelectorAll('[data-main-tab]')) {
+          button.classList.toggle('active', button.dataset.mainTab === name);
+        }
+        for (const panel of document.querySelectorAll('.main-tab')) {
+          panel.hidden = panel.id !== 'tab-' + name;
+        }
       }
-      function showLoading() {
-        response.textContent = 'Running...';
+      function runSql() {
+        const statements = selectedStatements();
+        if (statements.length === 0) return;
+        showLoading(statements.length);
+        for (const statement of statements) {
+          vscode.postMessage({ type: 'runSql', name: currentObject, sql: statement, source: 'query' });
+        }
+      }
+      function showLoading(count = 1) {
+        response.textContent = count === 1 ? 'Running...' : 'Running ' + count + ' queries...';
         result.innerHTML = '<p class="empty">Loading...</p>';
         updateExportButtons(null);
+      }
+      function selectedStatements() {
+        const start = sql.selectionStart;
+        const end = sql.selectionEnd;
+        const selected = start !== end ? sql.value.slice(start, end).trim() : '';
+        if (selected) return [selected];
+        return splitStatements(sql.value);
       }
       function renderResult(data) {
         if (data && data.error) {
@@ -459,7 +618,113 @@ function databaseHtml(dbPath, schema, selected, preview) {
         }
         response.textContent = resultSummary(data);
         result.innerHTML = renderTable(data);
+        renderData(data);
         updateExportButtons(data);
+      }
+      function renderData(data) {
+        dataSummary.textContent = resultSummary(data) + (pendingEdits.length ? ' · ' + pendingEdits.length + ' staged changes' : '');
+        dataResult.innerHTML = renderEditableTable(data);
+        updateDataExportButtons(data);
+      }
+      function renderEditableTable(data) {
+        if (!data || !data.columns || data.columns.length === 0) return '';
+        const header = '<th></th>' + data.columns.map(col => '<th>' + escapeHtml(col) + '</th>').join('');
+        const body = (data.rows || []).map((row, rowIndex) => '<tr><td><input type="checkbox" data-row-select="' + rowIndex + '"></td>' + row.map((value, colIndex) => '<td contenteditable="true" data-row="' + rowIndex + '" data-col="' + colIndex + '">' + escapeHtml(formatValue(value)) + '</td>').join('') + '</tr>').join('');
+        setTimeout(bindEditableCells, 0);
+        return '<div class="table-wrap"><table><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+      }
+      function bindEditableCells() {
+        for (const cell of dataResult.querySelectorAll('[contenteditable][data-row]')) {
+          cell.addEventListener('input', () => stageCellEdit(Number(cell.dataset.row), Number(cell.dataset.col), cell.textContent));
+        }
+      }
+      function stageCellEdit(rowIndex, colIndex, value) {
+        if (!currentResult || !currentResult.columns || !currentResult.rows) return;
+        const keyCol = primaryKeyColumn();
+        const keyIndex = currentResult.columns.indexOf(keyCol);
+        if (keyIndex < 0) return;
+        const col = currentResult.columns[colIndex];
+        const keyValue = currentResult.rows[rowIndex][keyIndex];
+        const sqlText = 'UPDATE ' + quoteIdent(currentObject) + ' SET ' + quoteIdent(col) + ' = ' + sqlLiteral(value === 'NULL' ? null : value) + ' WHERE ' + quoteIdent(keyCol) + ' = ' + sqlLiteral(keyValue) + ';';
+        upsertPending('update:' + keyValue + ':' + col, sqlText);
+      }
+      function addRow() {
+        if (!currentResult || !currentResult.columns) return;
+        const cols = currentResult.columns;
+        const values = cols.map(() => null);
+        const sqlText = 'INSERT INTO ' + quoteIdent(currentObject) + ' (' + cols.map(quoteIdent).join(', ') + ') VALUES (' + values.map(sqlLiteral).join(', ') + ');';
+        upsertPending('insert:' + Date.now(), sqlText);
+        renderData(currentResult);
+      }
+      function deleteSelectedRows() {
+        if (!currentResult || !currentResult.columns || !currentResult.rows) return;
+        const keyCol = primaryKeyColumn();
+        const keyIndex = currentResult.columns.indexOf(keyCol);
+        for (const box of dataResult.querySelectorAll('[data-row-select]:checked')) {
+          const row = currentResult.rows[Number(box.dataset.rowSelect)];
+          const keyValue = row[keyIndex];
+          upsertPending('delete:' + keyValue, 'DELETE FROM ' + quoteIdent(currentObject) + ' WHERE ' + quoteIdent(keyCol) + ' = ' + sqlLiteral(keyValue) + ';');
+        }
+        renderData(currentResult);
+      }
+      function saveEdits() {
+        if (pendingEdits.length === 0) return;
+        const statements = pendingEdits.map(edit => edit.sql);
+        if (!confirm('Apply ' + statements.length + ' staged data changes?\\n\\n' + statements.join('\\n'))) return;
+        vscode.postMessage({ type: 'applyStatements', command: 'applyDataEdits', source: 'data', statements, previewSql: statements });
+      }
+      function upsertPending(key, sqlText) {
+        const existing = pendingEdits.find(edit => edit.key === key);
+        if (existing) existing.sql = sqlText;
+        else pendingEdits.push({ key, sql: sqlText });
+        renderData(currentResult);
+      }
+      function primaryKeyColumn() {
+        const obj = currentSchemaObject();
+        const pk = obj && obj.columns ? obj.columns.find(col => col.primaryKey) : null;
+        return pk ? pk.name : (currentResult && currentResult.columns ? currentResult.columns[0] : '');
+      }
+      function currentSchemaObject() {
+        return (schemaState.objects || []).find(obj => obj.name === currentObject);
+      }
+      function applySchemaSql() {
+        const statements = splitStatements(manageSql.value);
+        if (statements.length === 0) return;
+        if (!confirm('Apply schema SQL?\\n\\n' + statements.join('\\n'))) return;
+        vscode.postMessage({ type: 'applyStatements', command: 'applySchemaChange', source: 'schema', statements, previewSql: statements });
+      }
+      function splitStatements(text) {
+        const statements = [];
+        let current = '';
+        let quote = '';
+        for (let index = 0; index < text.length; index += 1) {
+          const char = text[index];
+          const next = text[index + 1];
+          current += char;
+          if (quote) {
+            if (char === quote) {
+              if (next === quote) {
+                current += next;
+                index += 1;
+              } else {
+                quote = '';
+              }
+            }
+            continue;
+          }
+          if (char === "'" || char === '"') {
+            quote = char;
+            continue;
+          }
+          if (char === ';') {
+            const statement = current.trim();
+            if (statement) statements.push(statement);
+            current = '';
+          }
+        }
+        const tail = current.trim();
+        if (tail) statements.push(tail);
+        return statements;
       }
       function upsertResult(data) {
         const key = resultKey(data);
@@ -506,6 +771,39 @@ function databaseHtml(dbPath, schema, selected, preview) {
         const hasRows = !!(data && data.rows && data.rows.length > 0);
         exportActions.hidden = !hasRows;
         exportActions.style.display = hasRows ? 'flex' : 'none';
+      }
+      function updateDataExportButtons(data) {
+        const hasRows = !!(data && data.rows && data.rows.length > 0);
+        dataExportActions.hidden = !hasRows;
+        dataExportActions.style.display = hasRows ? 'flex' : 'none';
+      }
+      function renderStructure() {
+        const obj = currentSchemaObject();
+        structureView.innerHTML = obj ? '<section class="object-card"><h3>' + escapeHtml(obj.type || 'table') + ': ' + escapeHtml(obj.name) + '</h3><pre>' + escapeHtml(obj.sql || '') + '</pre>' + structureTable(obj) + indexList(obj) + fkList(obj) + triggerList(obj) + '</section>' : '<p class="empty">No object selected.</p>';
+      }
+      function structureTable(obj) {
+        const rows = (obj.columns || []).map(col => '<tr><td>' + escapeHtml(col.name) + '</td><td>' + escapeHtml(col.type || '') + '</td><td>' + (col.primaryKey ? 'PK' : '') + '</td><td>' + (col.notNull ? 'NOT NULL' : '') + '</td><td>' + escapeHtml(col.default ?? '') + '</td></tr>').join('');
+        return '<div class="table-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Key</th><th>Null</th><th>Default</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+      }
+      function indexList(obj) {
+        if (!obj.indexes || obj.indexes.length === 0) return '';
+        return '<h4>Indexes</h4><ul>' + obj.indexes.map(idx => '<li>' + escapeHtml(idx.name) + ' (' + escapeHtml((idx.columns || []).join(', ')) + ')' + (idx.unique ? ' unique' : '') + '</li>').join('') + '</ul>';
+      }
+      function fkList(obj) {
+        if (!obj.foreignKeys || obj.foreignKeys.length === 0) return '';
+        return '<h4>Foreign Keys</h4><ul>' + obj.foreignKeys.map(fk => '<li>' + escapeHtml(fk.from || '') + ' → ' + escapeHtml(fk.table || '') + '.' + escapeHtml(fk.to || '') + '</li>').join('') + '</ul>';
+      }
+      function triggerList(obj) {
+        if (!obj.triggers || obj.triggers.length === 0) return '';
+        return '<h4>Triggers</h4><ul>' + obj.triggers.map(tr => '<li>' + escapeHtml(tr.name) + '</li>').join('') + '</ul>';
+      }
+      function renderLogs() {
+        const needle = logFilter.value.trim().toLowerCase();
+        const rows = logsState.filter(log => !needle || (log.sql || '').toLowerCase().includes(needle) || (log.source || '').toLowerCase().includes(needle)).map(log => '<tr><td>' + escapeHtml(log.timestamp || '') + '</td><td>' + escapeHtml(log.source || '') + '</td><td>' + escapeHtml(log.status || '') + '</td><td>' + escapeHtml(String(log.durationMs || 0)) + ' ms</td><td><button data-rerun="' + escapeAttr(log.sql || '') + '">▶</button></td><td><code>' + escapeHtml(log.sql || '') + '</code></td></tr>').join('');
+        logsView.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Time</th><th>Source</th><th>Status</th><th>Latency</th><th></th><th>SQL</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+        for (const button of logsView.querySelectorAll('[data-rerun]')) {
+          button.addEventListener('click', () => { sql.value = button.dataset.rerun; activateMainTab('query'); runSql(); });
+        }
       }
       function renderTable(result) {
         if (!result || !result.columns || result.columns.length === 0) return '';
@@ -579,6 +877,9 @@ function databaseHtml(dbPath, schema, selected, preview) {
       }
       function escapeHtml(value) {
         return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+      function escapeAttr(value) {
+        return escapeHtml(value).replace(/'/g, '&#39;');
       }
     </script>
   `);
@@ -863,9 +1164,9 @@ function page(title, body) {
     <style>
       body { color: var(--vscode-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); margin: 0; }
       .app { min-height: 100vh; }
-      .topbar { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: minmax(360px, 1fr) auto; gap: 12px; align-items: end; padding: 12px; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+      .topbar { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: minmax(360px, 1fr) auto; gap: 12px; align-items: center; padding: 12px; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
       .sql-topbar { grid-template-columns: 1fr; }
-      .object-select { display: grid; gap: 4px; }
+      .object-select { display: grid; grid-template-columns: auto minmax(220px, 1fr); gap: 8px; align-items: center; }
       .object-select span { color: var(--vscode-descriptionForeground); font-size: 12px; }
       .combo { position: relative; }
       .combo input { width: 100%; box-sizing: border-box; }
@@ -875,6 +1176,17 @@ function page(title, body) {
       .combo-list button:hover, .combo-list button:focus { background: var(--vscode-list-hoverBackground); outline: none; }
       .combo-list small { color: var(--vscode-descriptionForeground); }
       .actions, .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .main-tabs { position: sticky; top: 57px; z-index: 2; display: flex; gap: 2px; overflow-x: auto; padding: 0 12px; border-bottom: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background); }
+      .main-tabs button { flex: 0 0 auto; border: 0; border-radius: 0; color: var(--vscode-descriptionForeground); background: transparent; padding: 10px 12px; border-bottom: 2px solid transparent; }
+      .main-tabs button.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+      .main-tab { padding: 12px; }
+      .data-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+      .data-actions input { min-width: 220px; }
+      .object-card { padding: 12px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+      .object-card h3, .object-card h4 { margin: 0 0 8px; }
+      .object-card ul { margin: 0 0 10px; padding-left: 18px; }
+      .manage-tab label { display: grid; gap: 6px; color: var(--vscode-descriptionForeground); }
+      .manage-tab textarea { height: 180px; padding-right: 8px; }
       button, input, select, textarea { font: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); border-radius: 4px; padding: 6px 8px; }
       button { cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-color: var(--vscode-button-border); }
       .icon-button { width: 32px; height: 32px; display: inline-grid; place-items: center; padding: 0; font-size: 15px; line-height: 1; }
@@ -899,10 +1211,12 @@ function page(title, body) {
       th, td { border-bottom: 1px solid var(--vscode-panel-border); border-right: 1px solid var(--vscode-panel-border); padding: 6px 8px; text-align: left; vertical-align: top; white-space: nowrap; }
       th { position: sticky; top: 0; background: var(--vscode-editorWidget-background); z-index: 1; }
       td { max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+      td[contenteditable="true"] { cursor: text; outline-offset: -2px; }
+      td[contenteditable="true"]:focus { outline: 1px solid var(--vscode-focusBorder); background: var(--vscode-input-background); }
       pre { margin: 12px; background: var(--vscode-textCodeBlock-background); padding: 10px; overflow: auto; border-radius: 4px; }
       .empty { padding: 12px; color: var(--vscode-descriptionForeground); }
       .error { color: var(--vscode-errorForeground); }
-      @media (max-width: 760px) { .topbar { grid-template-columns: 1fr; align-items: stretch; } .resultbar { align-items: flex-start; flex-direction: column; } }
+      @media (max-width: 760px) { .topbar, .object-select { grid-template-columns: 1fr; align-items: stretch; } .main-tabs { top: 94px; } .resultbar { align-items: flex-start; flex-direction: column; } }
     </style>
   </head>
   <body>${body}</body>
@@ -936,6 +1250,51 @@ function schemaObjects(schema) {
 
 function currentDatabase() {
   return config().get('database', '');
+}
+
+function queryLogs(dbPath) {
+  if (!extensionContext) {
+    return [];
+  }
+  dbPath = normalizedDbPath(dbPath);
+  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  return Array.isArray(all[dbPath]) ? all[dbPath] : [];
+}
+
+async function appendQueryLog(dbPath, result, source) {
+  if (!extensionContext) {
+    return;
+  }
+  dbPath = normalizedDbPath(dbPath);
+  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    database: dbPath,
+    source,
+    sql: result.sql || '',
+    timestamp: new Date().toISOString(),
+    durationMs: result.latencyMs ?? result.durationMs ?? 0,
+    status: result.error ? 'error' : 'ok',
+    error: result.error || '',
+    rows: result.rows ? result.rows.length : 0,
+    rowsAffected: result.rowsAffected || 0
+  };
+  all[dbPath] = [...queryLogs(dbPath), entry];
+  await extensionContext.globalState.update('sujitSqlite.queryLogs', all);
+}
+
+async function clearQueryLogs(dbPath) {
+  if (!extensionContext) {
+    return;
+  }
+  dbPath = normalizedDbPath(dbPath);
+  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  all[dbPath] = [];
+  await extensionContext.globalState.update('sujitSqlite.queryLogs', all);
+}
+
+function normalizedDbPath(dbPath) {
+  return dbPath ? path.resolve(dbPath) : '';
 }
 
 function config() {
