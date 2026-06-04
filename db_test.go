@@ -505,6 +505,44 @@ func TestCreateTableIfNotExistsPreservesRows(t *testing.T) {
 	}
 }
 
+func TestSingleFileDatabasePersists(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "single.db")
+	d, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE single_file (id INTEGER PRIMARY KEY, name TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO single_file VALUES (?, ?)`, int64(1), "Ada"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.IsDir() {
+		t.Fatalf("database path is a directory: %s", path)
+	}
+	d, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	rows, err := d.Query(ctx, `SELECT name FROM single_file WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || row[0] != "Ada" {
+		t.Fatalf("row = %#v ok=%v", row, ok)
+	}
+}
+
 func TestSavepoints(t *testing.T) {
 	ctx := context.Background()
 	d, err := Open(t.TempDir(), Options{})

@@ -1,11 +1,13 @@
 package db
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -28,6 +30,10 @@ import (
 type DB struct {
 	mu           sync.RWMutex
 	path         string
+	singleFile   string
+	lockPath     string
+	cleanupPath  bool
+	cleanupLocks bool
 	opts         Options
 	wal          *wal.Log
 	pager        *pager.Pager
@@ -81,45 +87,62 @@ func Open(path string, opts Options) (*DB, error) {
 	if opts.Synchronous == "" {
 		opts.Synchronous = string(opts.SyncPolicy)
 	}
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	storagePath, lockPath, singleFile, cleanupPath, cleanupLocks, err := prepareDatabaseStorage(path)
+	if err != nil {
 		return nil, err
+	}
+	cleanup := func() {
+		if cleanupPath {
+			_ = os.RemoveAll(storagePath)
+		}
+		if cleanupLocks {
+			_ = os.RemoveAll(lockPath)
+		}
 	}
 	var lock *databaseLock
 	if !opts.DisableFileLock {
 		var err error
-		lock, err = acquireDatabaseLock(path)
+		lock, err = acquireDatabaseLock(lockPath)
 		if err != nil {
+			cleanup()
 			return nil, err
 		}
 	}
-	log, err := wal.Open(filepath.Join(path, "db.wal"))
+	log, err := wal.Open(filepath.Join(storagePath, "db.wal"))
 	if err != nil {
 		_ = releaseDatabaseLock(lock)
+		cleanup()
 		return nil, err
 	}
-	pg, err := pager.Open(filepath.Join(path, "db.pages"), opts.PageSize)
+	pg, err := pager.Open(filepath.Join(storagePath, "db.pages"), opts.PageSize)
 	if err != nil {
 		_ = log.Close()
 		_ = releaseDatabaseLock(lock)
+		cleanup()
 		return nil, err
 	}
 	d := &DB{
-		path:   path,
-		opts:   opts,
-		wal:    log,
-		pager:  pg,
-		lock:   lock,
-		buffer: buffer.New(opts.BufferPoolSize),
-		txmgr:  txn.NewManager(),
-		state:  newState(),
-		opened: time.Now(),
+		path:         storagePath,
+		singleFile:   singleFile,
+		lockPath:     lockPath,
+		cleanupPath:  cleanupPath,
+		cleanupLocks: cleanupLocks,
+		opts:         opts,
+		wal:          log,
+		pager:        pg,
+		lock:         lock,
+		buffer:       buffer.New(opts.BufferPoolSize),
+		txmgr:        txn.NewManager(),
+		state:        newState(),
+		opened:       time.Now(),
 	}
 	if err := d.loadSnapshot(); err != nil {
-		if walHasRecords(filepath.Join(path, "db.wal")) {
+		if walHasRecords(filepath.Join(storagePath, "db.wal")) {
 			if replayErr := d.replayPhysicalPages(); replayErr != nil {
 				_ = log.Close()
 				_ = pg.Close()
 				_ = releaseDatabaseLock(lock)
+				cleanup()
 				return nil, replayErr
 			}
 			d.state = newState()
@@ -130,6 +153,7 @@ func Open(path string, opts Options) (*DB, error) {
 			_ = log.Close()
 			_ = pg.Close()
 			_ = releaseDatabaseLock(lock)
+			cleanup()
 			return nil, err
 		}
 	}
@@ -137,12 +161,14 @@ func Open(path string, opts Options) (*DB, error) {
 		_ = log.Close()
 		_ = pg.Close()
 		_ = releaseDatabaseLock(lock)
+		cleanup()
 		return nil, err
 	} else if !clean {
 		if err := d.replay(); err != nil {
 			_ = log.Close()
 			_ = pg.Close()
 			_ = releaseDatabaseLock(lock)
+			cleanup()
 			return nil, err
 		}
 	} else {
@@ -161,6 +187,160 @@ func Open(path string, opts Options) (*DB, error) {
 		d.state.Pragmas.Synchronous = strings.ToLower(opts.Synchronous)
 	}
 	return d, nil
+}
+
+func prepareDatabaseStorage(path string) (storagePath, lockPath, singleFile string, cleanupPath, cleanupLocks bool, err error) {
+	if !isSingleFileDatabasePath(path) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return "", "", "", false, false, err
+		}
+		return path, path, "", false, false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", "", "", false, false, err
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return "", "", "", false, false, fmt.Errorf("single-file database path is a directory: %s", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", "", false, false, err
+	}
+	storagePath, err = os.MkdirTemp("", "sujit-sqlite-db-*")
+	if err != nil {
+		return "", "", "", false, false, err
+	}
+	if err := unpackDatabaseFile(path, storagePath); err != nil {
+		_ = os.RemoveAll(storagePath)
+		return "", "", "", false, false, err
+	}
+	lockPath = path + ".locks"
+	if err := os.MkdirAll(lockPath, 0o700); err != nil {
+		_ = os.RemoveAll(storagePath)
+		return "", "", "", false, false, err
+	}
+	return storagePath, lockPath, path, true, true, nil
+}
+
+func isSingleFileDatabasePath(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".db")
+}
+
+func unpackDatabaseFile(path, dest string) error {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		name := filepath.Clean(f.Name)
+		if name == "." || name == ".." || filepath.IsAbs(name) || strings.HasPrefix(name, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("invalid database archive entry: %s", f.Name)
+		}
+		target := filepath.Join(dest, name)
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		in, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			_ = in.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		closeErr := out.Close()
+		inErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if inErr != nil {
+			return inErr
+		}
+	}
+	return nil
+}
+
+func packDatabaseFile(src, path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	zw := zip.NewWriter(out)
+	walkErr := filepath.WalkDir(src, func(filePath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(src, filePath)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		header.Method = zip.Deflate
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		in, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(writer, in)
+		closeErr := in.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+	closeZipErr := zw.Close()
+	closeFileErr := out.Close()
+	if walkErr != nil {
+		_ = os.Remove(tmp)
+		return walkErr
+	}
+	if closeZipErr != nil {
+		_ = os.Remove(tmp)
+		return closeZipErr
+	}
+	if closeFileErr != nil {
+		_ = os.Remove(tmp)
+		return closeFileErr
+	}
+	return os.Rename(tmp, path)
 }
 
 func (d *DB) Begin(ctx context.Context, opts TxOptions) (*Tx, error) {
@@ -1159,8 +1339,23 @@ func (d *DB) Close() error {
 	if perr := d.pager.Close(); err == nil {
 		err = perr
 	}
+	if d.singleFile != "" {
+		if perr := packDatabaseFile(d.path, d.singleFile); err == nil {
+			err = perr
+		}
+	}
 	if lerr := releaseDatabaseLock(d.lock); err == nil {
 		err = lerr
+	}
+	if d.cleanupPath {
+		if rerr := os.RemoveAll(d.path); err == nil {
+			err = rerr
+		}
+	}
+	if d.cleanupLocks {
+		if rerr := os.RemoveAll(d.lockPath); err == nil {
+			err = rerr
+		}
 	}
 	return err
 }

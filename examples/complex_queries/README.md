@@ -8,8 +8,8 @@ This directory contains runnable examples for `github.com/sujit/sqlite` plus a d
 go run ./examples/complex_queries
 ```
 
-The example persists its database directories under `examples/complex_queries/data/`.
-Each run refreshes only the demo seed rows, so the files remain on disk and reruns stay deterministic.
+The example persists single-file databases under `examples/complex_queries/data/`.
+Each run refreshes only the demo seed rows, so the `.db` files remain on disk and reruns stay deterministic.
 
 ## Files
 
