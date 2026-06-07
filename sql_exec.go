@@ -69,6 +69,9 @@ func execute(ctx context.Context, s *persistedState, query string, args ...any) 
 	if res, ok, err := execPragma(s, query); ok || err != nil {
 		return res, err
 	}
+	if res, ok, err := execMaintenance(s, query); ok || err != nil {
+		return res, err
+	}
 	parseQuery, strictTable := stripSQLiteStrict(query)
 	stmt, err := parseStatementCached(parseQuery)
 	if err != nil {
@@ -190,7 +193,13 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 	return Result{RowsAffected: 1}, true, nil
 }
 
+type rowChangeRecorder func(table string, data *tableData, pos int)
+
 func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, error) {
+	return fastSimpleDMLWithRecorder(s, query, args, nil)
+}
+
+func fastSimpleDMLWithRecorder(s *persistedState, query string, args []any, record rowChangeRecorder) (Result, bool, error) {
 	if hasNamedArgs(args) {
 		return Result{}, false, nil
 	}
@@ -208,10 +217,10 @@ func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, e
 			col:   plan.col,
 			where: plan.where,
 			inc:   plan.inc,
-		}, args)
+		}, args, record)
 	case 'd':
 		s.materializePending()
-		return fastDeleteWhere(s, plan.table, plan.where, args)
+		return fastDeleteWhere(s, plan.table, plan.where, args, record)
 	default:
 		return Result{}, false, nil
 	}
@@ -343,7 +352,7 @@ type simpleIncrementUpdate struct {
 	inc   int64
 }
 
-func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []any) (Result, bool, error) {
+func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []any, record rowChangeRecorder) (Result, bool, error) {
 	if len(args) != 1 {
 		return Result{}, false, nil
 	}
@@ -355,7 +364,7 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 	if pk != upd.where && usableIndexForColumn(s, upd.table, upd.where) == "" {
 		return Result{}, false, nil
 	}
-	col, _, ok := t.Column(upd.col)
+	col, colIdx, ok := t.Column(upd.col)
 	if !ok {
 		return Result{}, true, fmt.Errorf("unknown column: %s", upd.col)
 	}
@@ -369,7 +378,30 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 	if data.runtimeDeferred() {
 		return Result{}, false, nil
 	}
-	var positions []int
+	var affected int64
+	apply := func(pos int) (bool, error) {
+		if pos < 0 || pos >= len(data.Rows) {
+			return true, nil
+		}
+		row := &data.Rows[pos]
+		if row.Deleted != 0 {
+			return true, nil
+		}
+		cur, ok := asInt(row.value(t, col.Name))
+		if !ok {
+			return false, nil
+		}
+		cv, err := coerce(col, cur+upd.inc, t.Strict)
+		if err != nil {
+			return false, err
+		}
+		if record != nil {
+			record(t.Name, data, pos)
+		}
+		data.copyRowForColumnUpdate(pos, colIdx, col.Name, cv)
+		affected++
+		return true, nil
+	}
 	if pk != "" && upd.where == pk {
 		id, ok := asInt(args[0])
 		if !ok {
@@ -379,43 +411,44 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 		if !ok {
 			return Result{RowsAffected: 0}, true, nil
 		}
-		positions = []int{pos}
-	} else if idxName := usableIndexForColumn(s, upd.table, upd.where); idxName != "" {
-		idx := catalog.Index{Name: idxName, Columns: []string{upd.where}}
-		positions = data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, args[0]))
-	} else {
-		return Result{}, false, nil
-	}
-	var affected int64
-	for _, pos := range positions {
-		if pos < 0 || pos >= len(data.Rows) {
-			continue
-		}
-		row := &data.Rows[pos]
-		if row.Deleted != 0 {
-			continue
-		}
-		cur, ok := asInt(row.value(t, col.Name))
-		if !ok {
-			return Result{}, false, nil
-		}
-		cv, err := coerce(col, cur+upd.inc, t.Strict)
+		keepGoing, err := apply(pos)
 		if err != nil {
 			return Result{}, true, err
 		}
-		data.copyRow(pos)
-		row = &data.Rows[pos]
-		if row.Values == nil {
-			row.Values = positionedToValues(t, row.positionedValues())
+		if !keepGoing {
+			return Result{}, false, nil
 		}
-		row.Values[col.Name] = cv
-		row.syncPositioned(t)
-		affected++
+	} else if idxName := usableIndexForColumn(s, upd.table, upd.where); idxName != "" {
+		idx := catalog.Index{Name: idxName, Columns: []string{upd.where}}
+		var fallback bool
+		var applyErr error
+		key := runtimeIndexLookupKeyBytes(idx, args[0])
+		data.eachIndexPositionBytes(idxName, key, func(pos int) bool {
+			var keepGoing bool
+			keepGoing, applyErr = apply(pos)
+			if applyErr != nil {
+				fallback = false
+				return false
+			}
+			if !keepGoing {
+				fallback = true
+				return false
+			}
+			return true
+		})
+		if applyErr != nil {
+			return Result{}, true, applyErr
+		}
+		if fallback {
+			return Result{}, false, nil
+		}
+	} else {
+		return Result{}, false, nil
 	}
 	return Result{RowsAffected: affected}, true, nil
 }
 
-func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result, bool, error) {
+func fastDeleteWhere(s *persistedState, table, where string, args []any, record rowChangeRecorder) (Result, bool, error) {
 	if len(args) != 1 {
 		return Result{}, false, nil
 	}
@@ -430,7 +463,28 @@ func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result
 	if data.runtimeDeferred() {
 		return Result{}, false, nil
 	}
-	var positions []int
+	var affected int64
+	apply := func(pos int) (bool, error) {
+		if pos < 0 || pos >= len(data.Rows) {
+			return true, nil
+		}
+		row := &data.Rows[pos]
+		if row.Deleted != 0 {
+			return true, nil
+		}
+		if s.Pragmas.ForeignKeys {
+			row.ensureValues(t)
+			if err := validateDeleteReferences(s, table, row.Values); err != nil {
+				return false, err
+			}
+		}
+		if record != nil {
+			record(t.Name, data, pos)
+		}
+		data.markRowDeleted(pos, s.NextTx)
+		affected++
+		return true, nil
+	}
 	if pk := integerPrimaryKeyColumn(t); pk == where || where == "rowid" || where == "_rowid_" || where == "oid" {
 		id, ok := asInt(args[0])
 		if !ok {
@@ -440,30 +494,22 @@ func fastDeleteWhere(s *persistedState, table, where string, args []any) (Result
 		if !ok {
 			return Result{RowsAffected: 0}, true, nil
 		}
-		positions = []int{pos}
+		if _, err := apply(pos); err != nil {
+			return Result{}, true, err
+		}
 	} else if idxName := usableIndexForColumn(s, table, where); idxName != "" {
 		idx := catalog.Index{Name: idxName, Columns: []string{where}}
-		positions = data.lookupIndexPositions(idxName, runtimeIndexLookupKey(idx, args[0]))
+		var applyErr error
+		key := runtimeIndexLookupKeyBytes(idx, args[0])
+		data.eachIndexPositionBytes(idxName, key, func(pos int) bool {
+			_, applyErr = apply(pos)
+			return applyErr == nil
+		})
+		if applyErr != nil {
+			return Result{}, true, applyErr
+		}
 	} else {
 		return Result{}, false, nil
-	}
-	var affected int64
-	for _, pos := range positions {
-		if pos < 0 || pos >= len(data.Rows) {
-			continue
-		}
-		data.copyRow(pos)
-		row := &data.Rows[pos]
-		if row.Deleted != 0 {
-			continue
-		}
-		if s.Pragmas.ForeignKeys {
-			if err := validateDeleteReferences(s, table, row.Values); err != nil {
-				return Result{}, true, err
-			}
-		}
-		row.Deleted = s.NextTx
-		affected++
 	}
 	return Result{RowsAffected: affected}, true, nil
 }
@@ -1864,6 +1910,10 @@ func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) 
 	if !ok {
 		return Result{}, fmt.Errorf("table does not exist: %s", qname(st.Table))
 	}
+	idxName := catalog.Normalize(st.Name.Unquoted)
+	if _, ok := catalogIndexByName(s, idxName); ok {
+		return Result{}, fmt.Errorf("index already exists: %s", st.Name.Unquoted)
+	}
 	cols := make([]string, 0, len(st.Columns))
 	for _, c := range st.Columns {
 		name := catalog.Normalize(c.Name.Unquoted)
@@ -1872,7 +1922,12 @@ func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) 
 		}
 		cols = append(cols, name)
 	}
-	idx := catalog.Index{Name: catalog.Normalize(st.Name.Unquoted), Columns: cols, Unique: st.Type == ast.UniqueConstraint, SQL: strings.TrimSpace(rawSQL)}
+	idx := catalog.Index{Name: idxName, Columns: cols, Unique: st.Type == ast.UniqueConstraint, SQL: strings.TrimSpace(rawSQL)}
+	if idx.Unique {
+		if err := validateUniqueIndexExisting(t, s.Tables[t.Name], idx); err != nil {
+			return Result{}, err
+		}
+	}
 	t.Indexes = append(t.Indexes, idx)
 	if data := s.Tables[t.Name]; data != nil {
 		data.rebuildRuntime(t)
@@ -1893,6 +1948,11 @@ func execManualCreateIndex(s *persistedState, query string) (Result, bool, error
 	if unique {
 		rest = strings.TrimSpace(q[len("create unique index "):])
 	}
+	ifNotExists := false
+	if strings.HasPrefix(strings.ToLower(rest), "if not exists ") {
+		ifNotExists = true
+		rest = strings.TrimSpace(rest[len("if not exists "):])
+	}
 	parts := strings.SplitN(rest, " on ", 2)
 	if len(parts) != 2 {
 		parts = strings.SplitN(rest, " ON ", 2)
@@ -1901,6 +1961,12 @@ func execManualCreateIndex(s *persistedState, query string) (Result, bool, error
 		return Result{}, true, errors.New("invalid CREATE INDEX")
 	}
 	idxName := catalog.Normalize(parts[0])
+	if _, ok := catalogIndexByName(s, idxName); ok {
+		if ifNotExists {
+			return Result{}, true, nil
+		}
+		return Result{}, true, fmt.Errorf("index already exists: %s", idxName)
+	}
 	afterOn := strings.TrimSpace(parts[1])
 	open := strings.Index(afterOn, "(")
 	close := strings.LastIndex(afterOn, ")")
@@ -1923,6 +1989,11 @@ func execManualCreateIndex(s *persistedState, query string) (Result, bool, error
 	if isBareIdentifier(expr) {
 		idx.Columns = []string{catalog.Normalize(expr)}
 	}
+	if idx.Unique && len(idx.Columns) > 0 {
+		if err := validateUniqueIndexExisting(t, s.Tables[t.Name], idx); err != nil {
+			return Result{}, true, err
+		}
+	}
 	t.Indexes = append(t.Indexes, idx)
 	if data := s.Tables[t.Name]; data != nil {
 		data.rebuildRuntime(t)
@@ -1930,6 +2001,44 @@ func execManualCreateIndex(s *persistedState, query string) (Result, bool, error
 	t.SchemaVers++
 	s.Pragmas.SchemaVer++
 	return Result{}, true, nil
+}
+
+func catalogIndexByName(s *persistedState, name string) (catalog.Index, bool) {
+	name = catalog.Normalize(name)
+	for _, t := range s.Catalog.Tables {
+		for _, idx := range t.Indexes {
+			if catalog.Normalize(idx.Name) == name {
+				return idx, true
+			}
+		}
+	}
+	return catalog.Index{}, false
+}
+
+func validateUniqueIndexExisting(t *catalog.Table, data *tableData, idx catalog.Index) error {
+	if t == nil || data == nil || !idx.Unique || len(idx.Columns) == 0 {
+		return nil
+	}
+	for i := range data.Rows {
+		left := data.Rows[i]
+		if left.Deleted != 0 {
+			continue
+		}
+		for j := i + 1; j < len(data.Rows); j++ {
+			right := data.Rows[j]
+			if right.Deleted != 0 {
+				continue
+			}
+			same := true
+			for _, col := range idx.Columns {
+				same = same && valuesEqual(left.value(t, col), right.value(t, col), columnCollation(t, col))
+			}
+			if same {
+				return fmt.Errorf("unique constraint failed: %s.%s", t.Name, idx.Name)
+			}
+		}
+	}
+	return nil
 }
 
 func isBareIdentifier(s string) bool {
@@ -3479,6 +3588,23 @@ func execPragma(s *persistedState, query string) (Result, bool, error) {
 		return Result{}, true, nil
 	}
 	return Result{}, true, nil
+}
+
+func execMaintenance(s *persistedState, query string) (Result, bool, error) {
+	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	if q == "" {
+		return Result{}, false, nil
+	}
+	first, _ := nextSQLField(q)
+	switch strings.ToLower(first) {
+	case "vacuum", "analyze":
+		return Result{}, true, nil
+	case "reindex":
+		s.rebuildRuntime()
+		return Result{}, true, nil
+	default:
+		return Result{}, false, nil
+	}
 }
 
 func queryPragma(s *persistedState, query string) (*Rows, bool, error) {

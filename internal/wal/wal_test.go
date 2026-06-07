@@ -99,6 +99,26 @@ func TestReplayRejectsCorruptChecksum(t *testing.T) {
 	}
 }
 
+func TestReplayRejectsOversizedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.wal")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var header [21]byte
+	header[0] = byte(RecordCommit)
+	binary.LittleEndian.PutUint64(header[1:9], 1)
+	binary.LittleEndian.PutUint64(header[9:17], uint64(maxRecordDataSize)+1)
+	if _, err := log.file.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	err = log.Replay(func(Record) error { return nil })
+	if err == nil || err.Error() != "wal record too large" {
+		t.Fatalf("Replay err = %v, want wal record too large", err)
+	}
+}
+
 func FuzzReplay(f *testing.F) {
 	f.Add([]byte{})
 	f.Add([]byte{byte(RecordCommit), 1, 0, 0})

@@ -66,6 +66,38 @@ func TestPagerWriteReadAllocate(t *testing.T) {
 	}
 }
 
+func TestPagerRejectsPageIDMismatch(t *testing.T) {
+	path := t.TempDir() + "/pages.db"
+	p, err := Open(path, page.DefaultSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pg := page.New(1, page.DefaultSize)
+	copy(pg.Data, []byte("pager"))
+	if err := p.Write(pg); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint64(raw[0:8], 99)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err = Open(path, page.DefaultSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if _, err := p.Read(1); err == nil {
+		t.Fatal("expected page id mismatch")
+	}
+}
+
 func TestPagerRecordsRoundTrip(t *testing.T) {
 	p, err := Open(t.TempDir()+"/records.db", page.DefaultSize)
 	if err != nil {
@@ -215,6 +247,32 @@ func TestPagerRejectsCorruptRecordSize(t *testing.T) {
 	}
 	if _, err := p.ReadRecords(); err == nil {
 		t.Fatal("expected corrupt record size to fail")
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPagerRejectsOversizedRecordPayload(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	p, err := Open(path, page.DefaultSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"name": "Ada"})
+	if err := p.WriteRecords([]Record{{Key: 1, Values: payload}}); err != nil {
+		t.Fatal(err)
+	}
+	pg, err := p.Read(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint64(pg.Data[8:16], uint64(maxRecordPayload)+1)
+	if err := p.Write(pg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ReadRecords(); err == nil {
+		t.Fatal("expected oversized record payload to fail")
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)

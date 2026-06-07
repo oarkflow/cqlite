@@ -8,11 +8,15 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 )
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
+
+const maxRecordDataSize = 256 << 20
 
 type RecordType uint8
 
@@ -111,7 +115,7 @@ func (l *Log) Replay(fn func(Record) error) error {
 			return err
 		}
 		n := binary.LittleEndian.Uint64(header[9:17])
-		if n > 1<<32 {
+		if n > maxRecordDataSize {
 			return errors.New("wal record too large")
 		}
 		data := make([]byte, n)
@@ -141,14 +145,51 @@ func (l *Log) Checkpoint(snapshot any) error {
 		return err
 	}
 	tmp := l.path + ".snapshot.tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeFileSynced(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, l.path+".snapshot")
+	if err := os.Rename(tmp, l.path+".snapshot"); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(l.path))
 }
 
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.file.Close()
+}
+
+func writeFileSynced(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	} else if n != len(data) {
+		_ = f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

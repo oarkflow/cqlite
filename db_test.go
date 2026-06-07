@@ -159,6 +159,85 @@ func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 	}
 }
 
+func TestFailedAutocommitWALAppendDoesNotPublishMutation(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE failed_autocommit (id INTEGER PRIMARY KEY, msg TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO failed_autocommit VALUES (?, ?)`, int64(1), "should-not-publish"); err == nil {
+		t.Fatal("expected WAL append failure")
+	}
+	rows, err := d.Query(ctx, `SELECT msg FROM failed_autocommit WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); ok {
+		t.Fatalf("failed autocommit mutation was published: %#v", row)
+	}
+	d.wal, err = wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedAutocommitForeignKeyDeleteDoesNotPublishCascade(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE failed_fk_parent (id INTEGER PRIMARY KEY)`,
+		`CREATE TABLE failed_fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES failed_fk_parent(id) ON DELETE CASCADE)`,
+		`INSERT INTO failed_fk_parent VALUES (1)`,
+		`INSERT INTO failed_fk_child VALUES (10, 1)`,
+	} {
+		if _, err := d.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `DELETE FROM failed_fk_parent WHERE id = ?`, int64(1)); err == nil {
+		t.Fatal("expected WAL append failure")
+	}
+	parent, err := d.Query(ctx, `SELECT id FROM failed_fk_parent WHERE id = ?`, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := parent.Next(); !ok || row[0] != int64(1) {
+		t.Fatalf("parent after failed delete = %#v ok=%v", row, ok)
+	}
+	child, err := d.Query(ctx, `SELECT parent_id FROM failed_fk_child WHERE id = ?`, int64(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := child.Next(); !ok || row[0] != int64(1) {
+		t.Fatalf("child after failed cascade = %#v ok=%v", row, ok)
+	}
+	d.wal, err = wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSQLStrictTypesAndPersistence(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -277,6 +356,68 @@ func TestUpdateBySecondaryIndex(t *testing.T) {
 		if !ok || row[0] != want {
 			t.Fatalf("updated row = %#v ok=%v, want %v", row, ok, want)
 		}
+	}
+}
+
+func TestCreateUniqueIndexValidatesExistingRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE unique_existing (id INTEGER PRIMARY KEY, code TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO unique_existing VALUES (?, ?)`, int64(1), "dup"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO unique_existing VALUES (?, ?)`, int64(2), "dup"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE UNIQUE INDEX unique_existing_code_idx ON unique_existing (code)`); err == nil {
+		t.Fatal("expected duplicate existing rows to reject unique index")
+	}
+}
+
+func TestCreateIndexIfNotExistsAndMaintenanceStatements(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for _, sql := range []string{
+		`CREATE TABLE dbms_ready (id INTEGER PRIMARY KEY, code TEXT)`,
+		`CREATE INDEX IF NOT EXISTS dbms_ready_code_idx ON dbms_ready (code)`,
+		`CREATE INDEX IF NOT EXISTS dbms_ready_code_idx ON dbms_ready (code)`,
+		`ANALYZE`,
+		`REINDEX`,
+		`VACUUM`,
+	} {
+		if _, err := d.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if _, err := d.Exec(ctx, `CREATE INDEX dbms_ready_code_idx ON dbms_ready (code)`); err == nil {
+		t.Fatal("expected duplicate CREATE INDEX to fail")
+	}
+	rows, err := d.Query(ctx, `PRAGMA index_list(dbms_ready)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			break
+		}
+		if row[1] == "dbms_ready_code_idx" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("index count = %d, want 1", count)
 	}
 }
 

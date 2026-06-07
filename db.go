@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -563,23 +564,27 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 	}
 	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
-	d.state.NextTx = next
 	d.state.ensureRuntime()
+	before := d.state.clone()
+	d.state.NextTx = next
 	res, fast, err := fastDirectDML(&d.state, stmt, args)
 	if err != nil {
+		d.state = before
 		return Result{}, true, err
 	}
 	if !fast {
 		res, err = execute(ctx, &d.state, query, args...)
 		if err != nil {
-			d.state.rebuildRuntime()
+			d.state = before
 			return Result{}, true, err
 		}
 	}
 	if err := d.markDirty(); err != nil {
+		d.state = before
 		return Result{}, true, err
 	}
 	if err := d.appendLogical(next, query, args); err != nil {
+		d.state = before
 		return Result{}, true, err
 	}
 	d.applied = next
@@ -597,19 +602,52 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 	}
 	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
-	d.state.NextTx = next
 	d.state.ensureRuntime()
-	res, fast, err := fastSimpleDML(&d.state, query, args)
+	plan, planOK := simplePlan(query)
+	useFullRollback := planOK && plan.kind == 'd' && d.state.Pragmas.ForeignKeys
+	var before persistedState
+	if useFullRollback {
+		before = d.state.clone()
+	}
+	rollback := newSimpleDirectRollback(&d.state)
+	if planOK {
+		rollback.snapshotTable(plan.table)
+		if plan.kind != 'i' {
+			rollback.snapshotAllTables()
+		}
+	}
+	d.state.NextTx = next
+	res, fast, err := fastSimpleDMLWithRecorder(&d.state, query, args, rollback.recordRow)
 	if err != nil {
+		if useFullRollback {
+			d.state = before
+		} else {
+			rollback.restore()
+		}
 		return Result{}, true, err
 	}
 	if !fast {
+		if useFullRollback {
+			d.state = before
+		} else {
+			rollback.restore()
+		}
 		return Result{}, false, nil
 	}
 	if err := d.markDirty(); err != nil {
+		if useFullRollback {
+			d.state = before
+		} else {
+			rollback.restore()
+		}
 		return Result{}, true, err
 	}
 	if err := d.appendLogical(next, query, args); err != nil {
+		if useFullRollback {
+			d.state = before
+		} else {
+			rollback.restore()
+		}
 		return Result{}, true, err
 	}
 	d.applied = next
@@ -619,11 +657,178 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 	return res, true, nil
 }
 
+type simpleDirectRollback struct {
+	state   *persistedState
+	nextTx  uint64
+	tables  map[string]tableRollback
+	changes []rowRollback
+	seenRow map[string]map[int]struct{}
+}
+
+type tableRollback struct {
+	exists       bool
+	rowsLen      int
+	pending      []rowVersion
+	pendingRowID map[int64]struct{}
+	pendingLast  int64
+	pendingAsc   bool
+	baseRows     int
+	deferRuntime bool
+	rowsShared   bool
+	lazyRecords  []pager.Record
+	lazyPath     string
+	lazyPageSize int
+	lazyCount    int
+	nextRowID    int64
+}
+
+type rowRollback struct {
+	table string
+	pos   int
+	row   rowVersion
+}
+
+func newSimpleDirectRollback(state *persistedState) *simpleDirectRollback {
+	return &simpleDirectRollback{
+		state:   state,
+		nextTx:  state.NextTx,
+		tables:  make(map[string]tableRollback),
+		seenRow: make(map[string]map[int]struct{}),
+	}
+}
+
+func (r *simpleDirectRollback) snapshotAllTables() {
+	if r == nil || r.state == nil {
+		return
+	}
+	for name := range r.state.Tables {
+		r.snapshotTable(name)
+	}
+}
+
+func (r *simpleDirectRollback) snapshotTable(name string) {
+	if r == nil || r.state == nil {
+		return
+	}
+	name = catalog.Normalize(name)
+	if _, ok := r.tables[name]; ok {
+		return
+	}
+	tbl := r.state.Catalog.Tables[name]
+	data := r.state.Tables[name]
+	snap := tableRollback{}
+	if tbl != nil {
+		snap.nextRowID = tbl.NextRowID
+	}
+	if data == nil {
+		r.tables[name] = snap
+		return
+	}
+	snap.exists = true
+	snap.rowsLen = len(data.Rows)
+	if len(data.Pending) > 0 {
+		snap.pending = append([]rowVersion(nil), data.Pending...)
+	}
+	if len(data.pendingRowID) > 0 {
+		snap.pendingRowID = make(map[int64]struct{}, len(data.pendingRowID))
+		for rowid := range data.pendingRowID {
+			snap.pendingRowID[rowid] = struct{}{}
+		}
+	}
+	snap.pendingLast = data.pendingLast
+	snap.pendingAsc = data.pendingAsc
+	snap.baseRows = data.baseRows
+	snap.deferRuntime = data.deferRuntime
+	snap.rowsShared = data.rowsShared
+	if len(data.lazyRecords) > 0 {
+		snap.lazyRecords = append([]pager.Record(nil), data.lazyRecords...)
+	}
+	snap.lazyPath = data.lazyPath
+	snap.lazyPageSize = data.lazyPageSize
+	snap.lazyCount = data.lazyCount
+	r.tables[name] = snap
+}
+
+func (r *simpleDirectRollback) recordRow(table string, data *tableData, pos int) {
+	if r == nil || data == nil || pos < 0 || pos >= len(data.Rows) {
+		return
+	}
+	table = catalog.Normalize(table)
+	r.snapshotTable(table)
+	seen := r.seenRow[table]
+	if seen == nil {
+		seen = make(map[int]struct{})
+		r.seenRow[table] = seen
+	}
+	if _, ok := seen[pos]; ok {
+		return
+	}
+	seen[pos] = struct{}{}
+	row := data.Rows[pos]
+	row.Values = cloneValues(row.Values)
+	row.Pos = clonePositionedValues(row.Pos)
+	r.changes = append(r.changes, rowRollback{table: table, pos: pos, row: row})
+}
+
+func (r *simpleDirectRollback) restore() {
+	if r == nil || r.state == nil {
+		return
+	}
+	r.state.NextTx = r.nextTx
+	for name, snap := range r.tables {
+		tbl := r.state.Catalog.Tables[name]
+		if tbl != nil {
+			tbl.NextRowID = snap.nextRowID
+		}
+		if !snap.exists {
+			delete(r.state.Tables, name)
+			continue
+		}
+		data := r.state.Tables[name]
+		if data == nil {
+			data = &tableData{}
+			r.state.Tables[name] = data
+		}
+		if len(data.Rows) > snap.rowsLen {
+			data.Rows = data.Rows[:snap.rowsLen]
+		}
+		data.Pending = snap.pending
+		data.pendingRowID = snap.pendingRowID
+		data.pendingLast = snap.pendingLast
+		data.pendingAsc = snap.pendingAsc
+		data.baseRows = snap.baseRows
+		data.deferRuntime = snap.deferRuntime
+		data.rowsShared = snap.rowsShared
+		data.lazyRecords = snap.lazyRecords
+		data.lazyPath = snap.lazyPath
+		data.lazyPageSize = snap.lazyPageSize
+		data.lazyCount = snap.lazyCount
+		data.rowids = nil
+		data.indexes = nil
+		data.deferRuntime = true
+	}
+	for i := len(r.changes) - 1; i >= 0; i-- {
+		change := r.changes[i]
+		data := r.state.Tables[change.table]
+		if data == nil || change.pos < 0 || change.pos >= len(data.Rows) {
+			continue
+		}
+		data.Rows[change.pos] = change.row
+		data.rowids = nil
+		data.indexes = nil
+		data.deferRuntime = true
+	}
+}
+
 func (d *DB) appendLogical(txid uint64, query string, args []any) error {
+	return d.appendLogicalState(txid, &d.state, query, args)
+}
+
+func (d *DB) appendLogicalState(txid uint64, state *persistedState, query string, args []any) error {
 	if data, ok := encodeSimpleWAL(query, args); ok {
 		return d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
 	}
-	data, err := encodeStateWAL(&d.state)
+	data, err := encodeStateWAL(state)
 	if err != nil {
 		return err
 	}
@@ -872,10 +1077,10 @@ func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
 			col:   rec.plan.col,
 			where: rec.plan.where,
 			inc:   rec.plan.inc,
-		}, rec.args)
+		}, rec.args, nil)
 	case 'd':
 		s.ensureRuntime()
-		res, fast, err = fastDeleteWhere(s, rec.plan.table, rec.plan.where, rec.args)
+		res, fast, err = fastDeleteWhere(s, rec.plan.table, rec.plan.where, rec.args, nil)
 	default:
 		return errors.New("unknown simple WAL mutation")
 	}
@@ -1261,10 +1466,13 @@ func (d *DB) hasCleanCheckpointMarker() (bool, error) {
 func (d *DB) writeCleanCheckpointMarker(applied uint64) error {
 	tmp := d.cleanCheckpointMarkerPath() + ".tmp"
 	data := []byte(strconv.FormatUint(applied, 10))
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeFileSynced(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, d.cleanCheckpointMarkerPath()); err != nil {
+		return err
+	}
+	if err := syncDir(filepath.Dir(d.cleanCheckpointMarkerPath())); err != nil {
 		return err
 	}
 	d.clean = true
@@ -1281,6 +1489,40 @@ func (d *DB) markDirty() error {
 		return nil
 	}
 	return err
+}
+
+func writeFileSynced(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	} else if n != len(data) {
+		_ = f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error) {

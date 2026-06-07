@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/sujit/sqlite/internal/page"
@@ -52,7 +54,14 @@ func (p *Pager) Read(id page.ID) (page.Page, error) {
 		}
 		return page.Page{}, err
 	}
-	return page.Decode(buf)
+	pg, err := page.Decode(buf)
+	if err != nil {
+		return page.Page{}, err
+	}
+	if pg.ID != id {
+		return page.Page{}, errors.New("page id mismatch")
+	}
+	return pg, nil
 }
 
 func (p *Pager) Write(pg page.Page) error {
@@ -152,10 +161,13 @@ func (p *Pager) persistFreeListLocked() error {
 		return err
 	}
 	tmp := p.path + ".free.tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := writeFileSynced(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, p.path+".free"); err != nil {
+		return err
+	}
+	if err := syncDir(filepath.Dir(p.path)); err != nil {
 		return err
 	}
 	p.freeDirty = false
@@ -187,7 +199,10 @@ func (p *Pager) WriteBlob(data []byte) error {
 			return err
 		}
 	}
-	return p.Sync()
+	if err := p.Sync(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(p.path))
 }
 
 func (p *Pager) ReadBlob() ([]byte, error) {
@@ -224,4 +239,42 @@ func (p *Pager) ReadBlob() ([]byte, error) {
 		out = append(out, pg.Data[16:16+n]...)
 	}
 	return out, nil
+}
+
+func writeFileSynced(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	} else if n != len(data) {
+		_ = f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDirFromFile(path string) error {
+	return syncDir(filepath.Dir(path))
 }

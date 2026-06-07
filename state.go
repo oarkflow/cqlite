@@ -131,6 +131,45 @@ func (t *tableData) copyRow(pos int) {
 	t.Rows[pos].Pos = clonePositionedValues(t.Rows[pos].Pos)
 }
 
+func (t *tableData) copyRowForColumnUpdate(pos int, colIdx int, colName string, value any) {
+	if t == nil || pos < 0 || pos >= len(t.Rows) {
+		return
+	}
+	cloneRowValues := t.rowsShared
+	if t.rowsShared {
+		rows := make([]rowVersion, len(t.Rows))
+		copy(rows, t.Rows)
+		t.Rows = rows
+		t.rowsShared = false
+	}
+	row := &t.Rows[pos]
+	if cloneRowValues {
+		row.Pos = clonePositionedValues(row.Pos)
+	}
+	if colIdx >= 0 && colIdx < len(row.Pos) {
+		row.Pos[colIdx] = value
+	}
+	if row.Values != nil {
+		if cloneRowValues {
+			row.Values = cloneValues(row.Values)
+		}
+		row.Values[colName] = value
+	}
+}
+
+func (t *tableData) markRowDeleted(pos int, txid uint64) {
+	if t == nil || pos < 0 || pos >= len(t.Rows) {
+		return
+	}
+	if t.rowsShared {
+		rows := make([]rowVersion, len(t.Rows))
+		copy(rows, t.Rows)
+		t.Rows = rows
+		t.rowsShared = false
+	}
+	t.Rows[pos].Deleted = txid
+}
+
 func (t *tableData) runtimeDeferred() bool {
 	return t != nil && (t.deferRuntime || len(t.lazyRecords) > 0 || t.lazyPath != "")
 }
@@ -506,11 +545,16 @@ func (t *tableData) lookupRowID(rowid int64) (int, bool) {
 	if t == nil || t.rowids == nil {
 		return 0, false
 	}
-	raw, ok := t.rowids.Get(encodeInt64Key(rowid))
-	if !ok {
+	var (
+		pos int
+		ok  bool
+	)
+	if !t.rowids.View(encodeInt64Key(rowid), func(raw []byte) {
+		pos, ok = decodeIntPosition(raw)
+	}) {
 		return 0, false
 	}
-	return decodeIntPosition(raw)
+	return pos, ok
 }
 
 func (t *tableData) rangeRowIDs(start *int64, end *int64) []int {
@@ -575,11 +619,13 @@ func (t *tableData) lookupIndexPositions(indexName, key string) []int {
 	if t == nil || t.indexes == nil || t.indexes[indexName] == nil {
 		return nil
 	}
-	raw, ok := t.indexes[indexName].Get([]byte(key))
-	if !ok {
+	var out []int
+	if !t.indexes[indexName].View([]byte(key), func(raw []byte) {
+		out = decodeIndexPositions(raw)
+	}) {
 		return nil
 	}
-	return decodeIndexPositions(raw)
+	return out
 }
 
 func (t *tableData) eachIndexPosition(indexName, key string, fn func(int) bool) {

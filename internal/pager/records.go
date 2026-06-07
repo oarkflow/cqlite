@@ -12,6 +12,7 @@ import (
 const (
 	recordHeaderMagic = "SQLTREC1"
 	recordPageMagic   = "SQLTROW1"
+	maxRecordPayload  = 256 << 20
 )
 
 type Record struct {
@@ -35,7 +36,10 @@ func (p *Pager) WriteRecords(records []Record) error {
 		}
 		nextPage += page.ID(used)
 	}
-	return p.Sync()
+	if err := p.Sync(); err != nil {
+		return err
+	}
+	return syncDirFromFile(p.path)
 }
 
 func (p *Pager) ReadRecords() ([]Record, error) {
@@ -117,6 +121,9 @@ func (p *Pager) readAllRecordPages() ([]page.Page, error) {
 		if err != nil {
 			return nil, err
 		}
+		if pg.ID != page.ID(off/p.pageSize+1) {
+			return nil, errors.New("page id mismatch")
+		}
 		pages = append(pages, pg)
 	}
 	return pages, nil
@@ -159,7 +166,7 @@ func (p *Pager) readRecordPayload(start page.ID) ([]byte, int, error) {
 		return nil, 0, errors.New("invalid record page")
 	}
 	size := int(binary.LittleEndian.Uint64(first.Data[8:16]))
-	if size < 0 {
+	if size < 0 || size > maxRecordPayload {
 		return nil, 0, errors.New("invalid record size")
 	}
 	chunkSize := p.pageSize - page.HeaderSize - 16
@@ -169,6 +176,13 @@ func (p *Pager) readRecordPayload(start page.ID) ([]byte, int, error) {
 	count := (size + chunkSize - 1) / chunkSize
 	if count == 0 {
 		count = 1
+	}
+	info, err := p.file.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	if int64(start+page.ID(count)-1)*int64(p.pageSize) > info.Size() {
+		return nil, 0, errors.New("invalid record overflow page")
 	}
 	out := make([]byte, 0, size)
 	for i := 0; i < count; i++ {
@@ -202,7 +216,7 @@ func readRecordPayloadFromPages(pages []page.Page, start page.ID, pageSize int) 
 		return nil, 0, errors.New("invalid record page")
 	}
 	size := int(binary.LittleEndian.Uint64(first.Data[8:16]))
-	if size < 0 {
+	if size < 0 || size > maxRecordPayload {
 		return nil, 0, errors.New("invalid record size")
 	}
 	chunkSize := pageSize - page.HeaderSize - 16
@@ -212,6 +226,9 @@ func readRecordPayloadFromPages(pages []page.Page, start page.ID, pageSize int) 
 	count := (size + chunkSize - 1) / chunkSize
 	if count == 0 {
 		count = 1
+	}
+	if firstIdx+count > len(pages) {
+		return nil, 0, errors.New("invalid record overflow page")
 	}
 	out := make([]byte, 0, size)
 	for i := 0; i < count; i++ {
