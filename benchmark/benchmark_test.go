@@ -1,4 +1,4 @@
-package db
+package benchmark
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	db "github.com/sujit/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -49,13 +51,13 @@ func BenchmarkSQLiteComparison(b *testing.B) {
 
 func BenchmarkSQLiteThroughputComparison(b *testing.B) {
 	b.Run("custom_fast/insert_autocommit", func(b *testing.B) {
-		benchCustomInsertAutocommitWithOptions(b, Options{SyncPolicy: SyncOff})
+		benchCustomInsertAutocommitWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	})
 	b.Run("mattn_fast/insert_autocommit", func(b *testing.B) {
 		benchMattnInsertAutocommitWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = OFF`)
 	})
 	b.Run("custom_fast/update_by_pk", func(b *testing.B) {
-		benchCustomUpdateByPKWithOptions(b, Options{SyncPolicy: SyncOff})
+		benchCustomUpdateByPKWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	})
 	b.Run("mattn_fast/update_by_pk", func(b *testing.B) {
 		benchMattnUpdateByPKWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = OFF`)
@@ -68,7 +70,7 @@ func benchCustomInsertTx(b *testing.B) {
 	mustCustomExec(b, d, `CREATE TABLE bench_insert_tx (id INTEGER PRIMARY KEY, name TEXT, score INTEGER, payload JSON)`)
 	b.ReportAllocs()
 	b.ResetTimer()
-	tx, err := d.Begin(ctx, TxOptions{})
+	tx, err := d.Begin(ctx, db.TxOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -109,10 +111,10 @@ func benchMattnInsertTx(b *testing.B) {
 }
 
 func benchCustomInsertAutocommit(b *testing.B) {
-	benchCustomInsertAutocommitWithOptions(b, Options{SyncPolicy: SyncFull})
+	benchCustomInsertAutocommitWithOptions(b, db.Options{SyncPolicy: db.SyncFull})
 }
 
-func benchCustomInsertAutocommitWithOptions(b *testing.B, opts Options) {
+func benchCustomInsertAutocommitWithOptions(b *testing.B, opts db.Options) {
 	ctx := context.Background()
 	d := openBenchCustomWithOptions(b, opts)
 	mustCustomExec(b, d, `CREATE TABLE bench_insert_auto (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`)
@@ -147,14 +149,14 @@ func benchMattnInsertAutocommitWithPragmas(b *testing.B, pragmas ...string) {
 
 func benchCustomInsertBatch(b *testing.B) {
 	ctx := context.Background()
-	d := openBenchCustomWithOptions(b, Options{SyncPolicy: SyncOff})
+	d := openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	mustCustomExec(b, d, `CREATE TABLE bench_insert_batch (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`)
 	const batchSize = 100
 	b.ReportAllocs()
 	b.ResetTimer()
 	nextID := int64(1)
 	for i := 0; i < b.N; i++ {
-		tx, err := d.Begin(ctx, TxOptions{})
+		tx, err := d.Begin(ctx, db.TxOptions{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -332,7 +334,7 @@ func benchMattnRangeScan(b *testing.B) {
 func benchCustomReopenRecovery(b *testing.B) {
 	ctx := context.Background()
 	dir := filepath.Join(b.TempDir(), "custom")
-	d, err := Open(dir, Options{SyncPolicy: SyncFull})
+	d, err := db.Open(dir, db.Options{SyncPolicy: db.SyncFull})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -346,7 +348,7 @@ func benchCustomReopenRecovery(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reopened, err := Open(dir, Options{SyncPolicy: SyncFull})
+		reopened, err := db.Open(dir, db.Options{SyncPolicy: db.SyncFull})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -397,7 +399,7 @@ func benchMattnReopenRecovery(b *testing.B) {
 
 func benchCustomLargePayload(b *testing.B) {
 	ctx := context.Background()
-	d := openBenchCustomWithOptions(b, Options{SyncPolicy: SyncOff})
+	d := openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	mustCustomExec(b, d, `CREATE TABLE large_payloads (id INTEGER PRIMARY KEY, body TEXT, raw BLOB, meta JSON)`)
 	body := strings.Repeat("text-", 2048)
 	raw := []byte(strings.Repeat("blob-", 2048))
@@ -433,7 +435,7 @@ func benchMattnLargePayload(b *testing.B) {
 
 func benchCustomConcurrentMixed(b *testing.B) {
 	ctx := context.Background()
-	d := seedCustomBenchWithOptions(b, benchRows, Options{SyncPolicy: SyncOff})
+	d := seedCustomBenchWithOptions(b, benchRows, db.Options{SyncPolicy: db.SyncOff})
 	var seq uint64
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -545,10 +547,10 @@ func benchMattnFullScan(b *testing.B) {
 }
 
 func benchCustomUpdateByPK(b *testing.B) {
-	benchCustomUpdateByPKWithOptions(b, Options{SyncPolicy: SyncFull})
+	benchCustomUpdateByPKWithOptions(b, db.Options{SyncPolicy: db.SyncFull})
 }
 
-func benchCustomUpdateByPKWithOptions(b *testing.B, opts Options) {
+func benchCustomUpdateByPKWithOptions(b *testing.B, opts db.Options) {
 	ctx := context.Background()
 	d := seedCustomBenchWithOptions(b, benchRows, opts)
 	b.ReportAllocs()
@@ -583,7 +585,7 @@ func benchMattnUpdateByPKWithPragmas(b *testing.B, pragmas ...string) {
 
 func benchCustomUpdateByIndex(b *testing.B) {
 	ctx := context.Background()
-	d := seedCustomBenchWithOptions(b, benchRows, Options{SyncPolicy: SyncOff})
+	d := seedCustomBenchWithOptions(b, benchRows, db.Options{SyncPolicy: db.SyncOff})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -612,9 +614,9 @@ func benchMattnUpdateByIndex(b *testing.B) {
 
 func benchCustomDeleteByPK(b *testing.B) {
 	ctx := context.Background()
-	d := openBenchCustomWithOptions(b, Options{SyncPolicy: SyncOff})
+	d := openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	mustCustomExec(b, d, `CREATE TABLE delete_pk_items (id INTEGER PRIMARY KEY, name TEXT)`)
-	tx, err := d.Begin(ctx, TxOptions{})
+	tx, err := d.Begin(ctx, db.TxOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -671,10 +673,10 @@ func benchMattnDeleteByPK(b *testing.B) {
 
 func benchCustomDeleteByIndex(b *testing.B) {
 	ctx := context.Background()
-	d := openBenchCustomWithOptions(b, Options{SyncPolicy: SyncOff})
+	d := openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
 	mustCustomExec(b, d, `CREATE TABLE delete_idx_items (id INTEGER PRIMARY KEY, name TEXT)`)
 	mustCustomExec(b, d, `CREATE INDEX delete_idx_items_name_idx ON delete_idx_items (name)`)
-	tx, err := d.Begin(ctx, TxOptions{})
+	tx, err := d.Begin(ctx, db.TxOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -773,18 +775,18 @@ func benchMattnJoinAggregate(b *testing.B) {
 	}
 }
 
-func seedCustomBench(b *testing.B, n int) *DB {
-	return seedCustomBenchWithOptions(b, n, Options{SyncPolicy: SyncFull})
+func seedCustomBench(b *testing.B, n int) *db.DB {
+	return seedCustomBenchWithOptions(b, n, db.Options{SyncPolicy: db.SyncFull})
 }
 
-func seedCustomBenchWithOptions(b *testing.B, n int, opts Options) *DB {
+func seedCustomBenchWithOptions(b *testing.B, n int, opts db.Options) *db.DB {
 	b.Helper()
 	ctx := context.Background()
 	d := openBenchCustomWithOptions(b, opts)
 	mustCustomExec(b, d, `CREATE TABLE groups (id INTEGER PRIMARY KEY, name TEXT)`)
 	mustCustomExec(b, d, `CREATE TABLE items (id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT, score INTEGER, payload JSON)`)
 	mustCustomExec(b, d, `CREATE INDEX items_name_idx ON items (name)`)
-	tx, err := d.Begin(ctx, TxOptions{})
+	tx, err := d.Begin(ctx, db.TxOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -844,13 +846,13 @@ func seedMattnBenchWithPragmas(b *testing.B, n int, pragmas ...string) *sql.DB {
 	return d
 }
 
-func openBenchCustom(b *testing.B) *DB {
-	return openBenchCustomWithOptions(b, Options{SyncPolicy: SyncFull})
+func openBenchCustom(b *testing.B) *db.DB {
+	return openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncFull})
 }
 
-func openBenchCustomWithOptions(b *testing.B, opts Options) *DB {
+func openBenchCustomWithOptions(b *testing.B, opts db.Options) *db.DB {
 	b.Helper()
-	d, err := Open(filepath.Join(b.TempDir(), "custom"), opts)
+	d, err := db.Open(filepath.Join(b.TempDir(), "custom"), opts)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -882,7 +884,7 @@ func openBenchMattnWithPragmas(b *testing.B, pragmas ...string) *sql.DB {
 	return d
 }
 
-func mustCustomExec(b *testing.B, d *DB, query string, args ...any) {
+func mustCustomExec(b *testing.B, d *db.DB, query string, args ...any) {
 	b.Helper()
 	if _, err := d.Exec(context.Background(), query, args...); err != nil {
 		b.Fatalf("custom exec %q: %v", query, err)

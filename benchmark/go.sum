@@ -1,0 +1,4 @@
+github.com/mattn/go-sqlite3 v1.14.44 h1:3VSe+xafpbzsLbdr2AWlAZk9yRHiBhTBakioXaCKTF8=
+github.com/mattn/go-sqlite3 v1.14.44/go.mod h1:pjEuOr8IwzLJP2MfGeTb0A35jauH+C2kbHKBr7yXKVQ=
+github.com/oarkflow/sqlparser v0.0.2 h1:Hzo1ZSspq+qa3klcKT9FaKnmL8lycyEJbjtP+TqSWwo=
+github.com/oarkflow/sqlparser v0.0.2/go.mod h1:n/XfCliU3AyA+fbCxiy434dBwwnQklmeFEeWPJTZNx0=
