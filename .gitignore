@@ -3,3 +3,5 @@ bin/
 data/
 sqlite-cli
 sqlited
+*.test
+*.prof

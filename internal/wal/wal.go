@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -33,9 +34,10 @@ type Record struct {
 }
 
 type Log struct {
-	mu   sync.Mutex
-	path string
-	file *os.File
+	mu      sync.Mutex
+	path    string
+	file    *os.File
+	written int64
 }
 
 func Open(path string) (*Log, error) {
@@ -46,6 +48,24 @@ func Open(path string) (*Log, error) {
 	return &Log{path: path, file: f}, nil
 }
 
+func (l *Log) Written() int64 {
+	return atomic.LoadInt64(&l.written)
+}
+
+var ieeeTable *crc32.Table
+
+func init() {
+	ieeeTable = crc32.MakeTable(crc32.IEEE)
+}
+
+func crc32IEEE(data []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		crc = ieeeTable[byte(crc)^b] ^ (crc >> 8)
+	}
+	return ^crc
+}
+
 func (l *Log) Append(rec Record, sync bool) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -53,12 +73,20 @@ func (l *Log) Append(rec Record, sync bool) error {
 	header[0] = byte(rec.Type)
 	binary.LittleEndian.PutUint64(header[1:9], rec.TxID)
 	binary.LittleEndian.PutUint64(header[9:17], uint64(len(rec.Data)))
-	sum := crc32.Update(0, crcTable, header[:17])
-	sum = crc32.Update(sum, crcTable, rec.Data)
+	var sum uint32 = ^uint32(0)
+	for _, b := range header[:17] {
+		sum = ieeeTable[byte(sum)^b] ^ (sum >> 8)
+	}
+	for _, b := range rec.Data {
+		sum = ieeeTable[byte(sum)^b] ^ (sum >> 8)
+	}
+	sum = ^sum
 	binary.LittleEndian.PutUint32(header[17:21], sum)
+	total := 21 + len(rec.Data)
 	if err := l.writeRecord(header[:], rec.Data); err != nil {
 		return err
 	}
+	atomic.AddInt64(&l.written, int64(total))
 	if sync {
 		return syncFile(l.file)
 	}

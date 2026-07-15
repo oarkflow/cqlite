@@ -538,7 +538,7 @@ func (t *tableData) addRowIDPosition(rowid int64, pos int) {
 	if t.rowids == nil {
 		t.rowids = btree.New()
 	}
-	t.rowids.Put(encodeInt64Key(rowid), encodeIntPosition(pos))
+	t.rowids.PutOwned(encodeInt64Key(rowid), encodeIntPosition(pos))
 }
 
 func (t *tableData) lookupRowID(rowid int64) (int, bool) {

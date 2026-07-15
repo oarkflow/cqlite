@@ -298,7 +298,14 @@ func canFastPositionedInsert(s *persistedState, t *catalog.Table) bool {
 }
 
 func fastInsertPositioned(s *persistedState, t *catalog.Table, data *tableData, args []any) (Result, bool, error) {
-	pos := make([]any, len(t.Columns))
+	ncols := len(t.Columns)
+	var stackPos [16]any
+	var pos []any
+	if ncols <= len(stackPos) {
+		pos = stackPos[:ncols]
+	} else {
+		pos = make([]any, ncols)
+	}
 	rowid := t.NextRowID
 	pkName := integerPrimaryKeyColumn(t)
 	pkIndex := -1
@@ -4722,10 +4729,19 @@ func applyAffinity(col catalog.Column, v any) any {
 	}
 	switch col.Type {
 	case catalog.Integer:
+		if _, ok := v.(int64); ok {
+			return v
+		}
+		if _, ok := v.(int); ok {
+			return v
+		}
 		if i, ok := asInt(v); ok {
 			return i
 		}
 	case catalog.Real:
+		if _, ok := v.(float64); ok {
+			return v
+		}
 		if f, ok := asFloat(v); ok {
 			return f
 		}
@@ -4739,6 +4755,12 @@ func applyAffinity(col catalog.Column, v any) any {
 			return fmt.Sprint(v)
 		}
 	case catalog.Numeric:
+		if _, ok := v.(int64); ok {
+			return v
+		}
+		if _, ok := v.(float64); ok {
+			return v
+		}
 		if i, ok := asInt(v); ok {
 			return i
 		}

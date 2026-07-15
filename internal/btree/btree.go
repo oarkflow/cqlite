@@ -48,6 +48,17 @@ func (t *Tree) Put(key, value []byte) {
 	}
 }
 
+func (t *Tree) PutOwned(key, value []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if res := t.insert(t.root, key, value); res != nil {
+		t.root = &node{
+			keys:     [][]byte{res.key},
+			children: []*node{t.root, res.right},
+		}
+	}
+}
+
 func (t *Tree) Get(key []byte) ([]byte, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -206,7 +217,20 @@ func (t *Tree) entriesLocked() []entry {
 }
 
 func searchKeys(keys [][]byte, key []byte) (int, bool) {
-	lo, hi := 0, len(keys)
+	n := len(keys)
+	if n <= 16 {
+		for i, k := range keys {
+			cmp := bytes.Compare(k, key)
+			if cmp == 0 {
+				return i, true
+			}
+			if cmp > 0 {
+				return i, false
+			}
+		}
+		return n, false
+	}
+	lo, hi := 0, n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		cmp := bytes.Compare(keys[mid], key)
@@ -242,10 +266,12 @@ func insertChild(in []*node, pos int, value *node) []*node {
 }
 
 func cloneKeys(in [][]byte) [][]byte {
-	out := make([][]byte, len(in))
-	for i := range in {
-		out[i] = clone(in[i])
+	n := len(in)
+	if n == 0 {
+		return nil
 	}
+	out := make([][]byte, n)
+	copy(out, in)
 	return out
 }
 
@@ -253,5 +279,11 @@ func clone(in []byte) []byte {
 	if in == nil {
 		return nil
 	}
-	return append([]byte(nil), in...)
+	l := len(in)
+	if l == 0 {
+		return []byte{}
+	}
+	out := make([]byte, l)
+	copy(out, in)
+	return out
 }

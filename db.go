@@ -624,6 +624,7 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		} else {
 			rollback.restore()
 		}
+		rollback.release()
 		return Result{}, true, err
 	}
 	if !fast {
@@ -632,6 +633,7 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		} else {
 			rollback.restore()
 		}
+		rollback.release()
 		return Result{}, false, nil
 	}
 	if err := d.markDirty(); err != nil {
@@ -640,6 +642,7 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		} else {
 			rollback.restore()
 		}
+		rollback.release()
 		return Result{}, true, err
 	}
 	if err := d.appendLogical(next, query, args); err != nil {
@@ -648,8 +651,10 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		} else {
 			rollback.restore()
 		}
+		rollback.release()
 		return Result{}, true, err
 	}
+	rollback.release()
 	d.applied = next
 	if err := d.maybeCheckpointLocked(context.Background()); err != nil {
 		return Result{}, true, err
@@ -668,7 +673,7 @@ type simpleDirectRollback struct {
 type tableRollback struct {
 	exists       bool
 	rowsLen      int
-	pending      []rowVersion
+	pendingLen   int
 	pendingRowID map[int64]struct{}
 	pendingLast  int64
 	pendingAsc   bool
@@ -688,13 +693,27 @@ type rowRollback struct {
 	row   rowVersion
 }
 
+var rollbackPool = sync.Pool{
+	New: func() interface{} {
+		return &simpleDirectRollback{
+			tables:  make(map[string]tableRollback),
+			seenRow: make(map[string]map[int]struct{}),
+		}
+	},
+}
+
 func newSimpleDirectRollback(state *persistedState) *simpleDirectRollback {
-	return &simpleDirectRollback{
-		state:   state,
-		nextTx:  state.NextTx,
-		tables:  make(map[string]tableRollback),
-		seenRow: make(map[string]map[int]struct{}),
+	r := rollbackPool.Get().(*simpleDirectRollback)
+	r.state = state
+	r.nextTx = state.NextTx
+	r.changes = r.changes[:0]
+	for k := range r.tables {
+		delete(r.tables, k)
 	}
+	for k := range r.seenRow {
+		delete(r.seenRow, k)
+	}
+	return r
 }
 
 func (r *simpleDirectRollback) snapshotAllTables() {
@@ -726,9 +745,7 @@ func (r *simpleDirectRollback) snapshotTable(name string) {
 	}
 	snap.exists = true
 	snap.rowsLen = len(data.Rows)
-	if len(data.Pending) > 0 {
-		snap.pending = append([]rowVersion(nil), data.Pending...)
-	}
+	snap.pendingLen = len(data.Pending)
 	if len(data.pendingRowID) > 0 {
 		snap.pendingRowID = make(map[int64]struct{}, len(data.pendingRowID))
 		for rowid := range data.pendingRowID {
@@ -792,7 +809,11 @@ func (r *simpleDirectRollback) restore() {
 		if len(data.Rows) > snap.rowsLen {
 			data.Rows = data.Rows[:snap.rowsLen]
 		}
-		data.Pending = snap.pending
+		if len(data.Pending) > snap.pendingLen {
+			data.Pending = data.Pending[:snap.pendingLen]
+		} else {
+			data.Pending = nil
+		}
 		data.pendingRowID = snap.pendingRowID
 		data.pendingLast = snap.pendingLast
 		data.pendingAsc = snap.pendingAsc
@@ -820,13 +841,30 @@ func (r *simpleDirectRollback) restore() {
 	}
 }
 
+func (r *simpleDirectRollback) release() {
+	if r == nil {
+		return
+	}
+	r.state = nil
+	r.changes = r.changes[:0]
+	for k := range r.tables {
+		delete(r.tables, k)
+	}
+	for k := range r.seenRow {
+		delete(r.seenRow, k)
+	}
+	rollbackPool.Put(r)
+}
+
 func (d *DB) appendLogical(txid uint64, query string, args []any) error {
 	return d.appendLogicalState(txid, &d.state, query, args)
 }
 
 func (d *DB) appendLogicalState(txid uint64, state *persistedState, query string, args []any) error {
 	if data, ok := encodeSimpleWAL(query, args); ok {
-		return d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
+		err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
+		releaseWALBuf(&data)
+		return err
 	}
 	data, err := encodeStateWAL(state)
 	if err != nil {
@@ -958,6 +996,13 @@ func decodeStateWAL(data []byte) (persistedState, bool, error) {
 	return state, true, nil
 }
 
+var walBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 128)
+		return &b
+	},
+}
+
 func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
 	plan, ok := simplePlan(query)
 	if !ok || plan.params != len(args) || len(args) > math.MaxUint16 {
@@ -967,7 +1012,23 @@ func encodeSimpleWAL(query string, args []any) ([]byte, bool) {
 }
 
 func encodeSimpleWALPlan(plan simpleDMLPlan, args []any) ([]byte, bool) {
-	return appendSimpleWALPlan(make([]byte, 0, 64+len(args)*16), plan, args)
+	bp := walBufPool.Get().(*[]byte)
+	*bp = (*bp)[:0]
+	data, ok := appendSimpleWALPlan(*bp, plan, args)
+	if !ok {
+		walBufPool.Put(bp)
+		return nil, false
+	}
+	return data, true
+}
+
+func releaseWALBuf(data *[]byte) {
+	if data == nil {
+		return
+	}
+	if cap(*data) < 256 {
+		walBufPool.Put(data)
+	}
 }
 
 func appendSimpleWALPlan(data []byte, plan simpleDMLPlan, args []any) ([]byte, bool) {
@@ -1898,11 +1959,7 @@ func (d *DB) maybeCheckpointLocked(ctx context.Context) error {
 		return d.checkpointLocked(ctx)
 	}
 	if d.opts.CheckpointIntervalBytes > 0 {
-		info, err := os.Stat(filepath.Join(d.path, "db.wal"))
-		if err != nil {
-			return err
-		}
-		if info.Size() >= d.opts.CheckpointIntervalBytes {
+		if d.wal.Written() >= d.opts.CheckpointIntervalBytes {
 			return d.checkpointLocked(ctx)
 		}
 	}

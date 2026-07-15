@@ -38,10 +38,10 @@ func Encode(p Page, size int) ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[8:16], p.LSN)
 	binary.LittleEndian.PutUint32(buf[20:24], uint32(len(p.Data)))
 	copy(buf[HeaderSize:], p.Data)
-	check := make([]byte, 0, len(buf)-8)
-	check = append(check, buf[8:16]...)
-	check = append(check, buf[20:]...)
-	sum := crc32.ChecksumIEEE(check)
+	h := crc32.NewIEEE()
+	h.Write(buf[8:16])
+	h.Write(buf[20:])
+	sum := h.Sum32()
 	binary.LittleEndian.PutUint32(buf[16:20], sum)
 	return buf, nil
 }
@@ -51,10 +51,10 @@ func Decode(buf []byte) (Page, error) {
 		return Page{}, errors.New("page buffer too small")
 	}
 	want := binary.LittleEndian.Uint32(buf[16:20])
-	check := make([]byte, 0, len(buf)-8)
-	check = append(check, buf[8:16]...)
-	check = append(check, buf[20:]...)
-	got := crc32.ChecksumIEEE(check)
+	h := crc32.NewIEEE()
+	h.Write(buf[8:16])
+	h.Write(buf[20:])
+	got := h.Sum32()
 	if got != want {
 		return Page{}, errors.New("page checksum mismatch")
 	}
