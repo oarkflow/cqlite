@@ -1,10 +1,10 @@
-package db
+package cqlite
 
 import (
 	"bytes"
 	"testing"
 
-	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/catalog"
 )
 
 func TestRowCodecRoundTrip(t *testing.T) {

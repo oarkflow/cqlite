@@ -1,10 +1,10 @@
-package db
+package cqlite
 
 import (
 	"time"
 
-	isql "github.com/oarkflow/sqlite/internal/sql"
-	"github.com/oarkflow/sqlite/internal/txn"
+	isql "github.com/oarkflow/cqlite/internal/sql"
+	"github.com/oarkflow/cqlite/internal/txn"
 )
 
 type SyncPolicy string

@@ -1,7 +1,7 @@
 EXTENSION_ID := sujit.cqlite-tools-0.1.0
 EXTENSION_SRC := vscode-extension
 EXTENSION_DIR ?= $(HOME)/.vscode/extensions/$(EXTENSION_ID)
-BRIDGE_BIN := bin/sqlite-vscode-bridge
+BRIDGE_BIN := bin/cqlite-vscode-bridge
 CODE ?= code
 VSCODE_APP ?= Visual Studio Code
 GOCACHE ?= $(CURDIR)/.gocache
@@ -19,7 +19,7 @@ help:
 
 build-bridge:
 	@mkdir -p bin
-	GOCACHE="$(GOCACHE)" go build -o $(BRIDGE_BIN) ./cmd/sqlite-vscode-bridge
+	GOCACHE="$(GOCACHE)" go build -o $(BRIDGE_BIN) ./cmd/cqlite-vscode-bridge
 
 install-extension:
 	@mkdir -p "$(EXTENSION_DIR)"
@@ -44,7 +44,7 @@ reload-vscode:
 install-and-reload: install-extension reload-vscode
 
 test-extension:
-	GOCACHE="$(GOCACHE)" go test ./cmd/sqlite-vscode-bridge
+	GOCACHE="$(GOCACHE)" go test ./cmd/cqlite-vscode-bridge
 	node --check vscode-extension/src/extension.js
 	node -e "JSON.parse(require('fs').readFileSync('vscode-extension/package.json','utf8')); console.log('package ok')"
 

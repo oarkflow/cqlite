@@ -8,18 +8,19 @@ import (
 	"os"
 	"path/filepath"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 func main() {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "sqlite-quickstart-")
+	dir := "./data/"
+	err := os.MkdirAll(dir, 0755)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	// defer os.RemoveAll(dir)
 
-	db, err := sqlite.Open(filepath.Join(dir, "app.db"), sqlite.Options{})
+	db, err := cqlite.Open(filepath.Join(dir, "app.db"), cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -36,11 +37,11 @@ func main() {
 		log.Fatal(err)
 	}
 	if _, err := db.Exec(ctx, `INSERT INTO users(name, email) VALUES (:name, :email)`,
-		sqlite.Named("name", "Grace"), sqlite.Named("email", "grace@example.test")); err != nil {
+		cqlite.Named("name", "Grace"), cqlite.Named("email", "grace@example.test")); err != nil {
 		log.Fatal(err)
 	}
 
-	rows, err := db.Query(ctx, `SELECT id, name, email FROM users WHERE name <> :skip ORDER BY id`, sqlite.Named("skip", "Nobody"))
+	rows, err := db.Query(ctx, `SELECT id, name, email FROM users WHERE name <> :skip ORDER BY id`, cqlite.Named("skip", "Nobody"))
 	if err != nil {
 		log.Fatal(err)
 	}

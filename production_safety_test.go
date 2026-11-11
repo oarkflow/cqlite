@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"os"
@@ -16,10 +16,10 @@ func TestNoBenchmarkShapedRuntimeShortcuts(t *testing.T) {
 		"items set score",
 	}
 	allowed := map[string]bool{
-		"benchmark_test.go":                    true,
-		"production_safety_test.go":            true,
-		"crash_data_test.go":                   true,
-		"Tasks.md":                             true,
+		"benchmark_test.go":         true,
+		"production_safety_test.go": true,
+		"crash_data_test.go":        true,
+		"Tasks.md":                  true,
 	}
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {

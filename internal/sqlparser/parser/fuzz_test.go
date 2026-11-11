@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	sqlparser "github.com/oarkflow/sqlite/internal/sqlparser"
+	sqlparser "github.com/oarkflow/cqlite/internal/sqlparser"
 )
 
 // FuzzParser tests the parser with random input to ensure it never panics.

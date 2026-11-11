@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	catalog "github.com/oarkflow/sqlite/internal/catalog"
+	catalog "github.com/oarkflow/cqlite/internal/catalog"
 )
 
 func init() {

@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/oarkflow/sqlite/internal/page"
+	"github.com/oarkflow/cqlite/internal/page"
 )
 
 type Pager struct {

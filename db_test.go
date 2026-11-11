@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"context"
@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oarkflow/sqlite/internal/page"
-	"github.com/oarkflow/sqlite/internal/pager"
-	"github.com/oarkflow/sqlite/internal/wal"
+	"github.com/oarkflow/cqlite/internal/page"
+	"github.com/oarkflow/cqlite/internal/pager"
+	"github.com/oarkflow/cqlite/internal/wal"
 )
 
 func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {

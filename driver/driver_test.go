@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	db "github.com/oarkflow/sqlite"
+	db "github.com/oarkflow/cqlite"
 )
 
 type driverTextValue string

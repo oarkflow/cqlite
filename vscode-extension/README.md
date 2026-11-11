@@ -1,10 +1,10 @@
 # cQlite Tools
 
-VS Code extension for `github.com/oarkflow/sqlite` databases.
+VS Code extension for `github.com/oarkflow/cqlite` databases.
 
 ## Features
 
-- Open a custom SQLite database file such as `complex_embedded.db`.
+- Open a cQlite database file such as `complex_embedded.db`.
 - Browse tables, views, columns, primary keys, nullability, and indexes.
 - Run the selected SQL or the whole active editor.
 - Preview the selected table/view immediately from the database editor toolbar.
@@ -28,7 +28,7 @@ make test-extension
 2. Open `vscode-extension/` as the extension development folder, or use an Extension Development Host with this folder.
 3. Keep the default settings:
    - `cQlite.bridgeCommand`: `go`
-   - `cQlite.bridgeArgs`: `["run", "./cmd/sqlite-vscode-bridge"]`
+   - `cQlite.bridgeArgs`: `["run", "./cmd/cqlite-vscode-bridge"]`
 4. Run `cQlite: Open Database` and choose a `.db` file, for example:
    - `examples/complex_queries/data/complex_embedded.db`
    - `examples/complex_queries/data/complex_driver.db`

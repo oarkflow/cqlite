@@ -16,9 +16,9 @@
 package sqlparser
 
 import (
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
-	"github.com/oarkflow/sqlite/internal/sqlparser/parser"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/cqlite/internal/sqlparser/parser"
 )
 
 // Re-export core types so callers only import this package.

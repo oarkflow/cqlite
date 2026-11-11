@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"fmt"
@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/oarkflow/sqlite/internal/catalog"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/cqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 // windowCall is one window function invocation found in a select list, bound to

@@ -1,7 +1,7 @@
 {
 	"name": "cqlite-tools",
 	"displayName": "cQlite Tools",
-	"description": "Viewer, schema explorer, and query runner for github.com/oarkflow/sqlite databases.",
+	"description": "Viewer, schema explorer, and query runner for github.com/oarkflow/cqlite databases.",
 	"version": "0.1.0",
 	"publisher": "sujit",
 	"engines": {
@@ -28,18 +28,18 @@
 				"cQlite.database": {
 					"type": "string",
 					"default": "",
-					"description": "Path to a github.com/oarkflow/sqlite database file or directory."
+					"description": "Path to a github.com/oarkflow/cqlite database file or directory."
 				},
 				"cQlite.bridgeCommand": {
 					"type": "string",
 					"default": "go",
-					"description": "Command used to launch the SQLite bridge."
+					"description": "Command used to launch the cQlite bridge."
 				},
 				"cQlite.bridgeArgs": {
 					"type": "array",
 					"default": [
 						"run",
-						"./cmd/sqlite-vscode-bridge"
+						"./cmd/cqlite-vscode-bridge"
 					],
 					"items": {
 						"type": "string"

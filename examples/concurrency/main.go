@@ -7,12 +7,12 @@ import (
 	"log"
 	"sync"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 func main() {
 	ctx := context.Background()
-	db, err := sqlite.Open(":memory:", sqlite.Options{})
+	db, err := cqlite.Open(":memory:", cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func main() {
 			<-start
 			for n := 0; n < perWriter; n++ {
 				id := int64(writer*perWriter + n + 1)
-				if _, err := db.Exec(ctx, `INSERT INTO events VALUES (:id, :message)`, sqlite.Named("id", id), sqlite.Named("message", fmt.Sprintf("writer-%d item-%d", writer, n))); err != nil {
+				if _, err := db.Exec(ctx, `INSERT INTO events VALUES (:id, :message)`, cqlite.Named("id", id), cqlite.Named("message", fmt.Sprintf("writer-%d item-%d", writer, n))); err != nil {
 					errs <- err
 					return
 				}

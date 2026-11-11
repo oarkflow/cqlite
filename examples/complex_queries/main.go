@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	sqlite "github.com/oarkflow/sqlite"
-	_ "github.com/oarkflow/sqlite/driver"
+	cqlite "github.com/oarkflow/cqlite"
+	_ "github.com/oarkflow/cqlite/driver"
 )
 
 type orderRow struct {
@@ -42,7 +42,7 @@ func main() {
 }
 
 func embeddedExample(ctx context.Context, path string) error {
-	db, err := sqlite.Open(path, sqlite.Options{SyncPolicy: sqlite.SyncOff})
+	db, err := cqlite.Open(path, cqlite.Options{SyncPolicy: cqlite.SyncOff})
 	if err != nil {
 		return err
 	}
@@ -70,7 +70,7 @@ func embeddedExample(ctx context.Context, path string) error {
 	if _, err := db.Exec(ctx,
 		`INSERT INTO orders (id, account_id, status, total, created_at, metadata)
 		 VALUES :row`,
-		sqlite.Named("row", firstOrder),
+		cqlite.Named("row", firstOrder),
 	); err != nil {
 		return err
 	}
@@ -140,7 +140,7 @@ func embeddedExample(ctx context.Context, path string) error {
 	); err != nil {
 		return err
 	}
-	rows, err = db.Query(ctx, `SELECT id, status, total FROM orders WHERE id = $id`, sqlite.Named("id", int64(3)))
+	rows, err = db.Query(ctx, `SELECT id, status, total FROM orders WHERE id = $id`, cqlite.Named("id", int64(3)))
 	if err != nil {
 		return err
 	}
@@ -164,7 +164,7 @@ func embeddedExample(ctx context.Context, path string) error {
 		 GROUP BY accounts.name
 		 HAVING sum(orders.total) >= ?
 		 ORDER BY accounts.name`,
-		sqlite.Named("account_id", int64(101)),
+		cqlite.Named("account_id", int64(101)),
 		10.0,
 		20.0,
 	)
@@ -175,8 +175,8 @@ func embeddedExample(ctx context.Context, path string) error {
 
 	rows, err = db.Query(ctx,
 		`EXPLAIN QUERY PLAN SELECT id FROM orders WHERE account_id = :account_id AND status = @status`,
-		sqlite.Named("account_id", int64(101)),
-		sqlite.Named("status", "review"),
+		cqlite.Named("account_id", int64(101)),
+		cqlite.Named("status", "review"),
 	)
 	if err != nil {
 		return err
@@ -239,7 +239,7 @@ var schemaStatements = []string{
 	`CREATE INDEX idx_orders_account_status_param ON orders (account_id, status)`,
 }
 
-func createSchema(ctx context.Context, db *sqlite.DB) error {
+func createSchema(ctx context.Context, db *cqlite.DB) error {
 	for _, stmt := range schemaStatements {
 		if _, err := db.Exec(ctx, stmt); err != nil {
 			return err
@@ -248,7 +248,7 @@ func createSchema(ctx context.Context, db *sqlite.DB) error {
 	return nil
 }
 
-func resetEmbeddedSeed(ctx context.Context, db *sqlite.DB) error {
+func resetEmbeddedSeed(ctx context.Context, db *cqlite.DB) error {
 	for _, stmt := range []string{
 		`DELETE FROM orders`,
 		`DELETE FROM account_settings`,
@@ -276,23 +276,23 @@ func resetDriverSeed(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func insertRows(ctx context.Context, db *sqlite.DB, rows []orderRow) error {
+func insertRows(ctx context.Context, db *cqlite.DB, rows []orderRow) error {
 	_, err := db.Exec(ctx,
 		`INSERT INTO orders (id, account_id, status, total, created_at, metadata) VALUES :rows`,
-		sqlite.Named("rows", rows),
+		cqlite.Named("rows", rows),
 	)
 	return err
 }
 
-func upsertSettings(ctx context.Context, db *sqlite.DB, accountID, retentionDays int64, actor string) error {
+func upsertSettings(ctx context.Context, db *cqlite.DB, accountID, retentionDays int64, actor string) error {
 	res, err := db.Exec(ctx,
 		`UPDATE account_settings
 		 SET retention_days = :retention_days,
 		     updated_by = @actor
 		 WHERE account_id = :account_id`,
-		sqlite.Named("retention_days", retentionDays),
-		sqlite.Named("actor", actor),
-		sqlite.Named("account_id", accountID),
+		cqlite.Named("retention_days", retentionDays),
+		cqlite.Named("actor", actor),
+		cqlite.Named("account_id", accountID),
 	)
 	if err != nil {
 		return err
@@ -303,14 +303,14 @@ func upsertSettings(ctx context.Context, db *sqlite.DB, accountID, retentionDays
 	_, err = db.Exec(ctx,
 		`INSERT INTO account_settings (account_id, retention_days, updated_by)
 		 VALUES (:account_id, :retention_days, @actor)`,
-		sqlite.Named("account_id", accountID),
-		sqlite.Named("retention_days", retentionDays),
-		sqlite.Named("actor", actor),
+		cqlite.Named("account_id", accountID),
+		cqlite.Named("retention_days", retentionDays),
+		cqlite.Named("actor", actor),
 	)
 	return err
 }
 
-func printRows(title string, rows *sqlite.Rows) {
+func printRows(title string, rows *cqlite.Rows) {
 	fmt.Println(title)
 	fmt.Println("  columns:", strings.Join(rows.Columns, ", "))
 	for {

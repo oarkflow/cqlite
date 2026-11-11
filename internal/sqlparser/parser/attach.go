@@ -1,8 +1,8 @@
 package parser
 
 import (
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 // parseAttach parses ATTACH [DATABASE] expr AS schema-name. ATTACH is not a

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/oarkflow/sqlite/internal/page"
+	"github.com/oarkflow/cqlite/internal/page"
 )
 
 const (

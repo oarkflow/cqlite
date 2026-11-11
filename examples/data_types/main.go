@@ -8,7 +8,7 @@ import (
 	"log"
 	"time"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 type Profile struct {
@@ -18,7 +18,7 @@ type Profile struct {
 
 func main() {
 	ctx := context.Background()
-	db, err := sqlite.Open(":memory:", sqlite.Options{})
+	db, err := cqlite.Open(":memory:", cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func main() {
 	}
 
 	profile := Profile{Nickname: "ada", Active: true}
-	if _, err := db.Exec(ctx, `INSERT INTO profiles (nickname, active) VALUES :profile`, sqlite.Named("profile", profile)); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO profiles (nickname, active) VALUES :profile`, cqlite.Named("profile", profile)); err != nil {
 		log.Fatal(err)
 	}
 	metadata, err := json.Marshal(profile)

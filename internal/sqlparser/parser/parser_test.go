@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	sqlparser "github.com/oarkflow/sqlite/internal/sqlparser"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	sqlparser "github.com/oarkflow/cqlite/internal/sqlparser"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 // ---- helpers ----

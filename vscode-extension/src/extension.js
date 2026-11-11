@@ -1340,11 +1340,11 @@ function bridge(args, options) {
 }
 
 function resolveBridgeCommand(cfg, cwd) {
-  const defaultArgs = ['run', './cmd/sqlite-vscode-bridge'];
+  const defaultArgs = ['run', './cmd/cqlite-vscode-bridge'];
   const configuredCommand = cfg.get('bridgeCommand', 'go');
   const configuredArgs = cfg.get('bridgeArgs', defaultArgs);
   if (configuredCommand === 'go' && sameStringList(configuredArgs, defaultArgs)) {
-    const binary = path.join(cwd, 'bin', process.platform === 'win32' ? 'sqlite-vscode-bridge.exe' : 'sqlite-vscode-bridge');
+    const binary = path.join(cwd, 'bin', process.platform === 'win32' ? 'cqlite-vscode-bridge.exe' : 'cqlite-vscode-bridge');
     if (fs.existsSync(binary)) {
       return { command: binary, prefixArgs: [] };
     }

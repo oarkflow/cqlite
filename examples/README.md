@@ -1,4 +1,4 @@
-# Custom SQLite examples
+# cQlite examples
 
 Runnable Go examples for the embedded engine and its `database/sql` driver.
 Run commands from the repository root with Go 1.26 or newer:
@@ -40,23 +40,23 @@ persistent application schema and stores its demo files in
 The embedded API accepts a context and variadic bind arguments:
 
 ```go
-db, err := sqlite.Open("app.db", sqlite.Options{})
+db, err := cqlite.Open("app.db", cqlite.Options{})
 if err != nil { return err }
 defer db.Close()
 
 _, err = db.Exec(ctx, `INSERT INTO users(name) VALUES (:name)`,
-    sqlite.Named("name", "Ada"))
+    cqlite.Named("name", "Ada"))
 if err != nil { return err }
 rows, err := db.Query(ctx, `SELECT id, name FROM users WHERE id = ?`, 1)
 ```
 
 Use `?` for positional arguments and `:name`, `@name`, or `$name` for named
-arguments. The embedded API accepts `sqlite.Named`, maps, and structs. The
+arguments. The embedded API accepts `cqlite.Named`, maps, and structs. The
 `database/sql` driver accepts the standard `sql.Named` arguments.
 
 ## Durability and file layout
 
-`sqlite.Open(path, sqlite.Options{})` uses FULL synchronization by default.
+`cqlite.Open(path, cqlite.Options{})` uses FULL synchronization by default.
 Choose `SyncNormal` or `SyncOff` only when their durability/performance tradeoff
 fits the application. `:memory:` and an empty path create private temporary
 databases that are removed on close. File-backed databases recover committed

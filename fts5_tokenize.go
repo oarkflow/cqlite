@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"strings"
@@ -93,7 +93,7 @@ func (u unicode61Tokenizer) QueryToken(term string) string {
 // and "ascii" tokenizers.
 type asciiTokenizer struct{}
 
-func (asciiTokenizer) Name() string      { return "ascii" }
+func (asciiTokenizer) Name() string { return "ascii" }
 func (asciiTokenizer) QueryToken(t string) string {
 	return strings.ToLower(t)
 }
@@ -108,8 +108,8 @@ func (asciiTokenizer) Tokenize(text string) []Token {
 // substring LIKE/GLOB-style matching possible through FTS5.
 type trigramTokenizer struct{}
 
-func (trigramTokenizer) Name() string                 { return "trigram" }
-func (trigramTokenizer) QueryToken(t string) string    { return strings.ToLower(t) }
+func (trigramTokenizer) Name() string               { return "trigram" }
+func (trigramTokenizer) QueryToken(t string) string { return strings.ToLower(t) }
 
 func (trigramTokenizer) Tokenize(text string) []Token {
 	lower := strings.ToLower(text)

@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"bytes"
@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	catalog "github.com/oarkflow/sqlite/internal/catalog"
-	isql "github.com/oarkflow/sqlite/internal/sql"
+	catalog "github.com/oarkflow/cqlite/internal/catalog"
+	isql "github.com/oarkflow/cqlite/internal/sql"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
 )
 
 // cteMaterial is a fully materialized common table expression.

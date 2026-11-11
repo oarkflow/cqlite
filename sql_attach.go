@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"context"
@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	catalog "github.com/oarkflow/sqlite/internal/catalog"
-	"github.com/oarkflow/sqlite/internal/sqlparser"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	catalog "github.com/oarkflow/cqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/sqlparser"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
 )
 
 // attachedDB is a database opened by ATTACH. Each attached file is a real,

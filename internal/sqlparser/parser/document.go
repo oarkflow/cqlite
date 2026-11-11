@@ -3,8 +3,8 @@ package parser
 import (
 	"unsafe"
 
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 // Document is a lossless parse result. Source and Tokens preserve the exact

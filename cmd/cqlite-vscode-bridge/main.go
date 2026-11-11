@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 type response struct {
@@ -103,7 +103,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		write(response{OK: false, Error: err.Error(), Database: dbPath})
 		os.Exit(1)
@@ -161,7 +161,7 @@ func main() {
 	write(res)
 }
 
-func schema(ctx context.Context, database *sqlite.DB, dbPath string) (response, error) {
+func schema(ctx context.Context, database *cqlite.DB, dbPath string) (response, error) {
 	rows, err := database.Query(ctx, `SELECT type, name, sql FROM sqlite_schema`)
 	if err != nil {
 		return response{}, err
@@ -197,7 +197,7 @@ func schema(ctx context.Context, database *sqlite.DB, dbPath string) (response, 
 	return response{OK: true, Database: dbPath, Objects: objects, Tables: tables}, nil
 }
 
-func tableForeignKeys(ctx context.Context, database *sqlite.DB, table string) ([]foreignKeyInfo, error) {
+func tableForeignKeys(ctx context.Context, database *cqlite.DB, table string) ([]foreignKeyInfo, error) {
 	rows, err := database.Query(ctx, `PRAGMA foreign_key_list(`+quoteIdent(table)+`)`)
 	if err != nil {
 		return nil, err
@@ -238,7 +238,7 @@ func tableForeignKeys(ctx context.Context, database *sqlite.DB, table string) ([
 	return keys, nil
 }
 
-func tableTriggers(ctx context.Context, database *sqlite.DB, table string) ([]triggerInfo, error) {
+func tableTriggers(ctx context.Context, database *cqlite.DB, table string) ([]triggerInfo, error) {
 	rows, err := database.Query(ctx, `SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = `+sqlString(table)+` ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -261,7 +261,7 @@ func tableTriggers(ctx context.Context, database *sqlite.DB, table string) ([]tr
 	return triggers, nil
 }
 
-func tableColumns(ctx context.Context, database *sqlite.DB, table string) ([]columnInfo, error) {
+func tableColumns(ctx context.Context, database *cqlite.DB, table string) ([]columnInfo, error) {
 	rows, err := database.Query(ctx, `PRAGMA table_info(`+quoteIdent(table)+`)`)
 	if err != nil {
 		return nil, err
@@ -293,7 +293,7 @@ func tableColumns(ctx context.Context, database *sqlite.DB, table string) ([]col
 	return cols, nil
 }
 
-func tableIndexes(ctx context.Context, database *sqlite.DB, table string) ([]indexInfo, error) {
+func tableIndexes(ctx context.Context, database *cqlite.DB, table string) ([]indexInfo, error) {
 	rows, err := database.Query(ctx, `PRAGMA index_list(`+quoteIdent(table)+`)`)
 	if err != nil {
 		return nil, err
@@ -317,7 +317,7 @@ func tableIndexes(ctx context.Context, database *sqlite.DB, table string) ([]ind
 	return indexes, nil
 }
 
-func indexColumns(ctx context.Context, database *sqlite.DB, index string) ([]string, error) {
+func indexColumns(ctx context.Context, database *cqlite.DB, index string) ([]string, error) {
 	rows, err := database.Query(ctx, `PRAGMA index_info(`+quoteIdent(index)+`)`)
 	if err != nil {
 		return nil, err
@@ -335,7 +335,7 @@ func indexColumns(ctx context.Context, database *sqlite.DB, index string) ([]str
 	return columns, nil
 }
 
-func runSQL(ctx context.Context, database *sqlite.DB, dbPath, sql string, limit int) (response, error) {
+func runSQL(ctx context.Context, database *cqlite.DB, dbPath, sql string, limit int) (response, error) {
 	started := time.Now()
 	if queryLike(sql) {
 		rows, err := database.Query(ctx, sql)
@@ -360,7 +360,7 @@ func runSQL(ctx context.Context, database *sqlite.DB, dbPath, sql string, limit 
 	return response{OK: true, Database: dbPath, SQL: sql, RowsAffected: result.RowsAffected, LastInsertID: result.LastInsertID, DurationMS: time.Since(started).Milliseconds()}, nil
 }
 
-func runBatch(ctx context.Context, database *sqlite.DB, dbPath string, stmts []string, limit int) (response, error) {
+func runBatch(ctx context.Context, database *cqlite.DB, dbPath string, stmts []string, limit int) (response, error) {
 	started := time.Now()
 	out := response{OK: true, Database: dbPath}
 	for _, stmt := range stmts {
@@ -374,7 +374,7 @@ func runBatch(ctx context.Context, database *sqlite.DB, dbPath string, stmts []s
 	return out, nil
 }
 
-func browseRows(ctx context.Context, database *sqlite.DB, dbPath, table, payload string, limit int) (response, error) {
+func browseRows(ctx context.Context, database *cqlite.DB, dbPath, table, payload string, limit int) (response, error) {
 	var req statementPayload
 	if payload != "" {
 		if err := json.Unmarshal([]byte(payload), &req); err != nil {
@@ -413,7 +413,7 @@ func browseRows(ctx context.Context, database *sqlite.DB, dbPath, table, payload
 	return runSQL(ctx, database, dbPath, q.String(), limit)
 }
 
-func applyStatements(ctx context.Context, database *sqlite.DB, dbPath, payload string) (response, error) {
+func applyStatements(ctx context.Context, database *cqlite.DB, dbPath, payload string) (response, error) {
 	started := time.Now()
 	var req statementPayload
 	if err := json.Unmarshal([]byte(payload), &req); err != nil {
@@ -423,7 +423,7 @@ func applyStatements(ctx context.Context, database *sqlite.DB, dbPath, payload s
 	if len(stmts) == 0 {
 		return response{}, fmt.Errorf("missing statements")
 	}
-	tx, err := database.Begin(ctx, sqlite.TxOptions{})
+	tx, err := database.Begin(ctx, cqlite.TxOptions{})
 	if err != nil {
 		return response{}, err
 	}

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	db "github.com/oarkflow/sqlite"
+	db "github.com/oarkflow/cqlite"
 )
 
 const Name = "cqlite"

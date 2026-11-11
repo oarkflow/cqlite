@@ -1,13 +1,13 @@
-package db
+package cqlite
 
 import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
 
-	"github.com/oarkflow/sqlite/internal/btree"
-	"github.com/oarkflow/sqlite/internal/catalog"
-	"github.com/oarkflow/sqlite/internal/pager"
+	"github.com/oarkflow/cqlite/internal/btree"
+	"github.com/oarkflow/cqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/pager"
 )
 
 type rowVersion struct {

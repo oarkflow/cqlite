@@ -1,9 +1,9 @@
-package db
+package cqlite
 
 import (
 	"testing"
 
-	"github.com/oarkflow/sqlite/internal/sqlparser"
+	"github.com/oarkflow/cqlite/internal/sqlparser"
 )
 
 func TestParserAcceptsV1InsertShapes(t *testing.T) {

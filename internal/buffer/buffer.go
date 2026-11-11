@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/oarkflow/sqlite/internal/page"
+	"github.com/oarkflow/cqlite/internal/page"
 )
 
 type Frame struct {

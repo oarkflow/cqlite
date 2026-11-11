@@ -1,6 +1,6 @@
 -- Dialect corpus for adapter/query-builder tests.
 -- These statements intentionally include PostgreSQL/MySQL-style syntax that is
--- not all executable by github.com/oarkflow/sqlite today.
+-- not all executable by github.com/oarkflow/cqlite today.
 
 SELECT *
 FROM orders

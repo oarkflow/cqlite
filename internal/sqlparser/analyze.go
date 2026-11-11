@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
 )
 
 type FindingSeverity string

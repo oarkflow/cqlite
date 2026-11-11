@@ -1,4 +1,4 @@
--- SQLite-compatible complex query examples for github.com/oarkflow/sqlite.
+-- SQLite-compatible complex query examples for github.com/oarkflow/cqlite.
 
 CREATE TABLE IF NOT EXISTS accounts (
   id INTEGER PRIMARY KEY,

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	db "github.com/oarkflow/sqlite"
-	"github.com/oarkflow/sqlite/server/mysql"
+	db "github.com/oarkflow/cqlite"
+	"github.com/oarkflow/cqlite/server/mysql"
 )
 
 func main() {

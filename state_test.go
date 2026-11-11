@@ -1,9 +1,9 @@
-package db
+package cqlite
 
 import (
 	"testing"
 
-	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/catalog"
 )
 
 func TestPositionArenaAllocationsAreDisjointAndZeroed(t *testing.T) {

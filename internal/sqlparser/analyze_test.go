@@ -3,7 +3,7 @@ package sqlparser_test
 import (
 	"testing"
 
-	sqlparser "github.com/oarkflow/sqlite/internal/sqlparser"
+	sqlparser "github.com/oarkflow/cqlite/internal/sqlparser"
 )
 
 func TestAnalyzeSQLParseError(t *testing.T) {

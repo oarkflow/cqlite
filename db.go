@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"archive/zip"
@@ -18,14 +18,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oarkflow/sqlite/internal/buffer"
-	"github.com/oarkflow/sqlite/internal/catalog"
-	"github.com/oarkflow/sqlite/internal/page"
-	"github.com/oarkflow/sqlite/internal/pager"
-	isql "github.com/oarkflow/sqlite/internal/sql"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/txn"
-	"github.com/oarkflow/sqlite/internal/wal"
+	"github.com/oarkflow/cqlite/internal/buffer"
+	"github.com/oarkflow/cqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/page"
+	"github.com/oarkflow/cqlite/internal/pager"
+	isql "github.com/oarkflow/cqlite/internal/sql"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/txn"
+	"github.com/oarkflow/cqlite/internal/wal"
 )
 
 type DB struct {

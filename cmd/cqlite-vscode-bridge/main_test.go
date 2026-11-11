@@ -6,13 +6,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 func TestSchemaReturnsTablesAndViews(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.db")
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestSchemaReturnsTablesAndViews(t *testing.T) {
 func TestSchemaDetailIncludesIndexesForeignKeysAndTriggers(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.db")
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestSchemaDetailIncludesIndexesForeignKeysAndTriggers(t *testing.T) {
 func TestRunBatchReturnsSeparateResults(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.db")
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestRunBatchReturnsSeparateResults(t *testing.T) {
 func TestBrowseRowsAppliesLimitOffsetAndSort(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.db")
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestBrowseRowsAppliesLimitOffsetAndSort(t *testing.T) {
 func TestApplyStatementsCommitsAtomicallyAndRollsBackOnFailure(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.db")
-	database, err := sqlite.Open(dbPath, sqlite.Options{})
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

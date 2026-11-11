@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"log"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 func main() {
 	ctx := context.Background()
-	db, err := sqlite.Open(":memory:", sqlite.Options{})
+	db, err := cqlite.Open(":memory:", cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}

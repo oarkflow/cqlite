@@ -1,11 +1,11 @@
-package db
+package cqlite
 
 import (
 	"fmt"
 	"sort"
 	"strings"
 
-	catalog "github.com/oarkflow/sqlite/internal/catalog"
+	catalog "github.com/oarkflow/cqlite/internal/catalog"
 )
 
 // VirtualTable is an alias for the catalog's persisted CREATE VIRTUAL TABLE
@@ -84,10 +84,10 @@ func execCreateVirtualTable(s *persistedState, name, moduleName, args, rawSQL st
 		return Result{}, fmt.Errorf("no such module: %s", moduleName)
 	}
 	vt := &VirtualTable{
-		Name:    key,
-		Module:  strings.ToLower(moduleName),
-		Args:    args,
-		SQL:     rawSQL,
+		Name:     key,
+		Module:   strings.ToLower(moduleName),
+		Args:     args,
+		SQL:      rawSQL,
 		ModuleKV: map[string]string{},
 	}
 	if err := mod.Declare(s, vt, args); err != nil {

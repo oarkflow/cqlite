@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	db "github.com/oarkflow/sqlite"
+	db "github.com/oarkflow/cqlite"
 )
 
 type cliState struct {
@@ -91,7 +91,7 @@ func printPrompt(out io.Writer, prompt, cont bool) {
 		fmt.Fprint(out, "   ...> ")
 		return
 	}
-	fmt.Fprint(out, "sqlite> ")
+	fmt.Fprint(out, "cqlite> ")
 }
 
 func statementComplete(sql string) bool {

@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"bytes"
@@ -7,7 +7,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/cqlite/internal/catalog"
 )
 
 const (

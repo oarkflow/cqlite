@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"bytes"
@@ -19,11 +19,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/oarkflow/sqlite/internal/catalog"
-	isql "github.com/oarkflow/sqlite/internal/sql"
-	"github.com/oarkflow/sqlite/internal/sqlparser"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/cqlite/internal/catalog"
+	isql "github.com/oarkflow/cqlite/internal/sql"
+	"github.com/oarkflow/cqlite/internal/sqlparser"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 const primaryKeyNamePlaceholder = "__primary_key__"

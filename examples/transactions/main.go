@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"log"
 
-	sqlite "github.com/oarkflow/sqlite"
+	cqlite "github.com/oarkflow/cqlite"
 )
 
 func main() {
 	ctx := context.Background()
-	db, err := sqlite.Open(":memory:", sqlite.Options{})
+	db, err := cqlite.Open(":memory:", cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tx, err := db.Begin(ctx, sqlite.TxOptions{})
+	tx, err := db.Begin(ctx, cqlite.TxOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rollback, err := db.Begin(ctx, sqlite.TxOptions{})
+	rollback, err := db.Begin(ctx, cqlite.TxOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}

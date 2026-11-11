@@ -8,12 +8,12 @@ import (
 	"log"
 	"os"
 
-	_ "github.com/oarkflow/sqlite/driver"
+	_ "github.com/oarkflow/cqlite/driver"
 )
 
 func main() {
 	ctx := context.Background()
-	file, err := os.CreateTemp("", "sqlite-driver-*.db")
+	file, err := os.CreateTemp("", "cqlite-driver-*.db")
 	if err != nil {
 		log.Fatal(err)
 	}

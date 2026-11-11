@@ -1,4 +1,4 @@
-module github.com/oarkflow/sqlite
+module github.com/oarkflow/cqlite
 
 go 1.26.0
 

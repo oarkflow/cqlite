@@ -1,4 +1,4 @@
-package db
+package cqlite
 
 import (
 	"errors"
@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"strings"
 
-	catalog "github.com/oarkflow/sqlite/internal/catalog"
-	isql "github.com/oarkflow/sqlite/internal/sql"
-	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
-	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
+	catalog "github.com/oarkflow/cqlite/internal/catalog"
+	isql "github.com/oarkflow/cqlite/internal/sql"
+	"github.com/oarkflow/cqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/cqlite/internal/sqlparser/lexer"
 )
 
 // usesFTSFeatures reports whether a select needs the virtual-table path: a
