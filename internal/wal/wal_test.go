@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -65,6 +66,98 @@ func TestReplayIgnoresPartialTrailingPayload(t *testing.T) {
 	}
 	if err := log.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplayTruncatesPartialTailBeforeLaterAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.wal")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(Record{Type: RecordCommit, TxID: 1, Data: []byte("first")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.file.Write([]byte{byte(RecordCommit), 2, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.ReplayAndRepair(func(Record) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append(Record{Type: RecordCommit, TxID: 2, Data: []byte("second")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	log, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	var txids []uint64
+	if err := log.Replay(func(rec Record) error {
+		txids = append(txids, rec.TxID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(txids) != 2 || txids[0] != 1 || txids[1] != 2 {
+		t.Fatalf("replayed txids = %v; want [1 2]", txids)
+	}
+}
+
+func TestReplayUsesFixedWALBoundaryDuringConcurrentAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.wal")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.Append(Record{Type: RecordCommit, TxID: 1, Data: []byte("first")}, false); err != nil {
+		t.Fatal(err)
+	}
+	initialSize, err := writer.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	appended := make(chan struct{})
+	resume := make(chan struct{})
+	var once sync.Once
+	var records []Record
+	var replayErr error
+	done := make(chan struct{})
+	go func() {
+		replayErr = reader.Replay(func(rec Record) error {
+			records = append(records, rec)
+			once.Do(func() {
+				close(appended)
+				<-resume
+			})
+			return nil
+		})
+		close(done)
+	}()
+	<-appended
+	if err := writer.Append(Record{Type: RecordCommit, TxID: 2, Data: []byte("second")}, false); err != nil {
+		close(resume)
+		t.Fatal(err)
+	}
+	close(resume)
+	<-done
+	if replayErr != nil {
+		t.Fatal(replayErr)
+	}
+	if len(records) != 1 || records[0].TxID != 1 {
+		t.Fatalf("replayed records = %#v, want only the first record", records)
+	}
+	if got := reader.ReplaySize(); got != initialSize {
+		t.Fatalf("replay boundary = %d, want %d", got, initialSize)
 	}
 }
 

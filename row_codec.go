@@ -103,8 +103,30 @@ func encodeRowValue(buf *bytes.Buffer, value any) error {
 		buf.WriteByte(rowValueNull)
 	case int:
 		writeRowInt(buf, int64(v))
+	case int8:
+		writeRowInt(buf, int64(v))
+	case int16:
+		writeRowInt(buf, int64(v))
+	case int32:
+		writeRowInt(buf, int64(v))
 	case int64:
 		writeRowInt(buf, v)
+	case uint:
+		if uint64(v) > math.MaxInt64 {
+			return errors.New("unsigned integer exceeds SQLite INTEGER range")
+		}
+		writeRowInt(buf, int64(v))
+	case uint8:
+		writeRowInt(buf, int64(v))
+	case uint16:
+		writeRowInt(buf, int64(v))
+	case uint32:
+		writeRowInt(buf, int64(v))
+	case uint64:
+		if v > math.MaxInt64 {
+			return errors.New("unsigned integer exceeds SQLite INTEGER range")
+		}
+		writeRowInt(buf, int64(v))
 	case json.Number:
 		if i, err := v.Int64(); err == nil {
 			writeRowInt(buf, i)
@@ -117,6 +139,8 @@ func encodeRowValue(buf *bytes.Buffer, value any) error {
 		writeRowFloat(buf, f)
 	case float64:
 		writeRowFloat(buf, v)
+	case float32:
+		writeRowFloat(buf, float64(v))
 	case bool:
 		if v {
 			writeRowInt(buf, 1)
@@ -126,6 +150,10 @@ func encodeRowValue(buf *bytes.Buffer, value any) error {
 	case string:
 		writeRowBytes(buf, rowValueText, []byte(v))
 	case []byte:
+		if v == nil {
+			buf.WriteByte(rowValueNull)
+			break
+		}
 		writeRowBytes(buf, rowValueBlob, v)
 	default:
 		encoded, err := json.Marshal(v)
@@ -159,6 +187,15 @@ func writeRowBytes(buf *bytes.Buffer, typ byte, data []byte) {
 	buf.Write(data)
 }
 
+func cloneSQLiteBlob(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned
+}
+
 func decodeRowValue(data []byte, pos int) (any, int, error) {
 	if pos >= len(data) {
 		return nil, pos, errors.New("truncated row value")
@@ -187,11 +224,10 @@ func decodeRowValue(data []byte, pos int) (any, int, error) {
 		if n < 0 || n > len(data)-pos {
 			return nil, pos, errors.New("invalid variable row value length")
 		}
-		raw := append([]byte(nil), data[pos:pos+n]...)
 		if typ == rowValueBlob {
-			return raw, pos + n, nil
+			return cloneSQLiteBlob(data[pos : pos+n]), pos + n, nil
 		}
-		return string(raw), pos + n, nil
+		return string(data[pos : pos+n]), pos + n, nil
 	default:
 		return nil, pos, errors.New("unknown row value type")
 	}

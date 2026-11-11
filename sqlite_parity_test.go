@@ -151,6 +151,57 @@ func TestSQLiteParityForJoinsOrderingGroupingAndPragmas(t *testing.T) {
 	}
 }
 
+func TestSQLiteParityForJoinAggregateTextOrderAndCollation(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary not available")
+	}
+	setup := []string{
+		`CREATE TABLE groups (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)`,
+		`CREATE TABLE items (id INTEGER PRIMARY KEY, group_id INTEGER, score INTEGER)`,
+		`INSERT INTO groups VALUES (1, '2'), (2, '10'), (3, 'a'), (4, 'B'), (5, 'null-key')`,
+		`INSERT INTO items VALUES (1, 1, 2), (2, 2, 10), (3, 3, 3), (4, 4, 4), (5, NULL, 100), (6, 1, '2text'), (7, 1, 'not numeric')`,
+		`CREATE TABLE numeric_groups (id INTEGER PRIMARY KEY, bucket ANY)`,
+		`CREATE TABLE numeric_items (id INTEGER PRIMARY KEY, group_id INTEGER, score INTEGER)`,
+		`INSERT INTO numeric_groups VALUES (1, 1), (2, 1.0)`,
+		`INSERT INTO numeric_items VALUES (1, 1, 2), (2, 2, 3)`,
+		`CREATE TABLE sum_inputs (value ANY)`,
+		`INSERT INTO sum_inputs VALUES ('2text'), ('1e2tail'), ('1e'), (x'33'), ('not numeric')`,
+	}
+	queries := []string{
+		`SELECT groups.name, count(*), sum(items.score) FROM groups JOIN items ON groups.id = items.group_id GROUP BY groups.name ORDER BY groups.name`,
+		`SELECT numeric_groups.bucket, count(*), sum(numeric_items.score) FROM numeric_groups JOIN numeric_items ON numeric_groups.id = numeric_items.group_id GROUP BY numeric_groups.bucket ORDER BY numeric_groups.bucket`,
+		`SELECT sum(score), avg(score), total(score) FROM items`,
+		`SELECT sum(value), avg(value), total(value) FROM sum_inputs`,
+	}
+	custom := runCustomDB(t, setup, queries)
+	sqlite := runSQLite(t, setup, queries)
+	if fmt.Sprint(custom) != fmt.Sprint(sqlite) {
+		t.Fatalf("join aggregate text order mismatch\ncustom: %#v\nsqlite: %#v", custom, sqlite)
+	}
+}
+
+func TestFastJoinAggregateIntegerSumOverflow(t *testing.T) {
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+	for _, statement := range []string{
+		`CREATE TABLE groups (id INTEGER PRIMARY KEY, name TEXT)`,
+		`CREATE TABLE items (id INTEGER PRIMARY KEY, group_id INTEGER, score INTEGER)`,
+		`INSERT INTO groups VALUES (1, 'one')`,
+		`INSERT INTO items VALUES (1, 1, 9223372036854775807), (2, 1, 1)`,
+	} {
+		if _, err := d.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.Query(ctx, `SELECT groups.name, count(*), sum(items.score) FROM groups JOIN items ON groups.id = items.group_id GROUP BY groups.name ORDER BY groups.name`); err == nil || !strings.Contains(err.Error(), "integer overflow") {
+		t.Fatalf("join aggregate overflow error = %v; want integer overflow", err)
+	}
+}
+
 func TestSQLiteParityForSQLTransactionCommands(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not available")
@@ -872,11 +923,16 @@ func runSQLite(t *testing.T, setup, queries []string) [][][]string {
 	var out [][][]string
 	for _, query := range queries {
 		raw := runSQLiteQuery(t, dbPath, query)
+		// A query that matched no rows emits nothing at all, while a query that
+		// matched one row holding an empty string emits a single empty line.
+		// Only the trailing newline is structural.
+		if raw == "" {
+			out = append(out, nil)
+			continue
+		}
+		text := strings.TrimSuffix(raw, "\n")
 		var result [][]string
-		for _, line := range strings.Split(strings.TrimSuffix(raw, "\n"), "\n") {
-			if line == "" {
-				continue
-			}
+		for _, line := range strings.Split(text, "\n") {
 			result = append(result, strings.Split(line, "\t"))
 		}
 		out = append(out, result)
@@ -929,6 +985,10 @@ func normalizeRow(row []any) []string {
 			} else {
 				out[i] = fmt.Sprintf("%.15g", x)
 			}
+		case []byte:
+			// sqlite3's CLI prints blob payloads raw, so compare them the same
+			// way rather than through Go's slice formatting.
+			out[i] = string(x)
 		default:
 			out[i] = fmt.Sprint(x)
 		}

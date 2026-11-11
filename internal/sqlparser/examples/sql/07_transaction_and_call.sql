@@ -1,0 +1,5 @@
+START TRANSACTION READ WRITE;
+SAVEPOINT sp1;
+CALL refresh_materialized_views('daily');
+ROLLBACK TO SAVEPOINT sp1;
+COMMIT;

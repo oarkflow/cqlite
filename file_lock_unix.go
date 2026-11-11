@@ -3,6 +3,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,9 +20,9 @@ func acquireDatabaseLock(path string) (*databaseLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(shared.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+	if err := flockRetry(int(shared.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
 		_ = shared.Close()
-		return nil, fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
+		return nil, classifyFlockError(err)
 	}
 	writer, err := os.OpenFile(filepath.Join(path, "db.write.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -36,10 +37,29 @@ func acquireDatabaseWriteLock(l *databaseLock) error {
 	if l == nil || l.writer == nil {
 		return nil
 	}
-	if err := syscall.Flock(int(l.writer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
+	if err := flockRetry(int(l.writer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return classifyFlockError(err)
 	}
 	return nil
+}
+
+func flockRetry(fd int, how int) error {
+	for {
+		err := syscall.Flock(fd, how)
+		if !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+}
+
+func classifyFlockError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
+	}
+	return err
 }
 
 func releaseDatabaseWriteLock(l *databaseLock) error {

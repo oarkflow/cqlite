@@ -26,6 +26,10 @@ type Options struct {
 	DisableFileLock         bool
 	CheckpointIntervalBytes int64
 	CheckpointIntervalTx    uint64
+	// BusyTimeout bounds how long a writer waits for another process to release
+	// the database writer lock. Zero waits until the lock is released; the
+	// operation context can still cancel the wait.
+	BusyTimeout time.Duration
 }
 
 type TxOptions struct {

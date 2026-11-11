@@ -4,10 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"testing"
 
 	db "github.com/sujit/sqlite"
 )
+
+type driverTextValue string
+
+func (v driverTextValue) MarshalText() ([]byte, error) { return []byte("typed:" + string(v)), nil }
 
 func TestDatabaseSQLDriver(t *testing.T) {
 	database, err := sql.Open(Name, t.TempDir())
@@ -27,6 +32,106 @@ func TestDatabaseSQLDriver(t *testing.T) {
 	}
 	if name != "Ada" {
 		t.Fatalf("name = %q", name)
+	}
+}
+
+func TestDriverSharesFileEngineAcrossConnections(t *testing.T) {
+	path := t.TempDir()
+	d := &Driver{}
+	firstRaw, err := d.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw, err := d.Open(path)
+	if err != nil {
+		_ = firstRaw.Close()
+		t.Fatal(err)
+	}
+	first, second := firstRaw.(*Conn), secondRaw.(*Conn)
+	if first.db != second.db {
+		t.Fatal("connections to the same file opened separate engine instances")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.db.Exec(context.Background(), `CREATE TABLE shared_driver (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("closing one connection closed the shared engine: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDriverKeepsMemoryConnectionsPrivate(t *testing.T) {
+	d := &Driver{}
+	firstRaw, err := d.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw, err := d.Open(":memory:")
+	if err != nil {
+		_ = firstRaw.Close()
+		t.Fatal(err)
+	}
+	first, second := firstRaw.(*Conn), secondRaw.(*Conn)
+	if first.db == second.db {
+		t.Fatal("private memory connections unexpectedly share an engine")
+	}
+	_ = first.Close()
+	_ = second.Close()
+}
+
+func TestDriverConcurrentOpensShareAndReleaseEngine(t *testing.T) {
+	const count = 8
+	path := t.TempDir()
+	connections := make([]*Conn, count)
+	start := make(chan struct{})
+	errs := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := range connections {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			raw, err := (&Driver{}).Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			connections[i] = raw.(*Conn)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i := 0; i < len(errs); i++ {
+		t.Fatal(<-errs)
+	}
+	for i := 1; i < count; i++ {
+		if connections[i].db != connections[0].db {
+			t.Fatalf("connection %d opened a distinct engine", i)
+		}
+	}
+
+	for _, conn := range connections {
+		wg.Add(1)
+		go func(conn *Conn) {
+			defer wg.Done()
+			if err := conn.Close(); err != nil {
+				errs <- err
+			}
+		}(conn)
+	}
+	wg.Wait()
+	for i := 0; i < len(errs); i++ {
+		t.Fatal(<-errs)
+	}
+
+	reopenedRaw, err := (&Driver{}).Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopenedRaw.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -168,5 +273,26 @@ func TestDatabaseSQLNamedParameters(t *testing.T) {
 	}
 	if name != "Ada" {
 		t.Fatalf("name = %q", name)
+	}
+}
+
+func TestDatabaseSQLTextMarshalerBinding(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE marshaled_values (value ANY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO marshaled_values VALUES (?)`, driverTextValue("uuid")); err != nil {
+		t.Fatal(err)
+	}
+	var value, storageClass string
+	if err := database.QueryRow(`SELECT value, typeof(value) FROM marshaled_values`).Scan(&value, &storageClass); err != nil {
+		t.Fatal(err)
+	}
+	if value != "typed:uuid" || storageClass != "text" {
+		t.Fatalf("value=%q storageClass=%q; want typed text", value, storageClass)
 	}
 }

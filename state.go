@@ -18,21 +18,44 @@ type rowVersion struct {
 	Deleted uint64         `json:"deleted,omitempty"`
 }
 
+type positionArena struct {
+	remaining []any
+}
+
+func (a *positionArena) alloc(width int) []any {
+	if width <= 0 {
+		return nil
+	}
+	if len(a.remaining) < width {
+		capacity := 256
+		if capacity < width {
+			capacity = width
+		}
+		a.remaining = make([]any, capacity)
+	}
+	values := a.remaining[:width:width]
+	a.remaining = a.remaining[width:]
+	clear(values)
+	return values
+}
+
 type tableData struct {
-	Rows         []rowVersion           `json:"rows"`
-	Pending      []rowVersion           `json:"-"`
-	pendingRowID map[int64]struct{}     `json:"-"`
-	pendingLast  int64                  `json:"-"`
-	pendingAsc   bool                   `json:"-"`
-	rowids       *btree.Tree            `json:"-"`
-	indexes      map[string]*btree.Tree `json:"-"`
-	baseRows     int                    `json:"-"`
-	deferRuntime bool                   `json:"-"`
-	rowsShared   bool                   `json:"-"`
-	lazyRecords  []pager.Record         `json:"-"`
-	lazyPath     string                 `json:"-"`
-	lazyPageSize int                    `json:"-"`
-	lazyCount    int                    `json:"-"`
+	Rows           []rowVersion           `json:"rows"`
+	Pending        []rowVersion           `json:"-"`
+	pendingCapHint int                    `json:"-"`
+	pendingRowID   map[int64]struct{}     `json:"-"`
+	pendingLast    int64                  `json:"-"`
+	pendingAsc     bool                   `json:"-"`
+	rowids         *btree.Tree            `json:"-"`
+	indexes        map[string]*btree.Tree `json:"-"`
+	positionArena  positionArena          `json:"-"`
+	baseRows       int                    `json:"-"`
+	deferRuntime   bool                   `json:"-"`
+	rowsShared     bool                   `json:"-"`
+	lazyRecords    []pager.Record         `json:"-"`
+	lazyPath       string                 `json:"-"`
+	lazyPageSize   int                    `json:"-"`
+	lazyCount      int                    `json:"-"`
 }
 
 type persistedState struct {
@@ -40,6 +63,16 @@ type persistedState struct {
 	Tables  map[string]*tableData `json:"tables"`
 	NextTx  uint64                `json:"next_tx"`
 	Pragmas pragmaState           `json:"pragmas"`
+
+	// ctes holds materialized CTE results visible to the statement currently
+	// being executed. Query execution uses a shallow state view so this scratch
+	// map stays private to one statement and is never serialized.
+	ctes map[string]*cteMaterial
+
+	// compositeRead is set only on an ephemeral state assembled for a SELECT
+	// spanning multiple attached databases. It disables single-database fast
+	// plans and makes table lookup honor schema-qualified names.
+	compositeRead bool
 }
 
 type checkpointMeta struct {
@@ -71,14 +104,16 @@ func newState() persistedState {
 
 func (s persistedState) clone() persistedState {
 	out := persistedState{
-		Catalog: catalog.New(),
-		Tables:  make(map[string]*tableData, len(s.Tables)),
-		NextTx:  s.NextTx,
-		Pragmas: s.Pragmas,
+		Catalog:       catalog.New(),
+		Tables:        make(map[string]*tableData, len(s.Tables)),
+		NextTx:        s.NextTx,
+		Pragmas:       s.Pragmas,
+		compositeRead: s.compositeRead,
 	}
 	for name, tbl := range s.Catalog.Tables {
 		cp := *tbl
 		cp.Columns = append([]catalog.Column(nil), tbl.Columns...)
+		cp.PrimaryKeyColumns = append([]string(nil), tbl.PrimaryKeyColumns...)
 		cp.Indexes = append([]catalog.Index(nil), tbl.Indexes...)
 		out.Catalog.Tables[name] = &cp
 	}
@@ -87,10 +122,37 @@ func (s persistedState) clone() persistedState {
 		cp.Columns = append([]catalog.Column(nil), view.Columns...)
 		out.Catalog.Views[name] = &cp
 	}
+	if len(s.Catalog.VirtualTables) > 0 {
+		out.Catalog.VirtualTables = make(map[string]*catalog.VirtualTable, len(s.Catalog.VirtualTables))
+		for name, vt := range s.Catalog.VirtualTables {
+			cp := *vt
+			cp.Columns = append([]string(nil), vt.Columns...)
+			cp.Shadows = append([]string(nil), vt.Shadows...)
+			if vt.ModuleKV != nil {
+				cp.ModuleKV = make(map[string]string, len(vt.ModuleKV))
+				for k, v := range vt.ModuleKV {
+					cp.ModuleKV[k] = v
+				}
+			}
+			out.Catalog.VirtualTables[name] = &cp
+		}
+	}
+	if len(s.Catalog.Triggers) > 0 {
+		out.Catalog.Triggers = make(map[string]*catalog.Trigger, len(s.Catalog.Triggers))
+		for name, trg := range s.Catalog.Triggers {
+			cp := *trg
+			cp.UpdateOf = append([]string(nil), trg.UpdateOf...)
+			out.Catalog.Triggers[name] = &cp
+		}
+	}
 	for name, data := range s.Tables {
-		td := &tableData{Rows: data.Rows[:len(data.Rows):len(data.Rows)]}
-		if len(data.Pending) > 0 {
-			td.Pending = append([]rowVersion(nil), data.Pending...)
+		td := &tableData{
+			Rows: data.Rows[:len(data.Rows):len(data.Rows)],
+			// Staged rows are immutable after insertion. Cap the shared slice at
+			// its length so the next append allocates and cannot overwrite another
+			// transaction's pending rows.
+			Pending:        data.Pending[:len(data.Pending):len(data.Pending)],
+			pendingCapHint: data.pendingCapHint,
 		}
 		if len(data.lazyRecords) > 0 {
 			td.lazyRecords = append([]pager.Record(nil), data.lazyRecords...)
@@ -333,6 +395,9 @@ func (s *persistedState) materializePending() {
 
 func (t *tableData) stageRow(schema *catalog.Table, row rowVersion) int {
 	if t.deferRuntime {
+		if len(t.Pending) == 0 && cap(t.Pending) == 0 && t.pendingCapHint > 0 {
+			t.Pending = make([]rowVersion, 0, t.pendingCapHint)
+		}
 		t.Pending = append(t.Pending, row)
 		t.trackPendingRowID(row.RowID)
 		return len(t.Rows) + len(t.Pending) - 1
@@ -538,7 +603,7 @@ func (t *tableData) addRowIDPosition(rowid int64, pos int) {
 	if t.rowids == nil {
 		t.rowids = btree.New()
 	}
-	t.rowids.PutOwned(encodeInt64Key(rowid), encodeIntPosition(pos))
+	t.rowids.PutInt64(rowid, pos)
 }
 
 func (t *tableData) lookupRowID(rowid int64) (int, bool) {

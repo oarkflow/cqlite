@@ -1,11 +1,59 @@
 package btree
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
 )
+
+func TestTreePutInt64PreservesSignedOrderAndValues(t *testing.T) {
+	tr := NewWithOrder(4)
+	keys := []int64{0, -1, math.MaxInt64, math.MinInt64, 17, -42}
+	for i, key := range keys {
+		tr.PutInt64(key, i+100)
+	}
+	tr.PutInt64(-1, 999)
+	var got []int64
+	tr.ViewScan(nil, nil, func(key, value []byte) bool {
+		if len(key) != 8 || len(value) != 8 {
+			t.Fatalf("integer entry widths = %d/%d, want 8/8", len(key), len(value))
+		}
+		got = append(got, int64(binary.BigEndian.Uint64(key)^(uint64(1)<<63)))
+		return true
+	})
+	want := []int64{math.MinInt64, -42, -1, 0, 17, math.MaxInt64}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("integer key order = %v, want %v", got, want)
+	}
+	value, ok := tr.Get(encodeIntKeyForTest(-1))
+	if !ok || len(value) != 8 {
+		t.Fatalf("updated integer value = %v, ok=%v; want 8-byte value", value, ok)
+	}
+	if got := binary.LittleEndian.Uint64(value); got != 999 {
+		t.Fatalf("updated integer value = %d, want 999", got)
+	}
+	for i := 0; i < 600; i++ {
+		tr.PutInt64(int64(i), i*3)
+	}
+	for i := 0; i < 600; i++ {
+		value, ok := tr.Get(encodeIntKeyForTest(int64(i)))
+		if !ok || len(value) != 8 {
+			t.Fatalf("integer key %d value = %v, ok=%v", i, value, ok)
+		}
+		if got := binary.LittleEndian.Uint64(value); got != uint64(i*3) {
+			t.Fatalf("integer key %d value = %d", i, got)
+		}
+	}
+}
+
+func encodeIntKeyForTest(key int64) []byte {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(key)^(uint64(1)<<63))
+	return encoded[:]
+}
 
 func TestTreePutGetDeleteScan(t *testing.T) {
 	tr := NewWithOrder(4)
@@ -35,6 +83,20 @@ func TestTreePutGetDeleteScan(t *testing.T) {
 	}
 	if _, ok := tr.Get([]byte("b")); ok {
 		t.Fatal("deleted key still present")
+	}
+}
+
+func TestPutManyOwned(t *testing.T) {
+	tree := NewWithOrder(8)
+	tree.PutManyOwnedFunc(128, func(i int) ([]byte, []byte) {
+		return []byte(fmt.Sprintf("%04d", i)), []byte(fmt.Sprintf("v%04d", i*3))
+	})
+	for i := 0; i < 128; i++ {
+		got, ok := tree.Get([]byte(fmt.Sprintf("%04d", i)))
+		want := fmt.Sprintf("v%04d", i*3)
+		if !ok || string(got) != want {
+			t.Fatalf("Get(%d) = %q, %v; want %q", i, got, ok, want)
+		}
 	}
 }
 

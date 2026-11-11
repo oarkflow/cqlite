@@ -21,22 +21,33 @@ type Record struct {
 }
 
 func (p *Pager) WriteRecords(records []Record) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pageSize <= page.HeaderSize {
+		return errors.New("page size too small")
+	}
+	pageData := make([]byte, p.pageSize-page.HeaderSize)
+	encodedPage := make([]byte, p.pageSize)
 	header := page.New(1, p.pageSize)
 	copy(header.Data[0:8], []byte(recordHeaderMagic))
 	binary.LittleEndian.PutUint64(header.Data[8:16], uint64(len(records)))
-	if err := p.Write(header); err != nil {
+	if err := page.EncodeInto(header, p.pageSize, encodedPage); err != nil {
 		return err
+	}
+	if n, err := p.file.WriteAt(encodedPage, 0); err != nil {
+		return err
+	} else if n != len(encodedPage) {
+		return io.ErrShortWrite
 	}
 	nextPage := page.ID(2)
 	for _, rec := range records {
-		data := encodeRecord(rec)
-		used, err := p.writeRecordPayload(nextPage, data)
+		used, err := p.writeRecordPayload(nextPage, rec, pageData, encodedPage)
 		if err != nil {
 			return err
 		}
 		nextPage += page.ID(used)
 	}
-	if err := p.Sync(); err != nil {
+	if err := p.file.Sync(); err != nil {
 		return err
 	}
 	return syncDirFromFile(p.path)
@@ -129,32 +140,64 @@ func (p *Pager) readAllRecordPages() ([]page.Page, error) {
 	return pages, nil
 }
 
-func (p *Pager) writeRecordPayload(start page.ID, data []byte) (int, error) {
+func (p *Pager) writeRecordPayload(start page.ID, rec Record, pageData, encodedPage []byte) (int, error) {
 	chunkSize := p.pageSize - page.HeaderSize - 16
 	if chunkSize <= 0 {
 		return 0, errors.New("page size too small for record")
 	}
-	count := (len(data) + chunkSize - 1) / chunkSize
+	recordSize := 12 + len(rec.Values)
+	if recordSize > maxRecordPayload {
+		return 0, errors.New("record payload too large")
+	}
+	count := (recordSize + chunkSize - 1) / chunkSize
 	if count == 0 {
 		count = 1
 	}
+	var recordHeader [12]byte
+	binary.LittleEndian.PutUint64(recordHeader[0:8], uint64(rec.Key))
+	binary.LittleEndian.PutUint32(recordHeader[8:12], uint32(len(rec.Values)))
 	for i := 0; i < count; i++ {
 		begin := i * chunkSize
 		end := begin + chunkSize
-		if end > len(data) {
-			end = len(data)
+		if end > recordSize {
+			end = recordSize
 		}
-		pg := page.New(start+page.ID(i), p.pageSize)
-		copy(pg.Data[0:8], []byte(recordPageMagic))
+		clear(pageData)
+		copy(pageData[0:8], []byte(recordPageMagic))
 		if i == 0 {
-			binary.LittleEndian.PutUint64(pg.Data[8:16], uint64(len(data)))
+			binary.LittleEndian.PutUint64(pageData[8:16], uint64(recordSize))
 		}
-		copy(pg.Data[16:], data[begin:end])
-		if err := p.Write(pg); err != nil {
+		copyRecordBytes(pageData[16:], begin, end, recordHeader[:], rec.Values)
+		pg := page.Page{ID: start + page.ID(i), Data: pageData}
+		if err := page.EncodeInto(pg, p.pageSize, encodedPage); err != nil {
 			return 0, err
+		}
+		n, err := p.file.WriteAt(encodedPage, int64(pg.ID-1)*int64(p.pageSize))
+		if err != nil {
+			return 0, err
+		}
+		if n != len(encodedPage) {
+			return 0, io.ErrShortWrite
 		}
 	}
 	return count, nil
+}
+
+func copyRecordBytes(dst []byte, begin, end int, header []byte, values []byte) {
+	if begin < len(header) {
+		headerEnd := end
+		if headerEnd > len(header) {
+			headerEnd = len(header)
+		}
+		headerBytes := headerEnd - begin
+		copy(dst[:headerBytes], header[begin:headerEnd])
+		dst = dst[headerBytes:]
+		begin = headerEnd
+	}
+	if begin < end {
+		valueBegin := begin - 12
+		copy(dst, values[valueBegin:valueBegin+end-begin])
+	}
 }
 
 func (p *Pager) readRecordPayload(start page.ID) ([]byte, int, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/sujit/sqlite/internal/page"
@@ -135,6 +136,61 @@ func TestPagerRecordsRoundTripBinaryPayload(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Key != -7 || !bytes.Equal(got[0].Values, payload) {
 		t.Fatalf("records = %#v", got)
+	}
+}
+
+func TestConcurrentWriteRecordsDoesNotInterleaveBatches(t *testing.T) {
+	p, err := Open(t.TempDir()+"/records.db", page.DefaultSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	makeBatch := func(marker byte) []Record {
+		records := make([]Record, 96)
+		for i := range records {
+			records[i] = Record{Key: int64(i + 1), Values: bytes.Repeat([]byte{marker}, 3000)}
+		}
+		return records
+	}
+	first, second := makeBatch('a'), makeBatch('b')
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, batch := range [][]Record{first, second} {
+		batch := batch
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 3; i++ {
+				if err := p.WriteRecords(batch); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	got, err := p.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(first) {
+		t.Fatalf("record count = %d, want %d", len(got), len(first))
+	}
+	marker := got[0].Values[0]
+	if marker != 'a' && marker != 'b' {
+		t.Fatalf("unexpected payload marker %q", marker)
+	}
+	for i, rec := range got {
+		if rec.Key != int64(i+1) || !bytes.Equal(rec.Values, bytes.Repeat([]byte{marker}, 3000)) {
+			t.Fatalf("record %d was interleaved or corrupted: key=%d marker=%q", i, rec.Key, rec.Values[:1])
+		}
 	}
 }
 

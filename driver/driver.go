@@ -6,7 +6,10 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 
 	db "github.com/sujit/sqlite"
 )
@@ -20,23 +23,137 @@ func init() {
 type Driver struct{}
 
 func (d *Driver) Open(name string) (driver.Conn, error) {
-	inner, err := db.Open(name, db.Options{})
+	if isPrivateMemoryName(name) {
+		inner, err := db.Open(name, db.Options{})
+		if err != nil {
+			return nil, err
+		}
+		return &Conn{db: inner, release: inner.Close}, nil
+	}
+	inner, release, err := acquireSharedDatabase(name)
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{db: inner}, nil
+	return &Conn{db: inner, release: release}, nil
+}
+
+func isPrivateMemoryName(name string) bool {
+	p := strings.ToLower(strings.TrimSpace(name))
+	if p == "" || p == ":memory:" {
+		return true
+	}
+	if strings.HasPrefix(p, "file:") {
+		p = strings.TrimPrefix(p, "file:")
+		if i := strings.IndexAny(p, "?#"); i >= 0 {
+			p = p[:i]
+		}
+		return p == ":memory:" || p == ""
+	}
+	return false
+}
+
+type sharedEngine struct {
+	db      *db.DB
+	refs    int
+	opening bool
+	closing bool
+	done    chan struct{}
+}
+
+var sharedEngines = struct {
+	sync.Mutex
+	byPath map[string]*sharedEngine
+}{byPath: make(map[string]*sharedEngine)}
+
+func acquireSharedDatabase(name string) (*db.DB, func() error, error) {
+	key, err := filepath.Abs(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	key = filepath.Clean(key)
+	for {
+		sharedEngines.Lock()
+		entry := sharedEngines.byPath[key]
+		if entry != nil {
+			if entry.opening || entry.closing {
+				done := entry.done
+				sharedEngines.Unlock()
+				<-done
+				continue
+			}
+			entry.refs++
+			inner := entry.db
+			sharedEngines.Unlock()
+			return inner, func() error { return releaseSharedDatabase(key, entry) }, nil
+		}
+		entry = &sharedEngine{opening: true, done: make(chan struct{})}
+		sharedEngines.byPath[key] = entry
+		sharedEngines.Unlock()
+
+		inner, openErr := db.Open(name, db.Options{})
+		sharedEngines.Lock()
+		if openErr != nil {
+			delete(sharedEngines.byPath, key)
+			close(entry.done)
+			sharedEngines.Unlock()
+			return nil, nil, openErr
+		}
+		entry.db = inner
+		entry.refs = 1
+		entry.opening = false
+		close(entry.done)
+		sharedEngines.Unlock()
+		return inner, func() error { return releaseSharedDatabase(key, entry) }, nil
+	}
+}
+
+func releaseSharedDatabase(key string, entry *sharedEngine) error {
+	sharedEngines.Lock()
+	if entry.refs > 0 {
+		entry.refs--
+	}
+	if entry.refs > 0 {
+		sharedEngines.Unlock()
+		return nil
+	}
+	entry.closing = true
+	entry.done = make(chan struct{})
+	done := entry.done
+	inner := entry.db
+	sharedEngines.Unlock()
+
+	err := inner.Close()
+	sharedEngines.Lock()
+	if sharedEngines.byPath[key] == entry {
+		delete(sharedEngines.byPath, key)
+	}
+	close(done)
+	sharedEngines.Unlock()
+	return err
 }
 
 type Conn struct {
-	db *db.DB
-	tx *db.Tx
+	db        *db.DB
+	tx        *db.Tx
+	release   func() error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 	return &Stmt{conn: c, query: query}, nil
 }
 
-func (c *Conn) Close() error { return c.db.Close() }
+func (c *Conn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.release != nil {
+			c.closeErr = c.release()
+		} else if c.db != nil {
+			c.closeErr = c.db.Close()
+		}
+	})
+	return c.closeErr
+}
 
 func (c *Conn) Begin() (driver.Tx, error) {
 	if c.tx != nil {
@@ -70,7 +187,8 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 }
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	vals := namedValues(args)
+	var argStack [8]any
+	vals := namedValues(args, argStack[:0])
 	var res db.Result
 	var err error
 	if c.tx != nil {
@@ -85,7 +203,8 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	vals := namedValues(args)
+	var argStack [8]any
+	vals := namedValues(args, argStack[:0])
 	var rows *db.Rows
 	var err error
 	if c.tx != nil {
@@ -163,7 +282,7 @@ type rowsAdapter struct {
 }
 
 func (r *rowsAdapter) Columns() []string {
-	return append([]string(nil), r.Rows.Columns...)
+	return r.Rows.Columns
 }
 
 func (r *rowsAdapter) ColumnTypeDatabaseTypeName(index int) string {
@@ -202,8 +321,13 @@ func (r *rowsAdapter) Next(dest []driver.Value) error {
 	return nil
 }
 
-func namedValues(args []driver.NamedValue) []any {
-	out := make([]any, len(args))
+func namedValues(args []driver.NamedValue, storage []any) []any {
+	out := storage[:0]
+	if cap(out) < len(args) {
+		out = make([]any, len(args))
+	} else {
+		out = out[:len(args)]
+	}
 	for i, arg := range args {
 		if arg.Name != "" {
 			out[i] = db.Named(arg.Name, arg.Value)

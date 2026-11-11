@@ -18,18 +18,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oarkflow/sqlparser/ast"
 	"github.com/sujit/sqlite/internal/buffer"
 	"github.com/sujit/sqlite/internal/catalog"
 	"github.com/sujit/sqlite/internal/page"
 	"github.com/sujit/sqlite/internal/pager"
 	isql "github.com/sujit/sqlite/internal/sql"
+	"github.com/sujit/sqlite/internal/sqlparser/ast"
 	"github.com/sujit/sqlite/internal/txn"
 	"github.com/sujit/sqlite/internal/wal"
 )
 
 type DB struct {
 	mu           sync.RWMutex
+	writeGate    chan struct{}
 	path         string
 	singleFile   string
 	lockPath     string
@@ -46,9 +47,17 @@ type DB struct {
 	closed       atomic.Bool
 	explicitMu   sync.Mutex
 	explicitTx   *Tx
-	applied      uint64
-	checkpointed uint64
-	clean        bool
+	hasAttached  atomic.Bool
+	// attached holds databases opened by ATTACH, keyed by schema name.
+	attachedMu sync.RWMutex
+	attached   map[string]*attachedDB
+	// ephemeralRoot is the temporary directory backing a ":memory:" database.
+	// Close removes the whole tree so nothing survives the connection.
+	ephemeralRoot string
+	applied       uint64
+	checkpointed  uint64
+	clean         bool
+	walSize       int64 // protected by mu; bytes observed from the shared WAL
 }
 
 type logicalRecord struct {
@@ -60,16 +69,57 @@ const simpleWALMagic byte = 0xA5
 const txWALMagic byte = 0xA6
 const txSimpleWALMagic byte = 0xA7
 const stateWALMagic byte = 0xA8
+const txSimpleInsertBatchWALMagic byte = 0xA9
 
 type simpleWALRecord struct {
 	plan simpleDMLPlan
 	args []any
 }
 
+// Open opens a database at path. Two special names are recognised so that no
+// filesystem entry is ever created for them:
+//
+//   - ":memory:" (and "file::memory:") is a database that lives only for the
+//     lifetime of the returned *DB and is backed by a private temporary
+//     directory that Close removes.
+//   - "" is a private temporary database with the same lifetime.
+//
+// Any other path is a regular persistent database. Paths ending in ".db" are
+// stored as a single packed file; all others are directories.
 func Open(path string, opts Options) (*DB, error) {
-	if path == "" {
-		return nil, errors.New("database path is required")
+	if isMemoryDatabaseName(path) || path == "" {
+		root, err := os.MkdirTemp("", "sujit-sqlite-ephemeral-*")
+		if err != nil {
+			return nil, err
+		}
+		db, err := openWithPath(filepath.Join(root, "mem.db"), opts)
+		if err != nil {
+			_ = os.RemoveAll(root)
+			return nil, err
+		}
+		db.ephemeralRoot = root
+		return db, nil
 	}
+	return openWithPath(path, opts)
+}
+
+// isMemoryDatabaseName reports whether a path names a pure in-memory database.
+func isMemoryDatabaseName(path string) bool {
+	p := strings.ToLower(strings.TrimSpace(path))
+	if p == ":memory:" {
+		return true
+	}
+	if strings.HasPrefix(p, "file:") {
+		p = strings.TrimPrefix(p, "file:")
+		if i := strings.IndexAny(p, "?#"); i >= 0 {
+			p = p[:i]
+		}
+		return p == ":memory:" || p == ""
+	}
+	return false
+}
+
+func openWithPath(path string, opts Options) (*DB, error) {
 	if opts.PageSize == 0 {
 		opts.PageSize = page.DefaultSize
 	}
@@ -123,6 +173,7 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{
+		writeGate:    make(chan struct{}, 1),
 		path:         storagePath,
 		singleFile:   singleFile,
 		lockPath:     lockPath,
@@ -136,6 +187,18 @@ func Open(path string, opts Options) (*DB, error) {
 		txmgr:        txn.NewManager(),
 		state:        newState(),
 		opened:       time.Now(),
+	}
+	d.writeGate <- struct{}{}
+	// A handle may open while another process is committing. Remember the WAL
+	// boundary before recovery so a commit that lands between the clean-marker
+	// check and the end of replay cannot be mistaken for already-applied data.
+	recoveryWALSize, err := d.wal.Size()
+	if err != nil {
+		_ = log.Close()
+		_ = pg.Close()
+		_ = releaseDatabaseLock(lock)
+		cleanup()
+		return nil, err
 	}
 	if err := d.loadSnapshot(); err != nil {
 		if walHasRecords(filepath.Join(storagePath, "db.wal")) {
@@ -184,8 +247,13 @@ func Open(path string, opts Options) (*DB, error) {
 	if d.state.Pragmas.JournalMode == "" {
 		d.state.Pragmas.JournalMode = opts.JournalMode
 	}
-	if d.state.Pragmas.Synchronous == "" {
-		d.state.Pragmas.Synchronous = strings.ToLower(opts.Synchronous)
+	// synchronous is a connection setting in SQLite. Apply the current open
+	// options even when the checkpoint contains a value from an earlier handle.
+	d.state.Pragmas.Synchronous = strings.ToLower(opts.Synchronous)
+	// Replay captures and reads a fixed WAL size. If another writer appends after
+	// that boundary, the next refresh sees the larger file and replays it.
+	if d.walSize == 0 {
+		d.walSize = recoveryWALSize
 	}
 	return d, nil
 }
@@ -353,6 +421,9 @@ func (d *DB) Begin(ctx context.Context, opts TxOptions) (*Tx, error) {
 		return nil, ctx.Err()
 	default:
 	}
+	if err := d.refreshIfWALChanged(ctx); err != nil {
+		return nil, err
+	}
 	d.mu.Lock()
 	writes := d.state.clone()
 	baseApplied := d.applied
@@ -360,7 +431,83 @@ func (d *DB) Begin(ctx context.Context, opts TxOptions) (*Tx, error) {
 	return &Tx{db: d, tx: d.txmgr.Begin(opts.Isolation), writes: writes, baseApplied: baseApplied}, nil
 }
 
+// acquireWriteLock waits for a cross-process writer to finish instead of
+// surfacing a transient lock collision to callers. A positive BusyTimeout
+// bounds the wait; the default is unlimited and remains cancellable through
+// ctx. The local writer gate serializes writers within this process.
+func (d *DB) acquireWriteLock(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	err := acquireDatabaseWriteLock(d.lock)
+	if err == nil || !errors.Is(err, ErrDatabaseLocked) {
+		return err
+	}
+	var deadline <-chan time.Time
+	if d.opts.BusyTimeout > 0 {
+		timer := time.NewTimer(d.opts.BusyTimeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline:
+			return err
+		case <-ticker.C:
+			if err := acquireDatabaseWriteLock(d.lock); err == nil || !errors.Is(err, ErrDatabaseLocked) {
+				return err
+			}
+		}
+	}
+}
+
+// acquireWriteGate serializes local writers without holding the state mutex
+// while they wait for another handle or process to finish its commit.
+func (d *DB) acquireWriteGate(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.writeGate:
+		if err := ctx.Err(); err != nil {
+			d.releaseWriteGate()
+			return err
+		}
+		return nil
+	}
+}
+
+func (d *DB) releaseWriteGate() { d.writeGate <- struct{}{} }
+
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error) {
+	if res, ok, err := d.execAttachStatement(ctx, query, args...); ok || err != nil {
+		return res, err
+	}
+	ad, err := d.foreignTarget(query)
+	if err != nil {
+		return Result{}, err
+	}
+	if ad != nil {
+		defer ad.mu.RUnlock()
+		// The schema qualifier has already been routed; the target database
+		// executes the statement as its own.
+		return ad.db.execLocal(ctx, query, args...)
+	}
+	return d.execLocal(ctx, query, args...)
+}
+
+// execLocal runs a statement against this database without schema routing. It
+// is used for statements already dispatched to an attached database, whose own
+// qualifier must not be re-interpreted.
+func (d *DB) execLocal(ctx context.Context, query string, args ...any) (Result, error) {
 	if res, ok, err := d.execExplicitTransaction(ctx, query, args...); ok || err != nil {
 		return res, err
 	}
@@ -543,64 +690,91 @@ func (d *DB) execDirect(ctx context.Context, query string, args ...any) (Result,
 		return Result{}, true, ctx.Err()
 	default:
 	}
-	if res, ok, err := d.execSimpleDirect(query, args...); ok || err != nil {
+	if res, ok, err := d.execSimpleDirect(ctx, query, args...); ok || err != nil {
 		return res, ok, err
 	}
-	parseMu.Lock()
-	defer parseMu.Unlock()
-	stmt, err := parseStatementCached(stripStrictOnly(query))
-	if err != nil {
-		return Result{}, false, nil
+	type directExecution struct {
+		result  Result
+		handled bool
+		err     error
 	}
-	switch stmt.(type) {
-	case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt:
-	default:
-		return Result{}, false, nil
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := acquireDatabaseWriteLock(d.lock); err != nil {
-		return Result{}, true, err
-	}
-	defer releaseDatabaseWriteLock(d.lock)
-	next := d.applied + 1
-	d.state.ensureRuntime()
-	before := d.state.clone()
-	d.state.NextTx = next
-	res, fast, err := fastDirectDML(&d.state, stmt, args)
-	if err != nil {
-		d.state = before
-		return Result{}, true, err
-	}
-	if !fast {
-		res, err = execute(ctx, &d.state, query, args...)
+	parsed, parseErr := withQueryStatement(stripStrictOnly(query), func(stmt ast.Statement) (directExecution, error) {
+		switch stmt.(type) {
+		case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt:
+		default:
+			return directExecution{}, nil
+		}
+		if err := d.acquireWriteGate(ctx); err != nil {
+			return directExecution{handled: true, err: err}, nil
+		}
+		defer d.releaseWriteGate()
+		if err := d.checkOpen(); err != nil {
+			return directExecution{handled: true, err: err}, nil
+		}
+		if err := d.acquireWriteLock(ctx); err != nil {
+			return directExecution{handled: true, err: err}, nil
+		}
+		defer releaseDatabaseWriteLock(d.lock)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if err := d.refreshWALLocked(); err != nil {
+			return directExecution{handled: true, err: err}, nil
+		}
+		next := d.applied + 1
+		d.state.ensureRuntime()
+		before := d.state.clone()
+		d.state.NextTx = next
+		triggerScopeMu.RLock()
+		res, fast, err := fastDirectDML(&d.state, stmt, args)
+		triggerScopeMu.RUnlock()
 		if err != nil {
 			d.state = before
-			return Result{}, true, err
+			return directExecution{handled: true, err: err}, nil
 		}
+		if !fast {
+			res, err = execute(ctx, &d.state, query, args...)
+			if err != nil {
+				d.state = before
+				return directExecution{handled: true, err: err}, nil
+			}
+		}
+		if err := d.markDirty(); err != nil {
+			d.state = before
+			return directExecution{handled: true, err: err}, nil
+		}
+		if err := d.appendLogical(next, query, args); err != nil {
+			d.state = before
+			return directExecution{handled: true, err: err}, nil
+		}
+		d.applied = next
+		if err := d.maybeCheckpointLocked(ctx); err != nil {
+			return directExecution{handled: true, err: err}, nil
+		}
+		return directExecution{result: res, handled: true}, nil
+	})
+	if parseErr != nil {
+		return Result{}, false, nil
 	}
-	if err := d.markDirty(); err != nil {
-		d.state = before
-		return Result{}, true, err
-	}
-	if err := d.appendLogical(next, query, args); err != nil {
-		d.state = before
-		return Result{}, true, err
-	}
-	d.applied = next
-	if err := d.maybeCheckpointLocked(ctx); err != nil {
-		return Result{}, true, err
-	}
-	return res, true, nil
+	return parsed.result, parsed.handled, parsed.err
 }
 
-func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+func (d *DB) execSimpleDirect(ctx context.Context, query string, args ...any) (Result, bool, error) {
+	if err := d.acquireWriteGate(ctx); err != nil {
+		return Result{}, true, err
+	}
+	defer d.releaseWriteGate()
+	if err := d.checkOpen(); err != nil {
+		return Result{}, true, err
+	}
+	if err := d.acquireWriteLock(ctx); err != nil {
 		return Result{}, true, err
 	}
 	defer releaseDatabaseWriteLock(d.lock)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.refreshWALLocked(); err != nil {
+		return Result{}, true, err
+	}
 	next := d.applied + 1
 	d.state.ensureRuntime()
 	plan, planOK := simplePlan(query)
@@ -617,7 +791,7 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		}
 	}
 	d.state.NextTx = next
-	res, fast, err := fastSimpleDMLWithRecorder(&d.state, query, args, rollback.recordRow)
+	res, fast, err := fastSimpleDMLWithPlan(&d.state, query, args, rollback.recordRow, plan, planOK)
 	if err != nil {
 		if useFullRollback {
 			d.state = before
@@ -645,14 +819,20 @@ func (d *DB) execSimpleDirect(query string, args ...any) (Result, bool, error) {
 		rollback.release()
 		return Result{}, true, err
 	}
-	if err := d.appendLogical(next, query, args); err != nil {
+	var appendErr error
+	if planOK {
+		appendErr = d.appendLogicalPlan(next, &d.state, plan, args)
+	} else {
+		appendErr = d.appendLogical(next, query, args)
+	}
+	if appendErr != nil {
 		if useFullRollback {
 			d.state = before
 		} else {
 			rollback.restore()
 		}
 		rollback.release()
-		return Result{}, true, err
+		return Result{}, true, appendErr
 	}
 	rollback.release()
 	d.applied = next
@@ -667,7 +847,6 @@ type simpleDirectRollback struct {
 	nextTx  uint64
 	tables  map[string]tableRollback
 	changes []rowRollback
-	seenRow map[string]map[int]struct{}
 }
 
 type tableRollback struct {
@@ -688,16 +867,18 @@ type tableRollback struct {
 }
 
 type rowRollback struct {
-	table string
-	pos   int
-	row   rowVersion
+	table       string
+	pos         int
+	row         rowVersion
+	columnIndex int
+	columnName  string
+	oldValue    any
 }
 
 var rollbackPool = sync.Pool{
 	New: func() interface{} {
 		return &simpleDirectRollback{
-			tables:  make(map[string]tableRollback),
-			seenRow: make(map[string]map[int]struct{}),
+			tables: make(map[string]tableRollback),
 		}
 	},
 }
@@ -709,9 +890,6 @@ func newSimpleDirectRollback(state *persistedState) *simpleDirectRollback {
 	r.changes = r.changes[:0]
 	for k := range r.tables {
 		delete(r.tables, k)
-	}
-	for k := range r.seenRow {
-		delete(r.seenRow, k)
 	}
 	return r
 }
@@ -766,25 +944,21 @@ func (r *simpleDirectRollback) snapshotTable(name string) {
 	r.tables[name] = snap
 }
 
-func (r *simpleDirectRollback) recordRow(table string, data *tableData, pos int) {
+func (r *simpleDirectRollback) recordRow(table string, data *tableData, pos int, columnIndex int, columnName string, oldValue any) {
 	if r == nil || data == nil || pos < 0 || pos >= len(data.Rows) {
 		return
 	}
 	table = catalog.Normalize(table)
 	r.snapshotTable(table)
-	seen := r.seenRow[table]
-	if seen == nil {
-		seen = make(map[int]struct{})
-		r.seenRow[table] = seen
-	}
-	if _, ok := seen[pos]; ok {
-		return
-	}
-	seen[pos] = struct{}{}
 	row := data.Rows[pos]
-	row.Values = cloneValues(row.Values)
-	row.Pos = clonePositionedValues(row.Pos)
-	r.changes = append(r.changes, rowRollback{table: table, pos: pos, row: row})
+	r.changes = append(r.changes, rowRollback{
+		table:       table,
+		pos:         pos,
+		row:         row,
+		columnIndex: columnIndex,
+		columnName:  columnName,
+		oldValue:    oldValue,
+	})
 }
 
 func (r *simpleDirectRollback) restore() {
@@ -834,7 +1008,17 @@ func (r *simpleDirectRollback) restore() {
 		if data == nil || change.pos < 0 || change.pos >= len(data.Rows) {
 			continue
 		}
-		data.Rows[change.pos] = change.row
+		if change.columnIndex >= 0 {
+			row := &data.Rows[change.pos]
+			if change.columnIndex < len(row.Pos) {
+				row.Pos[change.columnIndex] = change.oldValue
+			}
+			if row.Values != nil {
+				row.Values[change.columnName] = change.oldValue
+			}
+		} else {
+			data.Rows[change.pos] = change.row
+		}
 		data.rowids = nil
 		data.indexes = nil
 		data.deferRuntime = true
@@ -850,9 +1034,6 @@ func (r *simpleDirectRollback) release() {
 	for k := range r.tables {
 		delete(r.tables, k)
 	}
-	for k := range r.seenRow {
-		delete(r.seenRow, k)
-	}
 	rollbackPool.Put(r)
 }
 
@@ -860,9 +1041,43 @@ func (d *DB) appendLogical(txid uint64, query string, args []any) error {
 	return d.appendLogicalState(txid, &d.state, query, args)
 }
 
+func (d *DB) appendWALRecord(rec wal.Record) error {
+	if err := d.wal.Append(rec, d.walSyncEnabled()); err != nil {
+		return err
+	}
+	d.walSize += wal.RecordSize(rec)
+	return nil
+}
+
+func (d *DB) walSyncEnabled() bool {
+	level := strings.ToUpper(strings.TrimSpace(d.state.Pragmas.Synchronous))
+	if level == "" {
+		level = strings.ToUpper(strings.TrimSpace(d.opts.Synchronous))
+	}
+	switch level {
+	case "OFF", "0", "NORMAL", "1":
+		return false
+	case "FULL", "2", "EXTRA", "3":
+		return true
+	default:
+		return d.opts.SyncPolicy == SyncFull
+	}
+}
+
 func (d *DB) appendLogicalState(txid uint64, state *persistedState, query string, args []any) error {
-	if data, ok := encodeSimpleWAL(query, args); ok {
-		err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
+	if plan, ok := simplePlan(query); ok {
+		return d.appendLogicalPlan(txid, state, plan, args)
+	}
+	data, err := encodeStateWAL(state)
+	if err != nil {
+		return err
+	}
+	return d.appendWALRecord(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data})
+}
+
+func (d *DB) appendLogicalPlan(txid uint64, state *persistedState, plan simpleDMLPlan, args []any) error {
+	if data, ok := encodeSimpleWALPlan(plan, args); ok {
+		err := d.appendWALRecord(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data})
 		releaseWALBuf(&data)
 		return err
 	}
@@ -870,7 +1085,7 @@ func (d *DB) appendLogicalState(txid uint64, state *persistedState, query string
 	if err != nil {
 		return err
 	}
-	return d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data}, d.opts.SyncPolicy == SyncFull)
+	return d.appendWALRecord(wal.Record{Type: wal.RecordCommit, TxID: txid, Data: data})
 }
 
 func encodeStateWAL(s *persistedState) ([]byte, error) {
@@ -896,7 +1111,7 @@ func encodeStateWAL(s *persistedState) ([]byte, error) {
 			tableNames = append(tableNames, name)
 		}
 	}
-	if len(tableNames) > math.MaxUint32 {
+	if uint64(len(tableNames)) > uint64(math.MaxUint32) {
 		return nil, errors.New("too many tables for state WAL")
 	}
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(tableNames)))
@@ -911,7 +1126,7 @@ func encodeStateWAL(s *persistedState) ([]byte, error) {
 		if !ok {
 			return nil, errors.New("table name too long for state WAL")
 		}
-		if len(data.Rows) > math.MaxUint32 {
+		if uint64(len(data.Rows)) > uint64(math.MaxUint32) {
 			return nil, errors.New("too many rows for state WAL")
 		}
 		out = binary.LittleEndian.AppendUint32(out, uint32(len(data.Rows)))
@@ -1019,6 +1234,9 @@ func encodeSimpleWALPlan(plan simpleDMLPlan, args []any) ([]byte, bool) {
 		walBufPool.Put(bp)
 		return nil, false
 	}
+	// append may have grown the backing array. Keep the actual encoded slice
+	// attached to its pool entry so releaseWALBuf can recycle it.
+	*bp = data
 	return data, true
 }
 
@@ -1026,7 +1244,8 @@ func releaseWALBuf(data *[]byte) {
 	if data == nil {
 		return
 	}
-	if cap(*data) < 256 {
+	if cap(*data) <= 64<<10 {
+		*data = (*data)[:0]
 		walBufPool.Put(data)
 	}
 }
@@ -1150,14 +1369,24 @@ func applySimpleWALRecord(s *persistedState, rec simpleWALRecord) error {
 		return err
 	}
 	if !fast {
-		return errors.New("could not replay simple WAL mutation")
+		if rec.plan.kind == 'u' {
+			if table, ok := s.Catalog.Table(rec.plan.table); ok && integerPrimaryKeyColumn(table) == rec.plan.where {
+				query := fmt.Sprintf("UPDATE %s SET %s = %s + %d WHERE %s = ?",
+					quoteWALIdentifier(rec.plan.table), quoteWALIdentifier(rec.plan.col),
+					quoteWALIdentifier(rec.plan.col), rec.plan.inc, quoteWALIdentifier(rec.plan.where))
+				if _, err := execute(context.Background(), s, query, rec.args...); err != nil {
+					return fmt.Errorf("replay primary-key update for %s: %w", rec.plan.table, err)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("could not replay simple WAL mutation (kind %q, table %q, %d arguments)", rec.plan.kind, rec.plan.table, len(rec.args))
 	}
 	return nil
 }
 
-func appendString16(dst []byte, s string) []byte {
-	dst, _ = appendString16OK(dst, s)
-	return dst
+func quoteWALIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func appendBytes32(dst []byte, data []byte) []byte {
@@ -1183,89 +1412,6 @@ func appendString16OK(dst []byte, s string) ([]byte, bool) {
 	}
 	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(s)))
 	return append(dst, s...), true
-}
-
-func decodeSimpleWAL(data []byte) (string, []any, bool, error) {
-	rec, ok, err := decodeSimpleWALRecord(data)
-	if !ok || err != nil {
-		return "", nil, ok, err
-	}
-	kind := rec.plan.kind
-	table := rec.plan.table
-	query := ""
-	switch kind {
-	case 'i':
-		query = "INSERT INTO " + table + " VALUES (" + strings.TrimRight(strings.Repeat("?,", len(rec.args)), ",") + ")"
-	case 'd':
-		query = "DELETE FROM " + table + " WHERE " + rec.plan.where + " = ?"
-	case 'u':
-		query = "UPDATE " + table + " SET " + rec.plan.col + " = " + rec.plan.col + " + " + strconv.FormatInt(rec.plan.inc, 10) + " WHERE " + rec.plan.where + " = ?"
-	default:
-		return "", nil, true, errors.New("unknown simple WAL record")
-	}
-	return query, rec.args, true, nil
-}
-
-func decodeSimpleWALLegacy(data []byte) (string, []any, bool, error) {
-	if len(data) < 2 || data[0] != simpleWALMagic {
-		return "", nil, false, nil
-	}
-	kind := data[1]
-	rest := data[2:]
-	table, rest, err := readString16(rest)
-	if err != nil {
-		return "", nil, true, err
-	}
-	query := ""
-	switch kind {
-	case 'i':
-	case 'd':
-		var where string
-		where, rest, err = readString16(rest)
-		if err != nil {
-			return "", nil, true, err
-		}
-		query = "DELETE FROM " + table + " WHERE " + where + " = ?"
-	case 'u':
-		var col, where string
-		col, rest, err = readString16(rest)
-		if err != nil {
-			return "", nil, true, err
-		}
-		where, rest, err = readString16(rest)
-		if err != nil {
-			return "", nil, true, err
-		}
-		if len(rest) < 8 {
-			return "", nil, true, errors.New("truncated simple WAL update increment")
-		}
-		inc := int64(binary.LittleEndian.Uint64(rest[:8]))
-		rest = rest[8:]
-		query = "UPDATE " + table + " SET " + col + " = " + col + " + " + strconv.FormatInt(inc, 10) + " WHERE " + where + " = ?"
-	default:
-		return "", nil, true, errors.New("unknown simple WAL record")
-	}
-	if len(rest) < 2 {
-		return "", nil, true, errors.New("truncated simple WAL argument count")
-	}
-	n := int(binary.LittleEndian.Uint16(rest[:2]))
-	rest = rest[2:]
-	args := make([]any, 0, n)
-	for i := 0; i < n; i++ {
-		var v any
-		v, rest, err = readWALValue(rest)
-		if err != nil {
-			return "", nil, true, err
-		}
-		args = append(args, v)
-	}
-	if len(rest) != 0 {
-		return "", nil, true, errors.New("trailing simple WAL bytes")
-	}
-	if kind == 'i' {
-		query = "INSERT INTO " + table + " VALUES (" + strings.TrimRight(strings.Repeat("?,", n), ",") + ")"
-	}
-	return query, args, true, nil
 }
 
 func readString16(data []byte) (string, []byte, error) {
@@ -1294,14 +1440,17 @@ func appendWALValue(dst []byte, v any) ([]byte, bool) {
 		dst = append(dst, 2)
 		return binary.LittleEndian.AppendUint64(dst, math.Float64bits(x)), true
 	case string:
-		if len(x) > math.MaxUint32 {
+		if uint64(len(x)) > uint64(math.MaxUint32) {
 			return nil, false
 		}
 		dst = append(dst, 3)
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(len(x)))
 		return append(dst, x...), true
 	case []byte:
-		if len(x) > math.MaxUint32 {
+		if x == nil {
+			return append(dst, 0), true
+		}
+		if uint64(len(x)) > uint64(math.MaxUint32) {
 			return nil, false
 		}
 		dst = append(dst, 4)
@@ -1318,20 +1467,6 @@ func appendWALValue(dst []byte, v any) ([]byte, bool) {
 	}
 }
 
-func encodeTransactionWAL(ops []logicalRecord) ([]byte, error) {
-	if data, ok := encodeSimpleTransactionWAL(ops); ok {
-		return data, nil
-	}
-	data, err := json.Marshal(ops)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, 1+len(data))
-	out = append(out, txWALMagic)
-	out = append(out, data...)
-	return out, nil
-}
-
 func encodeTxWAL(tx *Tx) ([]byte, error) {
 	if len(tx.ops) == 0 && len(tx.pendingInserts) > 0 {
 		if data, ok := encodePendingInsertTransactionWAL(tx); ok {
@@ -1346,33 +1481,114 @@ func encodeTxWAL(tx *Tx) ([]byte, error) {
 }
 
 func encodePendingInsertTransactionWAL(tx *Tx) ([]byte, bool) {
-	if len(tx.pendingInserts) == 0 || len(tx.pendingInserts) > math.MaxUint32 {
+	count := 0
+	for _, run := range tx.pendingInserts {
+		count += run.count
+	}
+	if count == 0 || uint64(count) > math.MaxUint32 {
 		return nil, false
 	}
-	out := []byte{txSimpleWALMagic}
-	out = binary.LittleEndian.AppendUint32(out, uint32(len(tx.pendingInserts)))
-	for _, ref := range tx.pendingInserts {
-		table := tx.writes.Catalog.Tables[ref.table]
-		data := tx.writes.Tables[ref.table]
-		if table == nil || data == nil || ref.index < 0 || ref.index >= len(data.Pending) {
+	if len(tx.pendingInserts) > math.MaxUint16 {
+		return nil, false
+	}
+	// Reserve the encoded size once. Without this pass, a large transaction
+	// repeatedly grows and recopies the WAL buffer while holding the writer
+	// lock. Values in Pending are already normalized SQLite storage classes.
+	capacity := 1 + 4 + 2
+	maxInt := int(^uint(0) >> 1)
+	addCapacity := func(size int) bool {
+		if size < 0 || size > maxInt-capacity {
+			return false
+		}
+		capacity += size
+		return true
+	}
+	for _, run := range tx.pendingInserts {
+		if run.table == "" || len(run.table) > math.MaxUint16 || run.count < 0 {
 			return nil, false
 		}
-		plan := simpleDMLPlan{kind: 'i', table: table.Name, params: len(table.Columns)}
-		lengthAt := len(out)
-		out = binary.LittleEndian.AppendUint32(out, 0)
-		start := len(out)
+		table := tx.writes.Catalog.Tables[run.table]
+		data := tx.writes.Tables[run.table]
+		if table == nil || data == nil || run.index < 0 || run.count <= 0 || run.index+run.count > len(data.Pending) {
+			return nil, false
+		}
+		if !addCapacity(2 + len(run.table) + 2 + 4) {
+			return nil, false
+		}
+		for i := run.index; i < run.index+run.count; i++ {
+			values := (&data.Pending[i]).positionedValues()
+			if len(values) != len(table.Columns) {
+				return nil, false
+			}
+			for _, value := range values {
+				size, ok := walValueSize(value)
+				if !ok || !addCapacity(size) {
+					return nil, false
+				}
+			}
+		}
+	}
+	out := make([]byte, 0, capacity)
+	out = append(out, txSimpleInsertBatchWALMagic)
+	out = binary.LittleEndian.AppendUint32(out, uint32(count))
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(tx.pendingInserts)))
+	for _, run := range tx.pendingInserts {
+		table := tx.writes.Catalog.Tables[run.table]
+		data := tx.writes.Tables[run.table]
+		if table == nil || data == nil || run.index < 0 || run.count <= 0 || run.index+run.count > len(data.Pending) || len(table.Columns) > math.MaxUint16 {
+			return nil, false
+		}
 		var ok bool
-		out, ok = appendSimpleWALPlan(out, plan, (&data.Pending[ref.index]).positionedValues())
-		if !ok || len(out)-start > math.MaxUint32 {
+		out, ok = appendString16OK(out, table.Name)
+		if !ok {
 			return nil, false
 		}
-		binary.LittleEndian.PutUint32(out[lengthAt:lengthAt+4], uint32(len(out)-start))
+		out = binary.LittleEndian.AppendUint16(out, uint16(len(table.Columns)))
+		out = binary.LittleEndian.AppendUint32(out, uint32(run.count))
+		for i := run.index; i < run.index+run.count; i++ {
+			values := (&data.Pending[i]).positionedValues()
+			if len(values) != len(table.Columns) {
+				return nil, false
+			}
+			for _, value := range values {
+				out, ok = appendWALValue(out, value)
+				if !ok {
+					return nil, false
+				}
+			}
+		}
 	}
 	return out, true
 }
 
+func walValueSize(value any) (int, bool) {
+	switch v := value.(type) {
+	case nil:
+		return 1, true
+	case int, int64, float64:
+		return 9, true
+	case bool:
+		return 2, true
+	case string:
+		if uint64(len(v)) > math.MaxUint32 {
+			return 0, false
+		}
+		return 5 + len(v), true
+	case []byte:
+		if v == nil {
+			return 1, true
+		}
+		if uint64(len(v)) > math.MaxUint32 {
+			return 0, false
+		}
+		return 5 + len(v), true
+	default:
+		return 0, false
+	}
+}
+
 func encodeSimpleTransactionWAL(ops []logicalRecord) ([]byte, bool) {
-	if len(ops) == 0 || len(ops) > math.MaxUint32 {
+	if len(ops) == 0 || uint64(len(ops)) > uint64(math.MaxUint32) {
 		return nil, false
 	}
 	out := []byte{txSimpleWALMagic}
@@ -1387,7 +1603,7 @@ func encodeSimpleTransactionWAL(ops []logicalRecord) ([]byte, bool) {
 		start := len(out)
 		var ok bool
 		out, ok = appendSimpleWALPlan(out, plan, op.Args)
-		if !ok || len(out)-start > math.MaxUint32 {
+		if !ok || uint64(len(out)-start) > uint64(math.MaxUint32) {
 			return nil, false
 		}
 		binary.LittleEndian.PutUint32(out[lengthAt:lengthAt+4], uint32(len(out)-start))
@@ -1396,6 +1612,9 @@ func encodeSimpleTransactionWAL(ops []logicalRecord) ([]byte, bool) {
 }
 
 func decodeSimpleTransactionWAL(data []byte) ([]simpleWALRecord, bool, error) {
+	if len(data) > 0 && data[0] == txSimpleInsertBatchWALMagic {
+		return decodeSimpleInsertBatchTransactionWAL(data[1:])
+	}
 	if len(data) == 0 || data[0] != txSimpleWALMagic {
 		return nil, false, nil
 	}
@@ -1403,18 +1622,23 @@ func decodeSimpleTransactionWAL(data []byte) ([]simpleWALRecord, bool, error) {
 	if len(data) < 4 {
 		return nil, true, errors.New("truncated simple transaction WAL count")
 	}
-	n := int(binary.LittleEndian.Uint32(data[:4]))
+	n64 := uint64(binary.LittleEndian.Uint32(data[:4]))
 	data = data[4:]
+	if n64 > uint64(len(data))/4 {
+		return nil, true, errors.New("invalid simple transaction WAL count")
+	}
+	n := int(n64)
 	records := make([]simpleWALRecord, 0, n)
 	for i := 0; i < n; i++ {
 		if len(data) < 4 {
 			return nil, true, errors.New("truncated simple transaction WAL record length")
 		}
-		size := int(binary.LittleEndian.Uint32(data[:4]))
+		size64 := uint64(binary.LittleEndian.Uint32(data[:4]))
 		data = data[4:]
-		if len(data) < size {
+		if size64 > uint64(len(data)) {
 			return nil, true, errors.New("truncated simple transaction WAL record")
 		}
+		size := int(size64)
 		rec, ok, err := decodeSimpleWALRecord(data[:size])
 		if err != nil {
 			return nil, true, err
@@ -1427,6 +1651,54 @@ func decodeSimpleTransactionWAL(data []byte) ([]simpleWALRecord, bool, error) {
 	}
 	if len(data) != 0 {
 		return nil, true, errors.New("trailing simple transaction WAL bytes")
+	}
+	return records, true, nil
+}
+
+func decodeSimpleInsertBatchTransactionWAL(data []byte) ([]simpleWALRecord, bool, error) {
+	if len(data) < 6 {
+		return nil, true, errors.New("truncated simple insert batch WAL header")
+	}
+	total64 := uint64(binary.LittleEndian.Uint32(data[:4]))
+	runs64 := uint64(binary.LittleEndian.Uint16(data[4:6]))
+	data = data[6:]
+	if total64 == 0 || runs64 == 0 || runs64 > total64 || total64 > uint64(len(data)) {
+		return nil, true, errors.New("invalid simple insert batch WAL counts")
+	}
+	total, runs := int(total64), int(runs64)
+	records := make([]simpleWALRecord, 0, total)
+	for runIndex := 0; runIndex < runs; runIndex++ {
+		table, rest, err := readString16(data)
+		if err != nil {
+			return nil, true, err
+		}
+		data = rest
+		if len(data) < 6 {
+			return nil, true, errors.New("truncated simple insert batch WAL run")
+		}
+		columns := int(binary.LittleEndian.Uint16(data[:2]))
+		rows64 := uint64(binary.LittleEndian.Uint32(data[2:6]))
+		data = data[6:]
+		if columns == 0 || rows64 == 0 || rows64 > uint64(total-len(records)) {
+			return nil, true, errors.New("invalid simple insert batch WAL run counts")
+		}
+		rows := int(rows64)
+		plan := simpleDMLPlan{kind: 'i', table: table, params: columns}
+		for rowIndex := 0; rowIndex < rows; rowIndex++ {
+			args := make([]any, 0, columns)
+			for columnIndex := 0; columnIndex < columns; columnIndex++ {
+				value, remaining, err := readWALValue(data)
+				if err != nil {
+					return nil, true, err
+				}
+				args = append(args, value)
+				data = remaining
+			}
+			records = append(records, simpleWALRecord{plan: plan, args: args})
+		}
+	}
+	if len(records) != total || len(data) != 0 {
+		return nil, true, errors.New("invalid simple insert batch WAL payload")
 	}
 	return records, true, nil
 }
@@ -1480,7 +1752,7 @@ func readWALValue(data []byte) (any, []byte, error) {
 		if len(data) < n {
 			return nil, nil, errors.New("truncated blob WAL payload")
 		}
-		v := append([]byte(nil), data[:n]...)
+		v := cloneSQLiteBlob(data[:n])
 		return v, data[n:], nil
 	case 5:
 		if len(data) < 1 {
@@ -1517,16 +1789,32 @@ func (d *DB) hasCleanCheckpointMarker() (bool, error) {
 		}
 		return false, err
 	}
-	txid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	fields := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	if len(fields) != 2 {
+		return false, nil
+	}
+	txid, err := strconv.ParseUint(fields[0], 10, 64)
 	if err != nil {
 		return false, nil
 	}
-	return txid == d.applied, nil
+	walSize, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return false, nil
+	}
+	currentWALSize, err := d.wal.Size()
+	if err != nil {
+		return false, err
+	}
+	return txid == d.applied && walSize == currentWALSize, nil
 }
 
 func (d *DB) writeCleanCheckpointMarker(applied uint64) error {
 	tmp := d.cleanCheckpointMarkerPath() + ".tmp"
-	data := []byte(strconv.FormatUint(applied, 10))
+	walSize, err := d.wal.Size()
+	if err != nil {
+		return err
+	}
+	data := []byte(strconv.FormatUint(applied, 10) + ":" + strconv.FormatInt(walSize, 10))
 	if err := writeFileSynced(tmp, data, 0o600); err != nil {
 		return err
 	}
@@ -1587,6 +1875,100 @@ func syncDir(path string) error {
 }
 
 func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error) {
+	if d.hasAttached.Load() {
+		if stmt, err := parseOneUnpooled(query); err == nil {
+			if selectStmt, ok := stmt.(*ast.SelectStmt); ok {
+				schemas := selectSchemaNames(selectStmt)
+				if len(schemas) > 1 {
+					return d.queryAttachedSelect(ctx, query, args, schemas)
+				}
+			}
+		}
+	}
+	ad, ferr := d.foreignTarget(query)
+	if ferr != nil {
+		return nil, ferr
+	}
+	if ad != nil {
+		defer ad.mu.RUnlock()
+		return ad.db.queryLocal(ctx, query, args...)
+	}
+	return d.queryLocal(ctx, query, args...)
+}
+
+// queryAttachedSelect evaluates a read-only SELECT over stable per-database
+// snapshots. Each table is copied into an ephemeral schema-qualified catalog,
+// so identically named tables in different files cannot alias accidentally.
+func (d *DB) queryAttachedSelect(ctx context.Context, query string, args []any, schemas []string) (*Rows, error) {
+	if err := d.checkOpen(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if err := d.refreshIfWALChanged(ctx); err != nil {
+		return nil, err
+	}
+	mainState := d.snapshotForRead()
+	view := newState()
+	view.compositeRead = true
+	addCompositeSchema(&view, "main", mainState, true)
+
+	// Keep each attachment alive through snapshot creation. Detach removes the
+	// name first, then waits on this read lock before closing its handle.
+	d.attachedMu.RLock()
+	attached := make(map[string]*attachedDB, len(schemas))
+	for _, schema := range schemas {
+		if schema == "main" {
+			continue
+		}
+		ad := d.attached[schema]
+		if ad == nil {
+			d.attachedMu.RUnlock()
+			return nil, fmt.Errorf("no such database: %s", schema)
+		}
+		ad.mu.RLock()
+		attached[schema] = ad
+	}
+	d.attachedMu.RUnlock()
+	defer func() {
+		for _, ad := range attached {
+			ad.mu.RUnlock()
+		}
+	}()
+	for _, schema := range schemas {
+		if schema == "main" {
+			continue
+		}
+		ad := attached[schema]
+		if err := ad.db.refreshIfWALChanged(ctx); err != nil {
+			return nil, err
+		}
+		addCompositeSchema(&view, schema, ad.db.snapshotForRead(), false)
+	}
+	triggerScopeMu.RLock()
+	defer triggerScopeMu.RUnlock()
+	rows, err := queryRows(ctx, &view, query, args...)
+	if err != nil {
+		return nil, d.rewriteMissingQualifiedTableError(query, err)
+	}
+	return rows, nil
+}
+
+func (d *DB) snapshotForRead() persistedState {
+	d.mu.Lock()
+	s := d.state.clone()
+	d.mu.Unlock()
+	return s
+}
+
+// queryLocal runs a query against this database without schema routing.
+func (d *DB) queryLocal(ctx context.Context, query string, args ...any) (*Rows, error) {
+	if rows, ok, err := d.queryDatabaseList(query); ok {
+		return rows, err
+	}
 	if err := d.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -1601,16 +1983,171 @@ func (d *DB) Query(ctx context.Context, query string, args ...any) (*Rows, error
 		return tx.Query(ctx, query, args...)
 	}
 	d.explicitMu.Unlock()
-	parseMu.Lock()
-	defer parseMu.Unlock()
-	d.mu.RLock()
+	if err := d.refreshIfWALChanged(ctx); err != nil {
+		return nil, err
+	}
+	for {
+		d.mu.RLock()
+		if !d.state.hasDeferredRuntime() || canQueryDeferredSimplePoint(&d.state, query, args) {
+			break
+		}
+		d.mu.RUnlock()
+		d.mu.Lock()
+		d.state.ensureRuntime()
+		d.mu.Unlock()
+	}
 	defer d.mu.RUnlock()
-	return queryRows(ctx, &d.state, query, args...)
+	triggerScopeMu.RLock()
+	defer triggerScopeMu.RUnlock()
+	stateView := d.state
+	stateView.ctes = nil
+	rows, err := queryRows(ctx, &stateView, query, args...)
+	if err != nil {
+		return nil, d.rewriteMissingQualifiedTableError(query, err)
+	}
+	return rows, nil
+}
+
+func (d *DB) rewriteMissingQualifiedTableError(query string, err error) error {
+	if err == nil || !strings.HasPrefix(err.Error(), "table does not exist: ") {
+		return err
+	}
+	schema, ok := statementSchemaOfQuery(query)
+	if !ok || isReservedSchema(schema) {
+		return err
+	}
+	if target := statementTargetName(query); target != "" {
+		return fmt.Errorf("no such table: %s", target)
+	}
+	return err
+}
+
+// refreshIfWALChanged detects commits from another handle or process. A reader
+// keeps its last committed snapshot while another writer owns the lock; replay
+// runs once the writer is idle, so reads never fail just because a commit is in
+// progress.
+func (d *DB) refreshIfWALChanged(ctx context.Context) error {
+	d.mu.RLock()
+	size, err := d.wal.Size()
+	stale := err == nil && size != d.walSize
+	d.mu.RUnlock()
+	if err != nil || !stale {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	size, err = d.wal.Size()
+	if err != nil || size == d.walSize {
+		return nil
+	}
+	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		if errors.Is(err, ErrDatabaseLocked) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return nil
+			}
+		}
+		return err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
+	return d.refreshWALLocked()
+}
+
+func (d *DB) refreshWALLocked() error {
+	size, err := d.wal.Size()
+	if err != nil {
+		return err
+	}
+	if size == d.walSize && !d.wal.HasIncompleteTail() {
+		return nil
+	}
+	return d.replayWithRepair()
+}
+
+// queryDatabaseList answers PRAGMA database_list, which must see the
+// connection's attached schemas rather than a single database's state.
+func (d *DB) queryDatabaseList(query string) (*Rows, bool, error) {
+	q := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
+	if !strings.EqualFold(q, "pragma database_list") {
+		return nil, false, nil
+	}
+	var out [][]any
+	for _, e := range d.databaseList() {
+		out = append(out, []any{int64(len(out)), e[0], e[1]})
+	}
+	return isql.NewRows([]string{"seq", "name", "file"}, out), true, nil
+}
+
+// foreignTarget reports the attached database a query targets, or nil when the
+// query belongs to this database. A statement naming a schema that is not
+// attached is an error rather than a fallback to main, so a detached schema can
+// never silently read another database's table of the same name.
+func (d *DB) foreignTarget(query string) (*attachedDB, error) {
+	if !d.hasAttached.Load() {
+		return nil, nil
+	}
+	q := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
+	if q == "" {
+		return nil, nil
+	}
+	// Most statements use unqualified names. Avoid allocating a parser arena
+	// just to discover that there is no schema qualifier to route.
+	if !strings.ContainsRune(q, '.') {
+		return nil, nil
+	}
+	stmt, parseErr := parseOneUnpooled(q)
+	if parseErr == nil && statementHasMultipleSchemas(stmt) {
+		return nil, errors.New("cross-database statements spanning attached schemas are not supported")
+	}
+	schema, ok := statementSchemaOfQuery(q)
+	if !ok {
+		return nil, nil
+	}
+	if isReservedSchema(schema) {
+		return nil, nil
+	}
+	d.attachedMu.RLock()
+	ad := d.attached[catalog.Normalize(schema)]
+	if ad != nil {
+		ad.mu.RLock()
+	}
+	d.attachedMu.RUnlock()
+	if ad == nil {
+		// SQLite reports a detached schema as a missing table, not a missing
+		// database, so match its wording.
+		if target := statementTargetName(query); target != "" {
+			return nil, fmt.Errorf("no such table: %s", target)
+		}
+		return nil, fmt.Errorf("no such database: %s", schema)
+	}
+	return ad, nil
 }
 
 func (d *DB) Close() error {
 	if d.closed.Swap(true) {
 		return nil
+	}
+	if err := d.acquireWriteGate(context.Background()); err != nil {
+		return err
+	}
+	defer d.releaseWriteGate()
+	if err := d.acquireWriteLock(context.Background()); err != nil {
+		_ = d.wal.Close()
+		_ = d.pager.Close()
+		_ = releaseDatabaseLock(d.lock)
+		return err
+	}
+	d.attachedMu.Lock()
+	attached := d.attached
+	d.attached = nil
+	d.hasAttached.Store(false)
+	d.attachedMu.Unlock()
+	for _, ad := range attached {
+		ad.mu.Lock()
+		_ = ad.db.Close()
+		ad.mu.Unlock()
 	}
 	d.explicitMu.Lock()
 	if d.explicitTx != nil {
@@ -1620,13 +2157,20 @@ func (d *DB) Close() error {
 	d.explicitMu.Unlock()
 	d.mu.Lock()
 	if d.applied != d.checkpointed {
-		if err := acquireDatabaseWriteLock(d.lock); err != nil {
+		// Another process may have committed since this handle's last write.
+		// Refresh under the writer lock before checkpointing, or this stale
+		// snapshot could replace a newer clean-checkpoint marker.
+		if err := d.refreshWALLocked(); err != nil {
+			_ = releaseDatabaseWriteLock(d.lock)
 			d.mu.Unlock()
 			_ = d.wal.Close()
 			_ = d.pager.Close()
 			_ = releaseDatabaseLock(d.lock)
 			return err
 		}
+		// Rows staged into Pending by the fast insert paths have to be
+		// materialised before they can be written out as table pages.
+		d.state.materializePending()
 		if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
 			_ = releaseDatabaseWriteLock(d.lock)
 			d.mu.Unlock()
@@ -1657,6 +2201,11 @@ func (d *DB) Close() error {
 	}
 	if d.cleanupLocks {
 		if rerr := os.RemoveAll(d.lockPath); err == nil {
+			err = rerr
+		}
+	}
+	if d.ephemeralRoot != "" {
+		if rerr := os.RemoveAll(d.ephemeralRoot); err == nil {
 			err = rerr
 		}
 	}
@@ -1737,7 +2286,13 @@ func (d *DB) replayPhysicalPages() error {
 }
 
 func (d *DB) replay() error {
-	return d.wal.Replay(func(rec wal.Record) error {
+	return d.replayWAL(false)
+}
+
+func (d *DB) replayWithRepair() error { return d.replayWAL(true) }
+
+func (d *DB) replayWAL(repair bool) error {
+	apply := func(rec wal.Record) error {
 		if rec.Type == wal.RecordSnapshot {
 			var s persistedState
 			if err := json.Unmarshal(rec.Data, &s); err != nil {
@@ -1776,14 +2331,11 @@ func (d *DB) replay() error {
 				return err
 			} else if ok {
 				d.state.NextTx = rec.TxID
-				parseMu.Lock()
 				for _, op := range ops {
 					if _, err := execute(context.Background(), &d.state, op.SQL, op.Args...); err != nil {
-						parseMu.Unlock()
 						return err
 					}
 				}
-				parseMu.Unlock()
 				d.state.rebuildRuntime()
 				d.applied = rec.TxID
 				return nil
@@ -1804,20 +2356,44 @@ func (d *DB) replay() error {
 				return err
 			}
 			d.state.NextTx = rec.TxID
-			parseMu.Lock()
 			if _, err := execute(context.Background(), &d.state, logical.SQL, logical.Args...); err != nil {
-				parseMu.Unlock()
 				return err
 			}
-			parseMu.Unlock()
 			d.state.rebuildRuntime()
 			d.applied = rec.TxID
 		}
 		return nil
-	})
+	}
+	var replayErr error
+	if repair {
+		replayErr = d.wal.ReplayAndRepair(apply)
+	} else {
+		replayErr = d.wal.Replay(apply)
+	}
+	if replayErr != nil {
+		return replayErr
+	}
+	d.walSize = d.wal.ReplaySize()
+	return nil
 }
 
-func (d *DB) commit(tx *Tx) error {
+func (d *DB) commit(ctx context.Context, tx *Tx) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if err := d.acquireWriteGate(ctx); err != nil {
+		return err
+	}
+	defer d.releaseWriteGate()
+	if err := d.checkOpen(); err != nil {
+		return err
+	}
+	if err := d.acquireWriteLock(ctx); err != nil {
+		return err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.checkOpen(); err != nil {
@@ -1826,16 +2402,27 @@ func (d *DB) commit(tx *Tx) error {
 	if len(tx.ops) == 0 && len(tx.pendingInserts) == 0 {
 		return nil
 	}
-	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+	if err := d.refreshWALLocked(); err != nil {
 		return err
 	}
-	defer releaseDatabaseWriteLock(d.lock)
 	next := d.applied + 1
-	tx.writes.NextTx = next
 	pendingOnly, err := d.validatePendingOnly(tx, d.applied != tx.baseApplied)
 	if err != nil {
 		return err
 	}
+	if !pendingOnly && d.applied != tx.baseApplied {
+		// Transactions execute against a snapshot. Replay intervening commits
+		// under the writer lock, then apply this transaction to the latest state
+		// so a stale snapshot cannot erase another writer's changes.
+		latest := d.state.clone()
+		for _, op := range tx.ops {
+			if _, err := execute(context.Background(), &latest, op.SQL, op.Args...); err != nil {
+				return err
+			}
+		}
+		tx.writes = latest
+	}
+	tx.writes.NextTx = next
 	data, err := encodeTxWAL(tx)
 	if err != nil {
 		return err
@@ -1843,7 +2430,7 @@ func (d *DB) commit(tx *Tx) error {
 	if err := d.markDirty(); err != nil {
 		return err
 	}
-	if err := d.wal.Append(wal.Record{Type: wal.RecordCommit, TxID: next, Data: data}, d.opts.SyncPolicy == SyncFull); err != nil {
+	if err := d.appendWALRecord(wal.Record{Type: wal.RecordCommit, TxID: next, Data: data}); err != nil {
 		return err
 	}
 	if pendingOnly {
@@ -1864,6 +2451,13 @@ func (d *DB) commit(tx *Tx) error {
 }
 
 func (d *DB) validatePendingOnly(tx *Tx, revalidateConflicts bool) (bool, error) {
+	// Pending-only commits are encoded as a batch of physical table inserts.
+	// Statements logged in tx.ops may have side effects outside those pending
+	// rows (virtual tables, triggers, and other SQL paths), so they must use the
+	// normal transaction commit path even when their shadow rows are pending.
+	if len(tx.ops) != 0 {
+		return false, nil
+	}
 	if tx.writes.Pragmas.SchemaVer != d.state.Pragmas.SchemaVer || len(tx.writes.Catalog.Tables) != len(d.state.Catalog.Tables) {
 		return false, nil
 	}
@@ -1924,6 +2518,31 @@ func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
 		liveData := d.state.Tables[name]
 		liveTable := d.state.Catalog.Tables[name]
 		txTable := tx.writes.Catalog.Tables[name]
+		if len(liveTable.Indexes) == 0 && !liveData.deferRuntime && liveData.rowids != nil && liveData.indexes != nil {
+			start := len(liveData.Rows)
+			liveData.Rows = reserveRowsForAppend(liveData.Rows, len(data.Pending))
+			liveData.Rows = append(liveData.Rows, data.Pending...)
+			liveData.pendingCapHint = len(data.Pending)
+			if liveData.pendingCapHint > 256 {
+				liveData.pendingCapHint = 256
+			}
+			// The B-tree retains inserted byte slices; share one backing buffer
+			// across this batch instead of allocating a key and value per row.
+			indexBytes := make([]byte, len(data.Pending)*16)
+			liveData.rowids.PutManyOwnedFunc(len(data.Pending), func(i int) ([]byte, []byte) {
+				pos := start + i
+				liveData.Rows[pos].Created = next
+				rowID := liveData.Rows[pos].RowID
+				base := i * 16
+				key := indexBytes[base : base+8]
+				value := indexBytes[base+8 : base+16]
+				binary.BigEndian.PutUint64(key, uint64(rowID)^(uint64(1)<<63))
+				binary.LittleEndian.PutUint64(value, uint64(pos))
+				return key, value
+			})
+			liveTable.NextRowID = txTable.NextRowID
+			continue
+		}
 		for _, row := range data.Pending {
 			row.Created = next
 			liveData.Rows = append(liveData.Rows, row)
@@ -1931,6 +2550,27 @@ func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
 		}
 		liveTable.NextRowID = txTable.NextRowID
 	}
+}
+
+// reserveRowsForAppend grows the live table's row slice geometrically before
+// applying a committed insert batch. Transaction snapshots cap their own slice
+// at the snapshot length, so the live table can safely use this extra capacity
+// without exposing appended rows to older snapshots.
+func reserveRowsForAppend(rows []rowVersion, appendCount int) []rowVersion {
+	need := len(rows) + appendCount
+	if need <= cap(rows) {
+		return rows
+	}
+	capacity := cap(rows) * 2
+	if capacity < need {
+		capacity = need
+	}
+	if capacity < 8 {
+		capacity = 8
+	}
+	grown := make([]rowVersion, len(rows), capacity)
+	copy(grown, rows)
+	return grown
 }
 
 func (d *DB) Checkpoint(ctx context.Context) error {
@@ -1942,12 +2582,22 @@ func (d *DB) Checkpoint(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := acquireDatabaseWriteLock(d.lock); err != nil {
+	if err := d.acquireWriteGate(ctx); err != nil {
+		return err
+	}
+	defer d.releaseWriteGate()
+	if err := d.checkOpen(); err != nil {
+		return err
+	}
+	if err := d.acquireWriteLock(ctx); err != nil {
 		return err
 	}
 	defer releaseDatabaseWriteLock(d.lock)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.refreshWALLocked(); err != nil {
+		return err
+	}
 	return d.checkpointLocked(ctx)
 }
 
@@ -2033,15 +2683,11 @@ func (d *DB) appendPhysicalPagerWAL(txid uint64) error {
 			LSN:    pg.LSN,
 			Data:   append([]byte(nil), raw[off:off+d.opts.PageSize]...),
 		}
-		if err := d.wal.Append(wal.Record{Type: wal.RecordPage, TxID: txid, Data: wal.EncodePageRecord(frame)}, d.opts.SyncPolicy == SyncFull); err != nil {
+		if err := d.appendWALRecord(wal.Record{Type: wal.RecordPage, TxID: txid, Data: wal.EncodePageRecord(frame)}); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func (d *DB) tablePager(name string) (*pager.Pager, error) {
-	return d.tablePagerFor(name, 0)
 }
 
 func (d *DB) tablePagerFor(name string, generation uint64) (*pager.Pager, error) {
@@ -2053,10 +2699,6 @@ func (d *DB) tablePagerPath(name string, generation uint64) string {
 		return filepath.Join(d.path, "table_"+safeName(name)+".pages")
 	}
 	return filepath.Join(d.path, "table_"+safeName(name)+"_"+strconv.FormatUint(generation, 10)+".pages")
-}
-
-func (d *DB) indexPager(table, index string) (*pager.Pager, error) {
-	return d.indexPagerFor(table, index, 0)
 }
 
 func (d *DB) indexPagerFor(table, index string, generation uint64) (*pager.Pager, error) {
@@ -2299,7 +2941,7 @@ type Tx struct {
 	baseApplied    uint64
 	savepoints     []savepoint
 	ops            []logicalRecord
-	pendingInserts []pendingInsertRef
+	pendingInserts []pendingInsertRun
 	closed         bool
 }
 
@@ -2308,41 +2950,52 @@ type savepoint struct {
 	state          persistedState
 	ops            int
 	pendingInserts int
+	pendingLast    int
 }
 
-type pendingInsertRef struct {
+type pendingInsertRun struct {
 	table string
 	index int
+	count int
 }
 
 func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error) {
 	if err := t.check(); err != nil {
 		return Result{}, err
 	}
-	parseMu.Lock()
-	defer parseMu.Unlock()
 	if ok, err := t.execTransactionControl(query); ok || err != nil {
 		return Result{}, err
 	}
-	if plan, ok := simplePlan(query); ok && plan.kind != 'i' {
+	plan, planOK := simplePlan(query)
+	if planOK && plan.kind != 'i' {
 		t.writes.ensureRuntime()
 	}
-	if res, fast, err := fastSimpleDML(&t.writes, query, args); fast || err != nil {
-		if err == nil {
-			t.logOp(query, args)
+	res, fast, fastErr := fastSimpleDMLWithPlan(&t.writes, query, args, nil, plan, planOK)
+	if fast || fastErr != nil {
+		if fastErr == nil {
+			t.logOpWithPlan(query, args, plan, planOK)
 		}
-		return res, err
+		return res, fastErr
 	}
-	if stmt, err := parseStatementCached(stripStrictOnly(query)); err == nil {
+	type directResult struct {
+		result Result
+		fast   bool
+		err    error
+	}
+	direct, parseErr := withQueryStatement(stripStrictOnly(query), func(stmt ast.Statement) (directResult, error) {
 		if _, insert := stmt.(*ast.InsertStmt); !insert {
 			t.writes.ensureRuntime()
 		}
-		if res, fast, err := fastDirectDML(&t.writes, stmt, args); fast || err != nil {
-			if err == nil {
-				t.logOp(query, args)
-			}
-			return res, err
+		triggerScopeMu.RLock()
+		res, fast, err := fastDirectDML(&t.writes, stmt, args)
+		triggerScopeMu.RUnlock()
+		return directResult{res, fast, err}, nil
+	})
+	if parseErr == nil && (direct.fast || direct.err != nil) {
+		if direct.err == nil {
+			t.logOp(query, args)
 		}
+		return direct.result, direct.err
 	}
 	res, err := execute(ctx, &t.writes, query, args...)
 	if err == nil {
@@ -2352,8 +3005,17 @@ func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error
 }
 
 func (t *Tx) logOp(query string, args []any) {
-	if ref, ok := t.pendingInsertRef(query, args); ok && len(t.ops) == 0 {
-		t.pendingInserts = append(t.pendingInserts, ref)
+	plan, planOK := simplePlan(query)
+	t.logOpWithPlan(query, args, plan, planOK)
+}
+
+func (t *Tx) logOpWithPlan(query string, args []any, plan simpleDMLPlan, planOK bool) {
+	if ref, ok := t.pendingInsertRef(plan, planOK, len(args)); ok && len(t.ops) == 0 {
+		if n := len(t.pendingInserts); n > 0 && t.pendingInserts[n-1].table == ref.table && t.pendingInserts[n-1].index+t.pendingInserts[n-1].count == ref.index {
+			t.pendingInserts[n-1].count++
+		} else {
+			t.pendingInserts = append(t.pendingInserts, pendingInsertRun{table: ref.table, index: ref.index, count: 1})
+		}
 		return
 	}
 	t.flushPendingInsertLogs()
@@ -2361,37 +3023,45 @@ func (t *Tx) logOp(query string, args []any) {
 	t.ops = append(t.ops, logicalRecord{SQL: query, Args: copied})
 }
 
-func (t *Tx) pendingInsertRef(query string, args []any) (pendingInsertRef, bool) {
-	plan, ok := simplePlan(query)
-	if !ok || plan.kind != 'i' || plan.params != len(args) {
-		return pendingInsertRef{}, false
+func (t *Tx) pendingInsertRef(plan simpleDMLPlan, planOK bool, argCount int) (pendingInsertRun, bool) {
+	if !planOK || plan.kind != 'i' || plan.params != argCount {
+		return pendingInsertRun{}, false
 	}
 	table, ok := t.writes.Catalog.Table(plan.table)
 	if !ok || !canFastPositionedInsert(&t.writes, table) {
-		return pendingInsertRef{}, false
+		return pendingInsertRun{}, false
 	}
 	data := t.writes.Tables[table.Name]
 	if data == nil || len(data.Pending) == 0 {
-		return pendingInsertRef{}, false
+		return pendingInsertRun{}, false
 	}
-	return pendingInsertRef{table: table.Name, index: len(data.Pending) - 1}, true
+	return pendingInsertRun{table: table.Name, index: len(data.Pending) - 1, count: 1}, true
+}
+
+func (t *Tx) pendingInsertLastCount() int {
+	if len(t.pendingInserts) == 0 {
+		return 0
+	}
+	return t.pendingInserts[len(t.pendingInserts)-1].count
 }
 
 func (t *Tx) flushPendingInsertLogs() {
 	if len(t.pendingInserts) == 0 {
 		return
 	}
-	for _, ref := range t.pendingInserts {
-		table := t.writes.Catalog.Tables[ref.table]
-		data := t.writes.Tables[ref.table]
-		if table == nil || data == nil || ref.index < 0 || ref.index >= len(data.Pending) {
+	for _, run := range t.pendingInserts {
+		table := t.writes.Catalog.Tables[run.table]
+		data := t.writes.Tables[run.table]
+		if table == nil || data == nil || run.index < 0 || run.count < 0 || run.index+run.count > len(data.Pending) {
 			continue
 		}
-		row := data.Pending[ref.index]
-		t.ops = append(t.ops, logicalRecord{
-			SQL:  insertSQLForTable(table),
-			Args: append([]any(nil), row.positionedValues()...),
-		})
+		for i := run.index; i < run.index+run.count; i++ {
+			row := data.Pending[i]
+			t.ops = append(t.ops, logicalRecord{
+				SQL:  insertSQLForTable(table),
+				Args: append([]any(nil), row.positionedValues()...),
+			})
+		}
 	}
 	t.pendingInserts = nil
 }
@@ -2405,18 +3075,34 @@ func (t *Tx) Query(ctx context.Context, query string, args ...any) (*Rows, error
 		return nil, err
 	}
 	t.writes.materializePending()
-	parseMu.Lock()
-	defer parseMu.Unlock()
-	return queryRows(ctx, &t.writes, query, args...)
+	triggerScopeMu.RLock()
+	defer triggerScopeMu.RUnlock()
+	stateView := t.writes
+	stateView.ctes = nil
+	return queryRows(ctx, &stateView, query, args...)
 }
 
 func (t *Tx) Commit() error {
+	return t.CommitContext(context.Background())
+}
+
+// CommitContext commits the transaction, waiting for another process to
+// release the writer lock until either the database busy timeout or ctx ends.
+// A canceled wait leaves the transaction open so the caller may retry.
+func (t *Tx) CommitContext(ctx context.Context) error {
 	if err := t.check(); err != nil {
+		return err
+	}
+	if err := t.db.commit(ctx, t); err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.closed = true
+			t.tx.Close()
+		}
 		return err
 	}
 	t.closed = true
 	t.tx.Close()
-	return t.db.commit(t)
+	return nil
 }
 
 func (t *Tx) Rollback() error {
@@ -2436,19 +3122,26 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 	if !looksLikeTransactionControl(query) {
 		return false, nil
 	}
-	stmt, err := parseStatementCached(query)
-	if err != nil {
+	type parsedTxControl struct {
+		action string
+		name   string
+		valid  bool
+	}
+	parsed, err := withQueryStatement(query, func(stmt ast.Statement) (parsedTxControl, error) {
+		txstmt, ok := stmt.(*ast.TransactionStmt)
+		if !ok {
+			return parsedTxControl{}, nil
+		}
+		name := ""
+		if txstmt.Savepoint != nil {
+			name = strings.ToLower(txstmt.Savepoint.Unquoted)
+		}
+		return parsedTxControl{action: strings.ToLower(strings.TrimSpace(string(txstmt.Action))), name: name, valid: true}, nil
+	})
+	if err != nil || !parsed.valid {
 		return false, nil
 	}
-	txstmt, ok := stmt.(*ast.TransactionStmt)
-	if !ok {
-		return false, nil
-	}
-	action := strings.ToLower(strings.TrimSpace(string(txstmt.Action)))
-	name := ""
-	if txstmt.Savepoint != nil {
-		name = strings.ToLower(txstmt.Savepoint.Unquoted)
-	}
+	action, name := parsed.action, parsed.name
 	switch action {
 	case "begin", "start", "start_transaction", "commit":
 		return true, nil
@@ -2465,6 +3158,9 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 				t.writes = t.savepoints[i].state.clone()
 				t.ops = t.ops[:t.savepoints[i].ops]
 				t.pendingInserts = t.pendingInserts[:t.savepoints[i].pendingInserts]
+				if len(t.pendingInserts) > 0 {
+					t.pendingInserts[len(t.pendingInserts)-1].count = t.savepoints[i].pendingLast
+				}
 				t.savepoints = t.savepoints[:i+1]
 				return true, nil
 			}
@@ -2474,7 +3170,7 @@ func (t *Tx) execTransactionControl(query string) (bool, error) {
 		if name == "" {
 			return true, errors.New("savepoint name is required")
 		}
-		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts)})
+		t.savepoints = append(t.savepoints, savepoint{name: name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts), pendingLast: t.pendingInsertLastCount()})
 		return true, nil
 	case "release", "release_savepoint":
 		if name == "" {
@@ -2541,6 +3237,9 @@ func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 				t.writes = t.savepoints[i].state.clone()
 				t.ops = t.ops[:t.savepoints[i].ops]
 				t.pendingInserts = t.pendingInserts[:t.savepoints[i].pendingInserts]
+				if len(t.pendingInserts) > 0 {
+					t.pendingInserts[len(t.pendingInserts)-1].count = t.savepoints[i].pendingLast
+				}
 				t.savepoints = t.savepoints[:i+1]
 				return Result{}, nil
 			}
@@ -2550,7 +3249,7 @@ func (t *Tx) execTransactionCommand(cmd txCommand) (Result, error) {
 		if cmd.name == "" {
 			return Result{}, errors.New("savepoint name is required")
 		}
-		t.savepoints = append(t.savepoints, savepoint{name: cmd.name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts)})
+		t.savepoints = append(t.savepoints, savepoint{name: cmd.name, state: t.writes.clone(), ops: len(t.ops), pendingInserts: len(t.pendingInserts), pendingLast: t.pendingInsertLastCount()})
 		return Result{}, nil
 	case "release":
 		if cmd.name == "" {

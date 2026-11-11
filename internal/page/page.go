@@ -34,16 +34,34 @@ func Encode(p Page, size int) ([]byte, error) {
 		return nil, errors.New("page payload too large")
 	}
 	buf := make([]byte, size)
+	if err := EncodeInto(p, size, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// EncodeInto serializes a page into caller-owned storage. Reusing buf avoids a
+// page-sized allocation for every page written during checkpointing.
+func EncodeInto(p Page, size int, buf []byte) error {
+	if size <= HeaderSize {
+		return errors.New("page size too small")
+	}
+	if len(p.Data) > size-HeaderSize {
+		return errors.New("page payload too large")
+	}
+	if len(buf) < size {
+		return errors.New("page output buffer too small")
+	}
+	buf = buf[:size]
+	clear(buf)
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(p.ID))
 	binary.LittleEndian.PutUint64(buf[8:16], p.LSN)
 	binary.LittleEndian.PutUint32(buf[20:24], uint32(len(p.Data)))
 	copy(buf[HeaderSize:], p.Data)
-	h := crc32.NewIEEE()
-	h.Write(buf[8:16])
-	h.Write(buf[20:])
-	sum := h.Sum32()
+	sum := crc32.Update(0, crc32.IEEETable, buf[8:16])
+	sum = crc32.Update(sum, crc32.IEEETable, buf[20:])
 	binary.LittleEndian.PutUint32(buf[16:20], sum)
-	return buf, nil
+	return nil
 }
 
 func Decode(buf []byte) (Page, error) {
@@ -51,10 +69,8 @@ func Decode(buf []byte) (Page, error) {
 		return Page{}, errors.New("page buffer too small")
 	}
 	want := binary.LittleEndian.Uint32(buf[16:20])
-	h := crc32.NewIEEE()
-	h.Write(buf[8:16])
-	h.Write(buf[20:])
-	got := h.Sum32()
+	got := crc32.Update(0, crc32.IEEETable, buf[8:16])
+	got = crc32.Update(got, crc32.IEEETable, buf[20:])
 	if got != want {
 		return Page{}, errors.New("page checksum mismatch")
 	}

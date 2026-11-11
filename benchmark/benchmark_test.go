@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	db "github.com/sujit/sqlite"
+	customdriver "github.com/sujit/sqlite/driver"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -49,6 +50,103 @@ func BenchmarkSQLiteComparison(b *testing.B) {
 	b.Run("mattn/concurrent_mixed", benchMattnConcurrentMixed)
 }
 
+// BenchmarkSQLiteFTSMatch compares selective MATCH queries on a moderately
+// sized index. Setup is outside the timed region; neither engine ranks results
+// because the query only returns rowid.
+func BenchmarkSQLiteFTSMatch(b *testing.B) {
+	b.Run("custom", benchCustomFTSMatch)
+	b.Run("mattn", benchMattnFTSMatch)
+}
+
+func benchCustomFTSMatch(b *testing.B) {
+	ctx := context.Background()
+	d := openBenchCustomWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
+	mustCustomExec(b, d, `CREATE VIRTUAL TABLE ft USING fts5(body)`)
+	tx, err := d.Begin(ctx, db.TxOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		body := fmt.Sprintf("common document token-%04d", i)
+		if i == 1379 {
+			body += " needle"
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO ft(body) VALUES ('%s')`, body)); err != nil {
+			_ = tx.Rollback()
+			b.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	// The first read can build deferred runtime indexes after a large write
+	// transaction. Keep that one-time setup cost out of the steady-state MATCH
+	// query measurement; the SQLite setup path builds its index before timing.
+	warm, err := d.Query(ctx, `SELECT rowid FROM ft WHERE ft MATCH 'needle'`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, ok := warm.Next(); !ok {
+		b.Fatal("MATCH returned no row during warmup")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := d.Query(ctx, `SELECT rowid FROM ft WHERE ft MATCH 'needle'`)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, ok := rows.Next(); !ok {
+			b.Fatal("MATCH returned no row")
+		}
+	}
+}
+
+func benchMattnFTSMatch(b *testing.B) {
+	d := openBenchMattnWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = OFF`)
+	if _, err := d.Exec(`CREATE VIRTUAL TABLE ft USING fts5(body)`); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such module: fts5") {
+			b.Skip("mattn/go-sqlite3 was built without FTS5; rerun with -tags sqlite_fts5")
+		}
+		b.Fatal(err)
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		b.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO ft(body) VALUES (?)`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		body := fmt.Sprintf("common document token-%04d", i)
+		if i == 1379 {
+			body += " needle"
+		}
+		if _, err := stmt.Exec(body); err != nil {
+			_ = tx.Rollback()
+			b.Fatal(err)
+		}
+	}
+	_ = stmt.Close()
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := d.Query(`SELECT rowid FROM ft WHERE ft MATCH 'needle'`)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if !rows.Next() {
+			_ = rows.Close()
+			b.Fatal("MATCH returned no row")
+		}
+		_ = rows.Close()
+	}
+}
+
 func BenchmarkSQLiteThroughputComparison(b *testing.B) {
 	b.Run("custom_fast/insert_autocommit", func(b *testing.B) {
 		benchCustomInsertAutocommitWithOptions(b, db.Options{SyncPolicy: db.SyncOff})
@@ -62,6 +160,190 @@ func BenchmarkSQLiteThroughputComparison(b *testing.B) {
 	b.Run("mattn_fast/update_by_pk", func(b *testing.B) {
 		benchMattnUpdateByPKWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = OFF`)
 	})
+}
+
+// BenchmarkSQLiteConcurrentFull compares the same database/sql prepared
+// statement mix with four connections and FULL durability on both engines.
+// It exercises concurrent point reads and serialized autocommit updates.
+func BenchmarkSQLiteConcurrentFull(b *testing.B) {
+	b.Run("custom", benchCustomConcurrentFull)
+	b.Run("mattn", benchMattnConcurrentFull)
+}
+
+func benchCustomConcurrentFull(b *testing.B) {
+	d, err := sql.Open(customdriver.Name, b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	d.SetMaxOpenConns(4)
+	d.SetMaxIdleConns(4)
+	defer d.Close()
+	seedConcurrentFull(b, d)
+	warmConcurrentFullConnections(b, d)
+	benchConcurrentFullStatements(b, d)
+}
+
+func benchMattnConcurrentFull(b *testing.B) {
+	d := openBenchMattnWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = FULL`, `PRAGMA busy_timeout = 5000`)
+	d.SetMaxOpenConns(4)
+	d.SetMaxIdleConns(4)
+	seedConcurrentFull(b, d)
+	warmConcurrentFullConnections(b, d)
+	benchConcurrentFullStatements(b, d)
+}
+
+func warmConcurrentFullConnections(b *testing.B, d *sql.DB) {
+	b.Helper()
+	conns := make([]*sql.Conn, 0, 4)
+	for i := 0; i < cap(conns); i++ {
+		conn, err := d.Conn(context.Background())
+		if err != nil {
+			for _, openConn := range conns {
+				_ = openConn.Close()
+			}
+			b.Fatal(err)
+		}
+		conns = append(conns, conn)
+		var score int64
+		if err := conn.QueryRowContext(context.Background(), `SELECT score FROM concurrent_full WHERE id = ?`, int64(1)).Scan(&score); err != nil {
+			for _, openConn := range conns {
+				_ = openConn.Close()
+			}
+			b.Fatalf("warm connection %d cannot read seeded row: %v", i, err)
+		}
+		if score != 0 {
+			b.Fatalf("warm connection %d read score %d, want 0", i, score)
+		}
+	}
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func seedConcurrentFull(b *testing.B, d *sql.DB) {
+	b.Helper()
+	if _, err := d.Exec(`CREATE TABLE concurrent_full (id INTEGER PRIMARY KEY, score INTEGER)`); err != nil {
+		b.Fatal(err)
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		b.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO concurrent_full VALUES (?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		b.Fatal(err)
+	}
+	for i := 0; i < benchRows; i++ {
+		if _, err := stmt.Exec(int64(i+1), int64(i)); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			b.Fatal(err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		b.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func benchConcurrentFullStatements(b *testing.B, d *sql.DB) {
+	b.Helper()
+	readStmt, err := d.Prepare(`SELECT score FROM concurrent_full WHERE id = ?`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer readStmt.Close()
+	writeStmt, err := d.Prepare(`UPDATE concurrent_full SET score = score + 1 WHERE id = ?`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer writeStmt.Close()
+	var seq uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := atomic.AddUint64(&seq, 1)
+			id := int64(n%benchRows + 1)
+			if n%20 == 0 {
+				if _, err := writeStmt.Exec(id); err != nil {
+					b.Fatal(err)
+				}
+				continue
+			}
+			var score int64
+			if err := readStmt.QueryRow(id).Scan(&score); err != nil {
+				var count int64
+				countErr := d.QueryRow(`SELECT COUNT(*) FROM concurrent_full`).Scan(&count)
+				b.Fatalf("read id %d: %v (count=%d, count error=%v)", id, err, count, countErr)
+			}
+		}
+	})
+}
+
+// BenchmarkSQLiteSyncNormalComparison compares WAL autocommit throughput with
+// both engines using NORMAL synchronization, separate from the default FULL
+// durability comparison above.
+func BenchmarkSQLiteSyncNormalComparison(b *testing.B) {
+	b.Run("custom/insert_autocommit", func(b *testing.B) {
+		benchCustomInsertAutocommitWithOptions(b, db.Options{Synchronous: "NORMAL"})
+	})
+	b.Run("mattn/insert_autocommit", func(b *testing.B) {
+		benchMattnInsertAutocommitWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`)
+	})
+}
+
+// BenchmarkSQLitePreparedFullInsert compares the same database/sql prepared
+// statement path on each engine with FULL durability enabled.
+func BenchmarkSQLitePreparedFullInsert(b *testing.B) {
+	b.Run("custom", benchPreparedCustomFullInsert)
+	b.Run("mattn", benchPreparedMattnFullInsert)
+}
+
+func benchPreparedCustomFullInsert(b *testing.B) {
+	d, err := sql.Open(customdriver.Name, b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(`CREATE TABLE prepared_full (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`); err != nil {
+		b.Fatal(err)
+	}
+	stmt, err := d.Prepare(`INSERT INTO prepared_full VALUES (?, ?, ?)`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := stmt.Exec(int64(i+1), "name", int64(i%100)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchPreparedMattnFullInsert(b *testing.B) {
+	d := openBenchMattnWithPragmas(b, `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = FULL`)
+	mustSQLExec(b, d, `CREATE TABLE prepared_full (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`)
+	stmt, err := d.Prepare(`INSERT INTO prepared_full VALUES (?, ?, ?)`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stmt.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := stmt.Exec(int64(i+1), "name", int64(i%100)); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func benchCustomInsertTx(b *testing.B) {
@@ -79,10 +361,10 @@ func benchCustomInsertTx(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.StopTimer()
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
+	b.StopTimer()
 }
 
 func benchMattnInsertTx(b *testing.B) {
@@ -103,11 +385,11 @@ func benchMattnInsertTx(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.StopTimer()
 	_ = stmt.Close()
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
+	b.StopTimer()
 }
 
 func benchCustomInsertAutocommit(b *testing.B) {

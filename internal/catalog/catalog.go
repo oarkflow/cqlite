@@ -56,15 +56,16 @@ type ForeignKey struct {
 }
 
 type Table struct {
-	Name        string       `json:"name"`
-	Columns     []Column     `json:"columns"`
-	Indexes     []Index      `json:"indexes"`
-	NextRowID   int64        `json:"next_row_id"`
-	SchemaVers  uint64       `json:"schema_version"`
-	Strict      bool         `json:"strict"`
-	SQL         string       `json:"sql,omitempty"`
-	ForeignKeys []ForeignKey `json:"foreign_keys,omitempty"`
-	Checks      []string     `json:"checks,omitempty"`
+	Name              string       `json:"name"`
+	Columns           []Column     `json:"columns"`
+	PrimaryKeyColumns []string     `json:"primary_key_columns,omitempty"`
+	Indexes           []Index      `json:"indexes"`
+	NextRowID         int64        `json:"next_row_id"`
+	SchemaVers        uint64       `json:"schema_version"`
+	Strict            bool         `json:"strict"`
+	SQL               string       `json:"sql,omitempty"`
+	ForeignKeys       []ForeignKey `json:"foreign_keys,omitempty"`
+	Checks            []string     `json:"checks,omitempty"`
 }
 
 type View struct {
@@ -75,13 +76,87 @@ type View struct {
 	SchemaVers uint64   `json:"schema_version"`
 }
 
+// Trigger records a persisted trigger definition. The body is kept as SQL text
+// and re-parsed on use, the same way views store their SELECT.
+type Trigger struct {
+	Name       string   `json:"name"`
+	Table      string   `json:"table"`
+	Timing     string   `json:"timing"` // "before", "after", "instead_of", or ""
+	Event      string   `json:"event"`  // "insert", "delete", "update"
+	UpdateOf   []string `json:"update_of,omitempty"`
+	ForEachRow bool     `json:"for_each_row"`
+	WhenSQL    string   `json:"when_sql,omitempty"`
+	BodySQL    string   `json:"body_sql"`
+	SQL        string   `json:"sql,omitempty"`
+	Temporary  bool     `json:"temporary,omitempty"`
+}
+
+// VirtualTable is a persisted CREATE VIRTUAL TABLE definition. The concrete
+// module fields are kept in ModuleKV so the catalog package stays independent
+// of any particular virtual table implementation.
+type VirtualTable struct {
+	Name     string            `json:"name"`
+	Module   string            `json:"module"`
+	Args     string            `json:"args"`
+	Columns  []string          `json:"columns"`
+	Shadows  []string          `json:"shadows,omitempty"`
+	ModuleKV map[string]string `json:"module_kv,omitempty"`
+	SQL      string            `json:"sql,omitempty"`
+}
+
 type Catalog struct {
-	Tables map[string]*Table `json:"tables"`
-	Views  map[string]*View  `json:"views,omitempty"`
+	Tables        map[string]*Table        `json:"tables"`
+	Views         map[string]*View         `json:"views,omitempty"`
+	Triggers      map[string]*Trigger      `json:"triggers,omitempty"`
+	VirtualTables map[string]*VirtualTable `json:"virtual_tables,omitempty"`
 }
 
 func New() Catalog {
 	return Catalog{Tables: make(map[string]*Table), Views: make(map[string]*View)}
+}
+
+// TriggerByName resolves a trigger by normalized name.
+func (c Catalog) TriggerByName(name string) (*Trigger, bool) {
+	if c.Triggers == nil {
+		return nil, false
+	}
+	t, ok := c.Triggers[Normalize(name)]
+	return t, ok
+}
+
+// TriggersFor returns the triggers attached to a table for a given event,
+// ordered BEFORE first then AFTER/INSTEAD OF, so firing order is stable.
+func (c Catalog) TriggersFor(table, event string) []*Trigger {
+	if c.Triggers == nil {
+		return nil
+	}
+	table = Normalize(table)
+	var before, after []*Trigger
+	for _, name := range sortedTriggerNames(c.Triggers) {
+		t := c.Triggers[name]
+		if t.Table != table || t.Event != event {
+			continue
+		}
+		if t.Timing == "before" {
+			before = append(before, t)
+		} else {
+			after = append(after, t)
+		}
+	}
+	return append(before, after...)
+}
+
+func sortedTriggerNames(m map[string]*Trigger) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	return names
 }
 
 func Normalize(name string) string {

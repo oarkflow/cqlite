@@ -5,3 +5,7 @@ sqlite-cli
 sqlited
 *.test
 *.prof
+.DS_Store
+.gocache-race
+.gomodcache
+.gocache-windows

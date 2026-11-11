@@ -6,6 +6,23 @@ import (
 	"github.com/sujit/sqlite/internal/catalog"
 )
 
+func TestPositionArenaAllocationsAreDisjointAndZeroed(t *testing.T) {
+	var arena positionArena
+	first := arena.alloc(3)
+	first[0], first[1], first[2] = int64(1), "first", int64(3)
+	second := arena.alloc(3)
+	if cap(first) != len(first) || cap(second) != len(second) {
+		t.Fatalf("arena slices must be capacity-limited: first cap=%d len=%d, second cap=%d len=%d", cap(first), len(first), cap(second), len(second))
+	}
+	if second[0] != nil || second[1] != nil || second[2] != nil {
+		t.Fatalf("new arena slice was not zeroed: %#v", second)
+	}
+	second[0], second[1], second[2] = int64(2), "second", int64(4)
+	if first[0] != int64(1) || first[1] != "first" || first[2] != int64(3) {
+		t.Fatalf("allocating a later row changed the first row: %#v", first)
+	}
+}
+
 func TestRowVersionMaintainsSchemaPositionedValues(t *testing.T) {
 	schema := &catalog.Table{
 		Name: "items",

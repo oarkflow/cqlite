@@ -5,10 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -78,9 +78,6 @@ func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
 }
 
 func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("windows locking shim is currently advisory no-op")
-	}
 	if os.Getenv("SUJIT_SQLITE_WRITE_LOCK_HELPER") == "1" {
 		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
 		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
@@ -148,7 +145,7 @@ func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	competing, err := Open(dir, Options{})
+	competing, err := Open(dir, Options{BusyTimeout: 40 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,6 +153,199 @@ func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 	_, err = competing.Exec(ctx, `INSERT INTO write_lock_items VALUES (1)`)
 	if !errors.Is(err, ErrDatabaseLocked) {
 		t.Fatalf("competing write err = %v, want ErrDatabaseLocked", err)
+	}
+}
+
+func TestDatabaseWriteLockWaitsForCompetingProcess(t *testing.T) {
+	if os.Getenv("SUJIT_SQLITE_WAIT_LOCK_HELPER") == "1" {
+		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
+		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
+		release := os.Getenv("SUJIT_SQLITE_LOCK_RELEASE")
+		d, err := Open(dir, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		if err := acquireDatabaseWriteLock(d.lock); err != nil {
+			t.Fatal(err)
+		}
+		defer releaseDatabaseWriteLock(d.lock)
+		if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(release); err == nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for lock release signal")
+	}
+
+	dir := t.TempDir()
+	setup, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setup.Exec(context.Background(), `CREATE TABLE wait_lock_items (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(dir, "wait-lock-ready")
+	release := filepath.Join(dir, "wait-lock-release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseWriteLockWaitsForCompetingProcess$")
+	cmd.Env = append(os.Environ(),
+		"SUJIT_SQLITE_WAIT_LOCK_HELPER=1",
+		"SUJIT_SQLITE_LOCK_DIR="+dir,
+		"SUJIT_SQLITE_LOCK_READY="+ready,
+		"SUJIT_SQLITE_LOCK_RELEASE="+release,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	defer func() {
+		_ = os.WriteFile(release, []byte("release"), 0o600)
+		if !waited {
+			_ = cmd.Wait()
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("helper did not acquire database write lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	competing, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competing.Close()
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		_ = os.WriteFile(release, []byte("release"), 0o600)
+		close(released)
+	}()
+	start := time.Now()
+	if _, err := competing.Exec(context.Background(), `INSERT INTO wait_lock_items VALUES (1)`); err != nil {
+		t.Fatalf("writer should succeed after lock release: %v", err)
+	}
+	<-released
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Fatalf("writer did not wait for competing process (elapsed %s)", elapsed)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("lock holder process: %v", err)
+	}
+	waited = true
+}
+
+func TestTxCommitContextCanCancelAndRetry(t *testing.T) {
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(context.Background(), `CREATE TABLE commit_wait (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(context.Background(), TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `INSERT INTO commit_wait VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	competitor, err := Open(d.path, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer competitor.Close()
+	if err := acquireDatabaseWriteLock(competitor.lock); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	err = tx.CommitContext(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		_ = releaseDatabaseWriteLock(competitor.lock)
+		t.Fatalf("CommitContext error = %v, want context deadline exceeded", err)
+	}
+	if err := releaseDatabaseWriteLock(competitor.lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.CommitContext(context.Background()); err != nil {
+		t.Fatalf("retry commit: %v", err)
+	}
+	rows, err := d.Query(context.Background(), `SELECT id FROM commit_wait`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(1) {
+		t.Fatalf("committed row = %#v ok=%v", row, ok)
+	}
+}
+
+func TestWALSyncEnabledFollowsSynchronousSetting(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+		want  bool
+	}{
+		{name: "off", level: "off", want: false},
+		{name: "normal", level: "normal", want: false},
+		{name: "full", level: "full", want: true},
+		{name: "extra", level: "extra", want: true},
+		{name: "numeric full", level: "2", want: true},
+		{name: "numeric off", level: "0", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &DB{opts: Options{SyncPolicy: SyncFull, Synchronous: "FULL"}, state: newState()}
+			d.state.Pragmas.Synchronous = tt.level
+			if got := d.walSyncEnabled(); got != tt.want {
+				t.Fatalf("walSyncEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	d := &DB{opts: Options{SyncPolicy: SyncFull, Synchronous: "OFF"}, state: newState()}
+	d.state.Pragmas.Synchronous = ""
+	if d.walSyncEnabled() {
+		t.Fatal("Synchronous=OFF option should disable per-commit WAL sync")
+	}
+}
+
+func TestOpenAndPragmaControlWALSync(t *testing.T) {
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if d.walSyncEnabled() {
+		t.Fatal("SyncPolicy=OFF should disable WAL commit sync on a new database")
+	}
+	rows, err := d.Query(context.Background(), `PRAGMA synchronous`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != "off" {
+		t.Fatalf("PRAGMA synchronous = %#v, ok=%v; want off", row, ok)
+	}
+	if _, err := d.Exec(context.Background(), `PRAGMA synchronous = FULL`); err != nil {
+		t.Fatal(err)
+	}
+	if !d.walSyncEnabled() {
+		t.Fatal("PRAGMA synchronous=FULL should enable WAL commit sync")
 	}
 }
 
@@ -181,6 +371,84 @@ func TestFailedAutocommitWALAppendDoesNotPublishMutation(t *testing.T) {
 	}
 	if row, ok := rows.Next(); ok {
 		t.Fatalf("failed autocommit mutation was published: %#v", row)
+	}
+	d.wal, err = wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedAutocommitUpdateRestoresChangedColumn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE failed_update (id INTEGER PRIMARY KEY, score INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO failed_update VALUES (1, 10)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `UPDATE failed_update SET score = score + 1 WHERE id = 1`); err == nil {
+		t.Fatal("expected WAL append failure")
+	}
+	rows, err := d.Query(ctx, `SELECT score FROM failed_update WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(10) {
+		t.Fatalf("score after failed update = %#v, ok=%v; want 10", row, ok)
+	}
+	d.wal, err = wal.Open(filepath.Join(dir, "db.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedAutocommitIndexedUpdateRestoresEveryMatchingRow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff, DisableFileLock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE failed_indexed_update (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE INDEX failed_indexed_update_name ON failed_indexed_update(name)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := d.Exec(ctx, `INSERT INTO failed_indexed_update VALUES (?, 'shared', ?)`, int64(i), int64(i*10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `UPDATE failed_indexed_update SET score = score + 1 WHERE name = ?`, "shared"); err == nil {
+		t.Fatal("expected WAL append failure")
+	}
+	rows, err := d.Query(ctx, `SELECT score FROM failed_indexed_update WHERE name = 'shared' ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []int64{10, 20, 30} {
+		row, ok := rows.Next()
+		if !ok || row[0] != want {
+			t.Fatalf("score after failed indexed update = %#v ok=%v, want %d", row, ok, want)
+		}
 	}
 	d.wal, err = wal.Open(filepath.Join(dir, "db.wal"))
 	if err != nil {
@@ -816,6 +1084,156 @@ func TestWALCrashStyleRecovery(t *testing.T) {
 	_ = d.Close()
 }
 
+func TestWALTornTailDoesNotHideLaterCommits(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE tail_recovery (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO tail_recovery VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	walPath := filepath.Join(dir, "db.wal")
+	f, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{byte(wal.RecordCommit), 0xAA, 0xBB, 0xCC}); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := Open(dir, Options{SyncPolicy: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovered.Exec(ctx, `INSERT INTO tail_recovery VALUES (2, 'after')`); err != nil {
+		_ = recovered.Close()
+		t.Fatal(err)
+	}
+	if err := recovered.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, Options{SyncPolicy: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	rows, err := reopened.Query(ctx, `SELECT id, value FROM tail_recovery ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"before", "after"} {
+		row, ok := rows.Next()
+		if !ok || row[0] != int64(i+1) || row[1] != want {
+			t.Fatalf("recovered row %d = %#v ok=%v; want (%d, %q)", i, row, ok, i+1, want)
+		}
+	}
+	if _, ok := rows.Next(); ok {
+		t.Fatal("unexpected extra row after tail recovery")
+	}
+}
+
+func TestCompositeIntegerPrimaryKeyDoesNotAliasRowID(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(t.TempDir(), Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `CREATE TABLE composite_integer_key (a INTEGER, b INTEGER, PRIMARY KEY (a, b))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, values := range [][2]int64{{1, 2}, {1, 3}} {
+		if _, err := d.Exec(ctx, `INSERT INTO composite_integer_key VALUES (?, ?)`, values[0], values[1]); err != nil {
+			t.Fatalf("insert composite key (%d, %d): %v", values[0], values[1], err)
+		}
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO composite_integer_key VALUES (1, 2)`); err == nil {
+		t.Fatal("duplicate composite primary key should be rejected")
+	}
+	rows, err := d.Query(ctx, `SELECT a, b FROM composite_integer_key ORDER BY a, b`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][2]int64{{1, 2}, {1, 3}}
+	for i, expected := range want {
+		row, ok := rows.Next()
+		if !ok || row[0] != expected[0] || row[1] != expected[1] {
+			t.Fatalf("composite row %d = %#v, ok=%v; want %v", i, row, ok, expected)
+		}
+	}
+	if _, ok := rows.Next(); ok {
+		t.Fatal("unexpected extra composite-key row")
+	}
+}
+
+func TestForeignKeyWithoutTargetColumnsUsesOrderedCompositePrimaryKey(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE fk_parent (a INTEGER, b INTEGER, PRIMARY KEY (b, a))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE fk_child (x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES fk_parent ON UPDATE CASCADE)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err = Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	fkRows, err := d.Query(ctx, `PRAGMA foreign_key_list(fk_child)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"b", "a"} {
+		row, ok := fkRows.Next()
+		if !ok || row[4] != want {
+			t.Fatalf("foreign key target column %d = %#v, ok=%v; want %q", i, row, ok, want)
+		}
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO fk_parent VALUES (1, 2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO fk_child VALUES (2, 1)`); err != nil {
+		t.Fatalf("insert child matching declared key order: %v", err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO fk_child VALUES (1, 2)`); err == nil {
+		t.Fatal("child with reversed composite key values should fail")
+	}
+	if _, err := d.Exec(ctx, `UPDATE fk_parent SET a = 3 WHERE a = 1 AND b = 2`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := d.Query(ctx, `SELECT x, y FROM fk_child`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(2) || row[1] != int64(3) {
+		t.Fatalf("cascaded child = %#v, ok=%v; want (2, 3)", row, ok)
+	}
+}
+
 func TestSimpleBinaryWALRecovery(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -992,6 +1410,57 @@ func TestTransactionCommitUsesBatchWALNotStateSnapshot(t *testing.T) {
 		t.Fatalf("unexpected recovered row after savepoint rollback: %#v", row)
 	}
 	_ = d.Close()
+}
+
+func TestLegacySimpleTransactionWALStillDecodes(t *testing.T) {
+	legacy, ok := encodeSimpleTransactionWAL([]logicalRecord{{
+		SQL:  `INSERT INTO legacy_wal VALUES (?, ?)`,
+		Args: []any{int64(7), "preserved"},
+	}})
+	if !ok {
+		t.Fatal("failed to encode legacy simple transaction WAL")
+	}
+	if legacy[0] != txSimpleWALMagic {
+		t.Fatalf("legacy WAL magic = %#x, want %#x", legacy[0], txSimpleWALMagic)
+	}
+	records, recognized, err := decodeSimpleTransactionWAL(legacy)
+	if err != nil || !recognized {
+		t.Fatalf("decode legacy WAL = (%v, %v), want recognized without error", recognized, err)
+	}
+	if len(records) != 1 || records[0].plan.table != "legacy_wal" || len(records[0].args) != 2 || records[0].args[0] != int64(7) || records[0].args[1] != "preserved" {
+		t.Fatalf("decoded legacy records = %#v", records)
+	}
+}
+
+func FuzzDecodeSimpleTransactionWAL(f *testing.F) {
+	legacy, ok := encodeSimpleTransactionWAL([]logicalRecord{{
+		SQL:  `INSERT INTO fuzz_wal VALUES (?)`,
+		Args: []any{int64(1)},
+	}})
+	if ok {
+		f.Add(legacy)
+	}
+	compact := []byte{txSimpleInsertBatchWALMagic}
+	compact = binary.LittleEndian.AppendUint32(compact, 1)
+	compact = binary.LittleEndian.AppendUint16(compact, 1)
+	compact = binary.LittleEndian.AppendUint16(compact, 1)
+	compact = append(compact, 't')
+	compact = binary.LittleEndian.AppendUint16(compact, 1)
+	compact = binary.LittleEndian.AppendUint32(compact, 1)
+	compact = append(compact, 0) // NULL value
+	f.Add(compact)
+	f.Add([]byte{txSimpleInsertBatchWALMagic})
+	f.Add([]byte{txSimpleWALMagic, 0, 0, 0, 0})
+	oversizedLegacy := []byte{txSimpleWALMagic}
+	oversizedLegacy = binary.LittleEndian.AppendUint32(oversizedLegacy, ^uint32(0))
+	f.Add(oversizedLegacy)
+	oversizedBatch := []byte{txSimpleInsertBatchWALMagic}
+	oversizedBatch = binary.LittleEndian.AppendUint32(oversizedBatch, ^uint32(0))
+	oversizedBatch = binary.LittleEndian.AppendUint16(oversizedBatch, 1)
+	f.Add(oversizedBatch)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _, _ = decodeSimpleTransactionWAL(data)
+	})
 }
 
 func TestParameterizedTransactionUsesSimpleMutationWAL(t *testing.T) {
@@ -1654,6 +2123,51 @@ func TestCheckpointGenerationCleanup(t *testing.T) {
 	}
 	if matches[0] == first {
 		t.Fatalf("old checkpoint generation was not replaced: %s", first)
+	}
+}
+
+func TestPrimaryKeyLookupLeavesCheckpointRowsLazy(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE lazy_lookup (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := d.Begin(ctx, TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := int64(1); id <= 100; id++ {
+		if _, err := tx.Exec(ctx, `INSERT INTO lazy_lookup VALUES (?, ?)`, id, fmt.Sprintf("value-%d", id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err = Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if !d.state.hasDeferredRuntime() {
+		t.Fatal("expected checkpoint table data to remain lazy after open")
+	}
+	rows, err := d.Query(ctx, `SELECT value FROM lazy_lookup WHERE id = ?`, int64(50))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != "value-50" {
+		t.Fatalf("lazy point lookup = %#v, ok=%v", row, ok)
+	}
+	if !d.state.hasDeferredRuntime() {
+		t.Fatal("primary key lookup materialized the checkpoint table")
 	}
 }
 

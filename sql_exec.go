@@ -1,32 +1,39 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"database/sql/driver"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
-	"github.com/oarkflow/sqlparser"
-	"github.com/oarkflow/sqlparser/ast"
-	"github.com/oarkflow/sqlparser/lexer"
 	"github.com/sujit/sqlite/internal/catalog"
 	isql "github.com/sujit/sqlite/internal/sql"
+	"github.com/sujit/sqlite/internal/sqlparser"
+	"github.com/sujit/sqlite/internal/sqlparser/ast"
+	"github.com/sujit/sqlite/internal/sqlparser/lexer"
 )
 
 const primaryKeyNamePlaceholder = "__primary_key__"
 
 var simpleDMLCache sync.Map
 var simpleSelectCache sync.Map
+var queryParserPool = sync.Pool{New: func() any { return sqlparser.NewString("") }}
 
-// parseMu protects the oarkflow parser and every AST derived from it. The
-// parser reuses internal arena storage, so parsed ASTs must be consumed before
-// any other goroutine parses another statement.
+// parseMu protects legacy callers that use the shared convenience parser.
+// New execution paths lease parser arenas from queryParserPool.
 var parseMu sync.Mutex
 
 type simpleDMLPlan struct {
@@ -65,6 +72,21 @@ func parseStatementCached(query string) (ast.Statement, error) {
 	return sqlparser.ParseStatement(query)
 }
 
+// withQueryStatement gives this execution exclusive use of a parser arena and
+// keeps the AST valid until run returns. Separate readers can parse and execute
+// concurrently without sharing the convenience parser's global arena.
+func withQueryStatement[T any](query string, run func(ast.Statement) (T, error)) (T, error) {
+	p := queryParserPool.Get().(*sqlparser.Parser)
+	p.ResetString(normalizeInsertOrReplace(query))
+	defer queryParserPool.Put(p)
+	stmt, err := p.Next()
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return run(stmt)
+}
+
 func execute(ctx context.Context, s *persistedState, query string, args ...any) (Result, error) {
 	if res, ok, err := execPragma(s, query); ok || err != nil {
 		return res, err
@@ -73,51 +95,80 @@ func execute(ctx context.Context, s *persistedState, query string, args ...any) 
 		return res, err
 	}
 	parseQuery, strictTable := stripSQLiteStrict(query)
-	stmt, err := parseStatementCached(parseQuery)
-	if err != nil {
+	type execution struct {
+		result Result
+		err    error
+	}
+	parsed, parseErr := withQueryStatement(parseQuery, func(stmt ast.Statement) (execution, error) {
+		unlockTriggerScope := lockTriggerScopeForStatement(s, stmt)
+		defer unlockTriggerScope()
+		select {
+		case <-ctx.Done():
+			return execution{err: ctx.Err()}, nil
+		default:
+		}
+		var res Result
+		var err error
+		switch st := stmt.(type) {
+		case *ast.CreateTableStmt:
+			res, err = execCreateTable(s, st, strictTable, query)
+		case *ast.CreateViewStmt:
+			res, err = execCreateView(s, st, query)
+		case *ast.DropTableStmt:
+			res, err = execDropTable(s, st, query)
+		case *ast.CreateIndexStmt:
+			res, err = execCreateIndex(s, st, query)
+		case *ast.DropIndexStmt:
+			res, err = execDropIndex(s, st)
+		case *ast.AlterTableStmt:
+			res, err = execAlterTable(s, st)
+		case *ast.CreateVirtualTableStmt:
+			res, err = execCreateVirtualTableStmt(s, st, query)
+		case *ast.CreateTriggerStmt:
+			res, err = execCreateTrigger(s, st, query)
+		case *ast.DropTriggerStmt:
+			res, err = execDropTrigger(s, st)
+		case *ast.InsertStmt:
+			res, err = execInsert(s, st, args)
+		case *ast.UpdateStmt:
+			res, err = execUpdate(s, st, args)
+		case *ast.DeleteStmt:
+			res, err = execDelete(s, st, args)
+		case *ast.ExplainStmt, *ast.TransactionStmt:
+		default:
+			err = fmt.Errorf("statement is not executable in v1: %T", stmt)
+		}
+		return execution{res, err}, nil
+	})
+	if parseErr != nil {
 		if res, ok, manualErr := execManualCreateIndex(s, query); ok {
 			return res, manualErr
 		}
 		if res, ok, manualErr := execManualDropView(s, query); ok {
 			return res, manualErr
 		}
-		return Result{}, err
+		return Result{}, parseErr
 	}
-	select {
-	case <-ctx.Done():
-		return Result{}, ctx.Err()
-	default:
-	}
-	switch st := stmt.(type) {
-	case *ast.CreateTableStmt:
-		return execCreateTable(s, st, strictTable, query)
-	case *ast.CreateViewStmt:
-		return execCreateView(s, st, query)
-	case *ast.DropTableStmt:
-		return execDropTable(s, st, query)
-	case *ast.CreateIndexStmt:
-		return execCreateIndex(s, st, query)
-	case *ast.DropIndexStmt:
-		return execDropIndex(s, st)
-	case *ast.AlterTableStmt:
-		return execAlterTable(s, st)
-	case *ast.InsertStmt:
-		return execInsert(s, st, args)
-	case *ast.UpdateStmt:
-		return execUpdate(s, st, args)
-	case *ast.DeleteStmt:
-		return execDelete(s, st, args)
-	case *ast.ExplainStmt:
-		return Result{}, nil
-	case *ast.TransactionStmt:
-		return Result{}, nil
-	default:
-		return Result{}, fmt.Errorf("statement is not executable in v1: %T", stmt)
-	}
+	return parsed.result, parsed.err
 }
 
 func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, bool, error) {
 	if hasNamedArgs(args) {
+		return Result{}, false, nil
+	}
+	// A trigger can run through a foreign-key action on a different table, so
+	// keep every DML statement on the trigger-aware executor when any trigger
+	// is present in the schema.
+	if s != nil && len(s.Catalog.Triggers) > 0 {
+		return Result{}, false, nil
+	}
+	// Trigger-armed tables must go through the row-by-row path so BEFORE and
+	// AFTER triggers fire for every change. Virtual tables are handled by
+	// their module, never by the text-driven fast paths.
+	if dmlStatementTouchesTriggers(s, stmt) {
+		return Result{}, false, nil
+	}
+	if dmlStatementTouchesVirtualTable(s, stmt) {
 		return Result{}, false, nil
 	}
 	if ins, ok := stmt.(*ast.InsertStmt); ok {
@@ -193,18 +244,33 @@ func fastDirectDML(s *persistedState, stmt ast.Statement, args []any) (Result, b
 	return Result{RowsAffected: 1}, true, nil
 }
 
-type rowChangeRecorder func(table string, data *tableData, pos int)
+type rowChangeRecorder func(table string, data *tableData, pos int, columnIndex int, columnName string, oldValue any)
 
 func fastSimpleDML(s *persistedState, query string, args []any) (Result, bool, error) {
 	return fastSimpleDMLWithRecorder(s, query, args, nil)
 }
 
 func fastSimpleDMLWithRecorder(s *persistedState, query string, args []any, record rowChangeRecorder) (Result, bool, error) {
+	plan, planOK := simplePlan(query)
+	return fastSimpleDMLWithPlan(s, query, args, record, plan, planOK)
+}
+
+func fastSimpleDMLWithPlan(s *persistedState, query string, args []any, record rowChangeRecorder, plan simpleDMLPlan, planOK bool) (Result, bool, error) {
+	// Virtual tables are routed to their module rather than the fast paths.
+	if s != nil && planOK {
+		if _, isVT := hasVirtualTables(s, plan.table); isVT {
+			return Result{}, false, nil
+		}
+	}
+	// Triggers can also fire indirectly through foreign-key actions on a
+	// different table, so DML uses the general executor whenever triggers exist.
+	if s != nil && len(s.Catalog.Triggers) > 0 {
+		return Result{}, false, nil
+	}
 	if hasNamedArgs(args) {
 		return Result{}, false, nil
 	}
-	plan, ok := simplePlan(query)
-	if !ok || plan.params != len(args) {
+	if !planOK || plan.params != len(args) {
 		return Result{}, false, nil
 	}
 	switch plan.kind {
@@ -299,22 +365,20 @@ func canFastPositionedInsert(s *persistedState, t *catalog.Table) bool {
 
 func fastInsertPositioned(s *persistedState, t *catalog.Table, data *tableData, args []any) (Result, bool, error) {
 	ncols := len(t.Columns)
-	var stackPos [16]any
-	var pos []any
-	if ncols <= len(stackPos) {
-		pos = stackPos[:ncols]
-	} else {
-		pos = make([]any, ncols)
-	}
+	// The row retains Pos after this function returns. Carve it from a table-local
+	// arena so small rows do not allocate a separate slice for every insert.
+	pos := data.positionArena.alloc(ncols)
 	rowid := t.NextRowID
 	pkName := integerPrimaryKeyColumn(t)
 	pkIndex := -1
 	for i, col := range t.Columns {
 		cv, err := coerce(col, args[i], t.Strict)
 		if err != nil {
+			clear(pos)
 			return Result{}, true, err
 		}
 		if col.NotNull && cv == nil {
+			clear(pos)
 			return Result{}, true, fmt.Errorf("column %s cannot be null", col.Name)
 		}
 		pos[i] = cv
@@ -330,6 +394,7 @@ func fastInsertPositioned(s *persistedState, t *catalog.Table, data *tableData, 
 		}
 	}
 	if err := validateIntegerPrimaryKeyFast(t, data, rowid, pkName); err != nil {
+		clear(pos)
 		return Result{}, true, err
 	}
 	data.stageRow(t, newPositionedRowVersion(rowid, pos, s.NextTx))
@@ -403,7 +468,7 @@ func fastIncrementUpdate(s *persistedState, upd simpleIncrementUpdate, args []an
 			return false, err
 		}
 		if record != nil {
-			record(t.Name, data, pos)
+			record(t.Name, data, pos, colIdx, col.Name, row.value(t, col.Name))
 		}
 		data.copyRowForColumnUpdate(pos, colIdx, col.Name, cv)
 		affected++
@@ -486,7 +551,7 @@ func fastDeleteWhere(s *persistedState, table, where string, args []any, record 
 			}
 		}
 		if record != nil {
-			record(t.Name, data, pos)
+			record(t.Name, data, pos, -1, "", nil)
 		}
 		data.markRowDeleted(pos, s.NextTx)
 		affected++
@@ -591,7 +656,7 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 		if col.NotNull && v == nil {
 			return fmt.Errorf("column %s cannot be null", col.Name)
 		}
-		if col.PrimaryKey || col.Unique {
+		if col.Unique || isSingleColumnPrimaryKey(t, col.Name) {
 			if col.PrimaryKey && col.Name == integerPrimaryKeyColumn(t) {
 				if data.rowids == nil {
 					data.rebuildRuntime(t)
@@ -805,6 +870,9 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 	if !ok {
 		return nil, false, nil
 	}
+	if _, isVT := hasVirtualTables(s, plan.table); isVT {
+		return nil, false, nil
+	}
 	t, ok := s.Catalog.Table(plan.table)
 	if !ok {
 		if _, viewOK := s.Catalog.View(plan.table); viewOK {
@@ -816,10 +884,16 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 	if data == nil {
 		return isql.NewRows(plan.cols, nil), true, nil
 	}
-	cols, projectors, ok := simpleSelectProjectors(t, plan.cols)
+	lazyData := data.lazyPath != "" || len(data.lazyRecords) > 0
+	if data.deferRuntime && !lazyData {
+		return nil, false, nil
+	}
+	var projectorStack [8]int
+	projectors, ok := simpleSelectProjectors(t, plan.cols, projectorStack[:0])
 	if !ok {
 		return nil, false, nil
 	}
+	cols := append([]string(nil), plan.cols...)
 	if plan.order.col != "" && columnCollation(t, plan.order.col) != "BINARY" {
 		return nil, false, nil
 	}
@@ -835,19 +909,20 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 			return isql.NewFlatRows(cols, nil), true, nil
 		}
 		out := make([]any, 0, width)
-		for _, p := range projectors {
-			out = append(out, p(row))
-		}
+		out = appendSimpleSelectProjection(out, row, projectors, plan.cols)
 		return isql.NewFlatRows(cols, out), true, nil
+	}
+	// Other lazy reads require the full runtime indexes; the caller falls
+	// through to the generic path, which materialises them before execution.
+	if lazyData {
+		return nil, false, nil
 	}
 	if len(data.lazyRecords) > 0 {
 		data.rebuildRuntime(t)
 	}
-	out := make([]any, 0, simpleSelectStreamCap(plan, data, args)*width)
+	out := make([]any, 0, simpleSelectStreamCap(t, plan, data, args)*width)
 	emit := func(row rowVersion) {
-		for _, p := range projectors {
-			out = append(out, p(row))
-		}
+		out = appendSimpleSelectProjection(out, row, projectors, plan.cols)
 	}
 	postFilter := !simpleSelectAccessCoversConditions(plan, args)
 	if plan.order.col == "" {
@@ -905,6 +980,42 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 		out = applySimpleFlatLimit(out, width, plan.limit, plan.offset)
 	}
 	return isql.NewFlatRows(cols, out), true, nil
+}
+
+func canQueryDeferredSimplePoint(s *persistedState, query string, args []any) bool {
+	if s == nil {
+		return false
+	}
+	plan, ok := parseSimpleSelectPlanCached(query)
+	if !ok || plan.order.col != "" || len(plan.conds) != 1 || plan.conds[0].op != "=" {
+		return false
+	}
+	table, ok := s.Catalog.Table(plan.table)
+	if !ok {
+		return false
+	}
+	data := s.Tables[catalog.Normalize(plan.table)]
+	if data == nil || (len(data.lazyRecords) == 0 && data.lazyPath == "") {
+		return false
+	}
+	pk := integerPrimaryKeyColumn(table)
+	cond := plan.conds[0]
+	if cond.col != pk && cond.col != "rowid" && cond.col != "_rowid_" && cond.col != "oid" {
+		column, _, ok := table.Column(cond.col)
+		if !ok || !column.PrimaryKey {
+			return false
+		}
+	}
+	if !simpleSelectColumnsValid(table, plan.cols) {
+		return false
+	}
+	if plan.order.col != "" && columnCollation(table, plan.order.col) != "BINARY" {
+		return false
+	}
+	if plan.order.col != "" && !simpleSelectOrderCompatible(plan, args) {
+		return false
+	}
+	return true
 }
 
 func simpleSelectLazyPointRow(t *catalog.Table, data *tableData, plan simpleSelectPlan, args []any) (rowVersion, bool, error) {
@@ -965,9 +1076,12 @@ func simpleSelectAccessCoversConditions(plan simpleSelectPlan, args []any) bool 
 	return true
 }
 
-func simpleSelectStreamCap(plan simpleSelectPlan, data *tableData, args []any) int {
+func simpleSelectStreamCap(table *catalog.Table, plan simpleSelectPlan, data *tableData, args []any) int {
 	if data == nil || len(data.Rows) == 0 {
 		return 0
+	}
+	if simpleSelectHasUniqueEquality(table, plan) {
+		return 1
 	}
 	if _, _, _, ok := simpleSelectRange(plan.conds, args); ok {
 		if len(data.Rows) < 128 {
@@ -976,6 +1090,46 @@ func simpleSelectStreamCap(plan simpleSelectPlan, data *tableData, args []any) i
 		return 128
 	}
 	return 16
+}
+
+func simpleSelectHasUniqueEquality(table *catalog.Table, plan simpleSelectPlan) bool {
+	if table == nil {
+		return false
+	}
+	for _, cond := range plan.conds {
+		if cond.op != "=" {
+			continue
+		}
+		if cond.col == "rowid" || cond.col == "_rowid_" || cond.col == "oid" {
+			if _, _, shadowed := table.Column(cond.col); !shadowed {
+				return true
+			}
+		}
+		column, _, ok := table.Column(cond.col)
+		if ok && (column.Unique || column.PrimaryKey && !isCompositeUniqueColumn(table, cond.col)) {
+			return true
+		}
+		for _, index := range table.Indexes {
+			if index.Unique && len(index.Columns) == 1 && index.Columns[0] == cond.col && index.Where == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isCompositeUniqueColumn(table *catalog.Table, column string) bool {
+	for _, index := range table.Indexes {
+		if !index.Unique || len(index.Columns) < 2 {
+			continue
+		}
+		for _, indexColumn := range index.Columns {
+			if indexColumn == column {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseSimpleSelectPlanCached(query string) (simpleSelectPlan, bool) {
@@ -1168,32 +1322,42 @@ func parseSimpleLiteral(raw string) (any, bool) {
 	return nil, false
 }
 
-func simpleSelectProjectors(t *catalog.Table, cols []string) ([]string, []func(rowVersion) any, bool) {
-	names := make([]string, 0, len(cols))
-	projectors := make([]func(rowVersion) any, 0, len(cols))
+func simpleSelectProjectors(t *catalog.Table, cols []string, projectors []int) ([]int, bool) {
+	projectors = projectors[:0]
 	for _, col := range cols {
-		name := col
 		if col == "rowid" || col == "_rowid_" || col == "oid" {
-			names = append(names, name)
-			projectors = append(projectors, func(row rowVersion) any { return row.RowID })
+			projectors = append(projectors, -1)
 			continue
 		}
 		if _, idx, ok := t.Column(col); !ok {
-			return nil, nil, false
+			return nil, false
 		} else {
-			c := col
-			colIdx := idx
-			names = append(names, name)
-			projectors = append(projectors, func(row rowVersion) any {
-				if v, ok := row.positionalAt(colIdx); ok {
-					return v
-				}
-				return row.Values[c]
-			})
+			projectors = append(projectors, idx)
 			continue
 		}
 	}
-	return names, projectors, true
+	return projectors, true
+}
+
+func simpleSelectColumnsValid(t *catalog.Table, cols []string) bool {
+	var projectors [8]int
+	_, ok := simpleSelectProjectors(t, cols, projectors[:0])
+	return ok
+}
+
+func appendSimpleSelectProjection(out []any, row rowVersion, projectors []int, cols []string) []any {
+	for i, projector := range projectors {
+		if projector < 0 {
+			out = append(out, row.RowID)
+			continue
+		}
+		if value, ok := row.positionalAt(projector); ok {
+			out = append(out, value)
+		} else {
+			out = append(out, row.Values[cols[i]])
+		}
+	}
+	return out
 }
 
 func simpleSelectCandidatePositions(s *persistedState, plan simpleSelectPlan, data *tableData, args []any) []int {
@@ -1318,7 +1482,14 @@ func lookupSimpleSelectEquality(s *persistedState, table string, data *tableData
 func eachSimpleSelectEquality(s *persistedState, table string, data *tableData, col string, val any, fn func(int) bool) bool {
 	t, _ := s.Catalog.Table(table)
 	if pk := integerPrimaryKeyColumn(t); pk == col || col == "rowid" || col == "_rowid_" || col == "oid" {
-		return false
+		id, ok := asInt(val)
+		if !ok {
+			return true
+		}
+		if pos, ok := data.lookupRowID(id); ok {
+			fn(pos)
+		}
+		return true
 	}
 	idxName := usableIndexForColumn(s, table, col)
 	if idxName == "" {
@@ -1464,30 +1635,30 @@ func queryRows(ctx context.Context, s *persistedState, query string, args ...any
 	if rows, ok, err := queryPragma(s, query); ok || err != nil {
 		return rows, err
 	}
-	if rows, ok := queryPlan(s, query); ok {
-		return rows, nil
-	}
-	if rows, ok, err := execSimpleSelectPlan(s, query, args); ok || err != nil {
-		return rows, err
+	if !s.compositeRead {
+		if rows, ok := queryPlan(s, query); ok {
+			return rows, nil
+		}
+		if rows, ok, err := execSimpleSelectPlan(s, query, args); ok || err != nil {
+			return rows, err
+		}
 	}
 	s.ensureRuntime()
-	stmt, err := parseStatementCached(query)
-	if err != nil {
-		return nil, err
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-	switch st := stmt.(type) {
-	case *ast.SelectStmt:
-		return execSelect(s, st, args)
-	case *ast.ExplainStmt:
-		return explain(st), nil
-	default:
-		return nil, fmt.Errorf("statement does not return rows in v1: %T", stmt)
-	}
+	return withQueryStatement(query, func(stmt ast.Statement) (*Rows, error) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		switch st := stmt.(type) {
+		case *ast.SelectStmt:
+			return execSelect(s, st, args)
+		case *ast.ExplainStmt:
+			return explain(st), nil
+		default:
+			return nil, fmt.Errorf("statement does not return rows in v1: %T", stmt)
+		}
+	})
 }
 
 func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, rawSQL string) (Result, error) {
@@ -1549,6 +1720,7 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 				return Result{}, errors.New("multiple primary keys are not supported")
 			}
 			seenPK = true
+			t.PrimaryKeyColumns = append(t.PrimaryKeyColumns, c.Name)
 		}
 		if strict && !catalog.StrictTypeAllowed(c.Type) {
 			return Result{}, fmt.Errorf("unsupported STRICT column type: %s", c.DeclType)
@@ -1582,6 +1754,11 @@ func execCreateTable(s *persistedState, st *ast.CreateTableStmt, strict bool, ra
 			continue
 		}
 		if tc.Type == ast.PrimaryKeyConstraint {
+			if seenPK {
+				return Result{}, errors.New("multiple primary keys are not supported")
+			}
+			seenPK = true
+			t.PrimaryKeyColumns = append(t.PrimaryKeyColumns, cols...)
 			for _, c := range cols {
 				col, i, ok := t.Column(c)
 				if !ok {
@@ -1863,6 +2040,13 @@ func selectSQLFromCreateView(rawSQL string) string {
 }
 
 func execDropTable(s *persistedState, st *ast.DropTableStmt, rawSQL string) (Result, error) {
+	for _, t := range st.Tables {
+		if _, ok := hasVirtualTables(s, qname(t)); ok {
+			if err := execDropVirtualTable(s, qname(t)); err != nil {
+				return Result{}, err
+			}
+		}
+	}
 	if isDropViewSQL(rawSQL) {
 		for _, view := range st.Tables {
 			if err := s.Catalog.DropView(qname(view), st.IfExists); err != nil {
@@ -2126,6 +2310,82 @@ func execAlterTable(s *persistedState, st *ast.AlterTableStmt) (Result, error) {
 				s.Tables[t.Name].Rows[i].Values[col.Name] = col.Default
 				s.Tables[t.Name].Rows[i].syncPositioned(t)
 			}
+		case *ast.AlterColumnCmd:
+			colName := catalog.Normalize(c.Name.Unquoted)
+			_, colIdx, ok := t.Column(colName)
+			if !ok {
+				return Result{}, fmt.Errorf("no such column: %s", colName)
+			}
+			switch strings.ToLower(string(c.Action)) {
+			case "rename":
+				id, ok := c.Expr.(*ast.Ident)
+				if !ok {
+					return Result{}, errors.New("RENAME COLUMN requires a new column name")
+				}
+				newCol := catalog.Normalize(id.Unquoted)
+				if newCol != colName {
+					if _, _, dup := t.Column(newCol); dup {
+						return Result{}, fmt.Errorf("duplicate column: %s", newCol)
+					}
+					t.Columns[colIdx].Name = newCol
+					for i := range t.Indexes {
+						for j := range t.Indexes[i].Columns {
+							if t.Indexes[i].Columns[j] == colName {
+								t.Indexes[i].Columns[j] = newCol
+							}
+						}
+					}
+					for i := range t.PrimaryKeyColumns {
+						if t.PrimaryKeyColumns[i] == colName {
+							t.PrimaryKeyColumns[i] = newCol
+						}
+					}
+					for i := range t.ForeignKeys {
+						for j := range t.ForeignKeys[i].Columns {
+							if t.ForeignKeys[i].Columns[j] == colName {
+								t.ForeignKeys[i].Columns[j] = newCol
+							}
+						}
+					}
+					if data := s.Tables[t.Name]; data != nil {
+						for ri := range data.Rows {
+							data.copyRow(ri)
+							row := &data.Rows[ri]
+							if v, exists := row.Values[colName]; exists {
+								delete(row.Values, colName)
+								row.Values[newCol] = v
+							}
+							row.syncPositioned(t)
+						}
+					}
+				}
+			case "set":
+				if c.Expr == nil {
+					// ALTER COLUMN ... SET NOT NULL
+					t.Columns[colIdx].NotNull = true
+					break
+				}
+				v, err := evalExpr(c.Expr, nil, &binder{})
+				if err != nil {
+					return Result{}, err
+				}
+				col := t.Columns[colIdx]
+				col.Default = applyAffinity(col, v)
+				col.DefaultSQL = formatDefaultSQL(col.Default)
+				t.Columns[colIdx] = col
+			case "set_not_null":
+				t.Columns[colIdx].NotNull = true
+			case "drop_default":
+				t.Columns[colIdx].Default = nil
+				t.Columns[colIdx].DefaultSQL = ""
+			case "drop_not_null":
+				t.Columns[colIdx].NotNull = false
+			case "drop":
+				t.Columns[colIdx].Default = nil
+				t.Columns[colIdx].DefaultSQL = ""
+			default:
+				return Result{}, fmt.Errorf("unsupported ALTER COLUMN action: %q", string(c.Action))
+			}
 		case *ast.RenameTableCmd:
 			newName := qname(c.NewName)
 			delete(s.Catalog.Tables, t.Name)
@@ -2176,10 +2436,210 @@ func removeString(values []string, target string) []string {
 	return out
 }
 
-func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, error) {
-	t, data, err := tableForWrite(s, qname(st.Table))
+// viewRowsMaterialize reads the rows a view currently exposes.
+func viewRowsMaterialize(s *persistedState, name string) ([]string, []map[string]any, error) {
+	view, ok := s.Catalog.View(name)
+	if !ok {
+		return nil, nil, fmt.Errorf("no such view: %s", name)
+	}
+	s.ensureRuntime()
+	stmt, err := parseViewSelectStatement(view.SelectSQL)
+	if err != nil {
+		return nil, nil, err
+	}
+	sel, ok := stmt.(*ast.SelectStmt)
+	if !ok {
+		return nil, nil, fmt.Errorf("view is not a SELECT: %s", view.Name)
+	}
+	rows, err := execSelectGeneric(s, sel, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	cols := make([]string, 0, len(view.Columns))
+	for _, c := range view.Columns {
+		cols = append(cols, c.Name)
+	}
+	if len(cols) == 0 {
+		cols = append(cols, rows.Columns...)
+	}
+	var out []map[string]any
+	for {
+		row, ok := rows.Next()
+		if !ok {
+			break
+		}
+		m := make(map[string]any, len(cols))
+		for i, c := range cols {
+			if i < len(row) {
+				m[c] = row[i]
+			}
+		}
+		out = append(out, m)
+	}
+	return cols, out, nil
+}
+
+// execViewInsteadOfUpdate applies an UPDATE to a view by firing its INSTEAD OF
+// trigger for each exposed row the WHERE clause matches.
+func execViewInsteadOfUpdate(s *persistedState, st *ast.UpdateStmt, name string, args []any) (Result, error) {
+	cols, rows, err := viewRowsMaterialize(s, name)
 	if err != nil {
 		return Result{}, err
+	}
+	bind := binder{args: args}
+	var affected int64
+	for _, row := range rows {
+		whereBind := bind
+		ok, err := matchWhereState(s, st.Where, row, &whereBind)
+		if err != nil {
+			return Result{}, err
+		}
+		if !ok {
+			continue
+		}
+		next := make(map[string]any, len(row))
+		for k, v := range row {
+			next[k] = v
+		}
+		setBind := binder{args: args}
+		for _, asn := range st.Set {
+			col := catalog.Normalize(asn.Column.Unquoted)
+			v, err := evalExpr(asn.Value, next, &setBind)
+			if err != nil {
+				return Result{}, err
+			}
+			next[col] = v
+		}
+		if _, err := fireInsteadOf(s, name, "update", row, next); err != nil {
+			return Result{}, err
+		}
+		affected++
+	}
+	_ = cols
+	return Result{RowsAffected: affected}, nil
+}
+
+// execViewInsteadOfDelete applies a DELETE to a view by firing its INSTEAD OF
+// trigger for each exposed row the WHERE clause matches.
+func execViewInsteadOfDelete(s *persistedState, st *ast.DeleteStmt, name string, args []any) (Result, error) {
+	_, rows, err := viewRowsMaterialize(s, name)
+	if err != nil {
+		return Result{}, err
+	}
+	bind := binder{args: args}
+	var affected int64
+	for _, row := range rows {
+		whereBind := bind
+		ok, err := matchWhereState(s, st.Where, row, &whereBind)
+		if err != nil {
+			return Result{}, err
+		}
+		if !ok {
+			continue
+		}
+		if _, err := fireInsteadOf(s, name, "delete", row, nil); err != nil {
+			return Result{}, err
+		}
+		affected++
+	}
+	return Result{RowsAffected: affected}, nil
+}
+
+// execInsertInsteadOf applies an INSERT to a view by firing its INSTEAD OF
+// trigger once per proposed row.
+func execInsertInsteadOf(s *persistedState, st *ast.InsertStmt, t *catalog.Table, cols []catalog.Column, args []any) (Result, error) {
+	buildRow := func(values []any) (map[string]any, error) {
+		if len(values) != len(cols) {
+			return nil, errors.New("insert column/value count mismatch")
+		}
+		row := make(map[string]any, len(t.Columns))
+		for _, col := range t.Columns {
+			row[col.Name] = col.Default
+		}
+		for i, v := range values {
+			cv, err := coerce(cols[i], v, t.Strict)
+			if err != nil {
+				return nil, err
+			}
+			row[cols[i].Name] = cv
+		}
+		return row, nil
+	}
+	var affected int64
+	emit := func(values []any) error {
+		row, err := buildRow(values)
+		if err != nil {
+			return err
+		}
+		if _, err := fireInsteadOf(s, t.Name, "insert", nil, row); err != nil {
+			return err
+		}
+		affected++
+		return nil
+	}
+	if st.Select != nil {
+		rows, err := execSelect(s, st.Select, args)
+		if err != nil {
+			return Result{}, err
+		}
+		for {
+			values, ok := rows.Next()
+			if !ok {
+				break
+			}
+			if err := emit(values); err != nil {
+				return Result{}, err
+			}
+		}
+		return Result{RowsAffected: affected}, nil
+	}
+	if st.ValuesExpr != nil {
+		expanded, err := expandInsertValuesExpr(st.ValuesExpr, args, cols)
+		if err != nil {
+			return Result{}, err
+		}
+		for _, values := range expanded {
+			if err := emit(values); err != nil {
+				return Result{}, err
+			}
+		}
+		return Result{RowsAffected: affected}, nil
+	}
+	for _, valueExprs := range st.Values {
+		values := make([]any, 0, len(valueExprs))
+		b := binder{args: args}
+		for _, e := range valueExprs {
+			v, err := evalExpr(e, nil, &b)
+			if err != nil {
+				return Result{}, err
+			}
+			values = append(values, v)
+		}
+		if err := emit(values); err != nil {
+			return Result{}, err
+		}
+	}
+	return Result{RowsAffected: affected}, nil
+}
+
+func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, error) {
+	name := qname(st.Table)
+	if vt, ok := hasVirtualTables(s, name); ok {
+		return execVTabInsert(s, st, vt)
+	}
+	insteadOf := insteadOfTrigger(s, name, "insert")
+	t, data, err := tableForWrite(s, name)
+	if err != nil {
+		if insteadOf {
+			if view, ok := s.Catalog.View(name); ok {
+				t = &catalog.Table{Name: view.Name, Columns: view.Columns}
+				data = &tableData{}
+			} else {
+				return Result{}, err
+			}
+		} else {
+			return Result{}, err
+		}
 	}
 	cols := make([]catalog.Column, 0, len(st.Columns))
 	if len(st.Columns) == 0 {
@@ -2192,6 +2652,12 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 			}
 			cols = append(cols, col)
 		}
+	}
+	// A view with an INSTEAD OF trigger has no base rows of its own; the
+	// trigger program performs the real work, so build the proposed row and
+	// hand it over.
+	if insteadOf {
+		return execInsertInsteadOf(s, st, t, cols, args)
 	}
 	var affected int64
 	var last int64
@@ -2214,6 +2680,11 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 		return insert(row)
 	}
 	insert = func(row map[string]any) (bool, int64, error) {
+		if proceed, err := beforeRowChange(s, t.Name, "insert", nil, nil, row); err != nil {
+			return false, 0, err
+		} else if !proceed {
+			return false, 0, nil
+		}
 		rowid := t.NextRowID
 		if pk := integerPrimaryKeyColumn(t); pk != "" {
 			if row[pk] == nil {
@@ -2247,6 +2718,9 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 			t.NextRowID = rowid + 1
 		}
 		data.addRuntime(t, len(data.Rows)-1)
+		if err := afterRowChange(s, t.Name, "insert", nil, nil, row); err != nil {
+			return false, 0, err
+		}
 		return true, rowid, nil
 	}
 	if st.Select != nil {
@@ -2323,7 +2797,15 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 
 func expandInsertValuesExpr(expr ast.Expr, args []any, cols []catalog.Column) ([][]any, error) {
 	bind := binder{args: args}
-	value, err := evalExpr(expr, nil, &bind)
+	var value any
+	var err error
+	if param, ok := expr.(*ast.Param); ok {
+		// Keep row objects intact until insertObjectRows has expanded them into
+		// columns. Ordinary bound values still pass through SQLite coercion.
+		value, err = bind.rawParam(param.Raw)
+	} else {
+		value, err = evalExpr(expr, nil, &bind)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -2433,9 +2915,27 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 		}
 		conflict := false
 		for _, col := range t.Columns {
-			if (col.PrimaryKey || col.Unique) && valuesEqual(row.Values[col.Name], incoming[col.Name], col.Collation) {
+			if (col.Unique || isSingleColumnPrimaryKey(t, col.Name)) && valuesEqual(row.Values[col.Name], incoming[col.Name], col.Collation) {
 				conflict = true
 				break
+			}
+		}
+		if !conflict {
+			for _, idx := range t.Indexes {
+				if !idx.Unique || len(idx.Columns) == 0 {
+					continue
+				}
+				same := true
+				for _, name := range idx.Columns {
+					if incoming[name] == nil || !valuesEqual(row.Values[name], incoming[name], columnCollation(t, name)) {
+						same = false
+						break
+					}
+				}
+				if same {
+					conflict = true
+					break
+				}
 			}
 		}
 		if !conflict {
@@ -2490,7 +2990,7 @@ func deleteReplaceConflicts(s *persistedState, t *catalog.Table, data *tableData
 
 func rowConflictsForReplace(t *catalog.Table, existing, incoming map[string]any) bool {
 	for _, col := range t.Columns {
-		if (col.PrimaryKey || col.Unique) && incoming[col.Name] != nil && valuesEqual(existing[col.Name], incoming[col.Name], col.Collation) {
+		if (col.Unique || isSingleColumnPrimaryKey(t, col.Name)) && incoming[col.Name] != nil && valuesEqual(existing[col.Name], incoming[col.Name], col.Collation) {
 			return true
 		}
 	}
@@ -2517,9 +3017,25 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 	if err != nil {
 		return Result{}, err
 	}
+	if vt, ok := hasVirtualTables(s, name); ok {
+		return execVTabUpdate(s, st, vt)
+	}
+	insteadOf := insteadOfTrigger(s, name, "update")
 	t, data, err := tableForWrite(s, name)
 	if err != nil {
-		return Result{}, err
+		if insteadOf {
+			if view, ok := s.Catalog.View(name); ok {
+				t = &catalog.Table{Name: view.Name, Columns: view.Columns}
+				data = &tableData{}
+			} else {
+				return Result{}, err
+			}
+		} else {
+			return Result{}, err
+		}
+	}
+	if insteadOf {
+		return execViewInsteadOfUpdate(s, st, name, args)
 	}
 	setParamCount := 0
 	for _, asn := range st.Set {
@@ -2529,6 +3045,7 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 	positions := mutationCandidatePositions(s, name, data, st.Where, args, setParamCount)
 	changed := false
 	runtimeTouched := updateTouchesRuntime(t, st.Set)
+	updCols := changedColumns(st.Set)
 	for _, i := range positions {
 		row := &data.Rows[i]
 		if row.Deleted != 0 {
@@ -2568,12 +3085,27 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 				return Result{}, err
 			}
 		}
+		if insteadOf {
+			if _, err := fireInsteadOf(s, t.Name, "update", row.Values, next); err != nil {
+				return Result{}, err
+			}
+			continue
+		}
+		if proceed, err := beforeRowChange(s, t.Name, "update", updCols, row.Values, next); err != nil {
+			return Result{}, err
+		} else if !proceed {
+			continue
+		}
+		oldValues := cloneValues(row.Values)
 		data.copyRow(i)
 		row = &data.Rows[i]
 		row.Values = next
 		row.syncPositioned(t)
 		changed = true
 		affected++
+		if err := afterRowChange(s, t.Name, "update", updCols, oldValues, next); err != nil {
+			return Result{}, err
+		}
 	}
 	if changed && runtimeTouched {
 		data.rebuildRuntime(t)
@@ -2608,9 +3140,25 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 	if err != nil {
 		return Result{}, err
 	}
+	if vt, ok := hasVirtualTables(s, name); ok {
+		return execVTabDelete(s, st, vt)
+	}
+	insteadOf := insteadOfTrigger(s, name, "delete")
+	if insteadOf {
+		return execViewInsteadOfDelete(s, st, name, args)
+	}
 	_, data, err := tableForWrite(s, name)
 	if err != nil {
-		return Result{}, err
+		if insteadOf {
+			if view, ok := s.Catalog.View(name); ok {
+				_ = view
+				data = &tableData{}
+			} else {
+				return Result{}, err
+			}
+		} else {
+			return Result{}, err
+		}
 	}
 	bind := binder{args: args}
 	var affected int64
@@ -2633,11 +3181,26 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 					return Result{}, err
 				}
 			}
+			oldValues := cloneValues(row.Values)
+			if insteadOf {
+				if _, err := fireInsteadOf(s, name, "delete", oldValues, nil); err != nil {
+					return Result{}, err
+				}
+				continue
+			}
+			if proceed, err := beforeRowChange(s, name, "delete", nil, oldValues, nil); err != nil {
+				return Result{}, err
+			} else if !proceed {
+				continue
+			}
 			data.copyRow(i)
 			row = &data.Rows[i]
 			row.Deleted = s.NextTx
 			changed = true
 			affected++
+			if err := afterRowChange(s, name, "delete", nil, oldValues, nil); err != nil {
+				return Result{}, err
+			}
 		}
 	}
 	if changed {
@@ -2678,6 +3241,9 @@ func validateDeleteReferences(s *persistedState, table string, old map[string]an
 				continue
 			}
 			refCols := resolveFKColumns(refTable, fk.RefColumns)
+			if len(refCols) != len(fk.Columns) {
+				return errors.New("foreign key mismatch")
+			}
 			childData := s.Tables[child.Name]
 			for i := range childData.Rows {
 				row := &childData.Rows[i]
@@ -2730,6 +3296,9 @@ func applyUpdateReferences(s *persistedState, table string, old, next map[string
 				continue
 			}
 			refCols := resolveFKColumns(refTable, fk.RefColumns)
+			if len(refCols) != len(fk.Columns) {
+				return errors.New("foreign key mismatch")
+			}
 			changed := false
 			for _, refCol := range refCols {
 				if !reflect.DeepEqual(old[refCol], next[refCol]) {
@@ -2786,16 +3355,34 @@ func applyUpdateReferences(s *persistedState, table string, old, next map[string
 }
 
 func execSelect(s *persistedState, st *ast.SelectStmt, args []any) (*Rows, error) {
+	if rows, ok, err := execSelectExt(s, st, args); ok || err != nil {
+		return rows, err
+	}
+	if len(st.From) == 1 {
+		if vt, simple, ok := vtabFromRef(s, st.From[0]); ok {
+			// MATCH drives the row set directly and rank/bm25() need relevance
+			// scores, so those go through the virtual-table path. Anything else
+			// (aggregates, plain scans) uses the generic executor, which reads
+			// the virtual table through buildVirtualRows.
+			if usesFTSFeatures(st) {
+				return execVTabSelect(s, st, vt, simple, args)
+			}
+		}
+	}
 	if len(st.From) == 1 {
 		if name := refSimpleName(st.From[0]); catalog.Normalize(name) == "sqlite_schema" {
 			return selectVirtualSchema(s, st, args)
 		}
 	}
-	if rows, ok, err := fastJoinAggregateSelect(s, st, args); ok || err != nil {
-		return rows, err
-	}
-	if rows, ok, err := fastSingleTableSelect(s, st, args); ok || err != nil {
-		return rows, err
+	// A CTE shadows any physical table of the same name, so the catalog-driven
+	// fast paths must not run while a WITH scope is active.
+	if len(s.ctes) == 0 {
+		if rows, ok, err := fastJoinAggregateSelect(s, st, args); ok || err != nil {
+			return rows, err
+		}
+		if rows, ok, err := fastSingleTableSelect(s, st, args); ok || err != nil {
+			return rows, err
+		}
 	}
 	return execSelectGeneric(s, st, args)
 }
@@ -2810,6 +3397,10 @@ func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows
 	if err != nil {
 		return nil, err
 	}
+	winKeys, winCalls, err := collectWindowCalls(st, exprs)
+	if err != nil {
+		return nil, err
+	}
 	var filtered []rowContext
 	for _, row := range contexts {
 		whereBind := bind
@@ -2821,28 +3412,92 @@ func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows
 			filtered = append(filtered, row)
 		}
 	}
-	var out [][]any
-	if len(st.GroupBy) == 0 && !hasAggregate(exprs) && len(st.OrderBy) > 0 {
-		sort.SliceStable(filtered, func(i, j int) bool {
-			for _, item := range st.OrderBy {
-				lv, _ := evalExprState(s, item.Expr, filtered[i].Values, &binder{args: args})
-				rv, _ := evalExprState(s, item.Expr, filtered[j].Values, &binder{args: args})
-				c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
-				if c == 0 {
-					continue
-				}
-				if item.Desc {
-					return c > 0
-				}
-				return c < 0
+	aggregated := len(st.GroupBy) > 0 || hasAggregate(exprs)
+	if aggregated {
+		auxExprs := collectNestedAggregates(winCalls)
+		out, cols, extraOut, err := aggregateRows(s, contexts, st, cols, exprs, auxExprs, args)
+		if err != nil {
+			return nil, err
+		}
+		if len(winCalls) > 0 {
+			base := make([]map[string]any, len(out))
+			for i, r := range out {
+				base[i] = rowFromOutput(cols, r)
 			}
-			return false
-		})
+			var aux []map[ast.Expr]any
+			if len(auxExprs) > 0 {
+				aux = make([]map[ast.Expr]any, len(out))
+				for i := range out {
+					m := make(map[ast.Expr]any, len(auxExprs))
+					for j, e := range auxExprs {
+						if j < len(extraOut[i]) {
+							m[e] = extraOut[i][j]
+						}
+					}
+					aux[i] = m
+				}
+			}
+			winVals, err := evalWindowValues(s, winCalls, base, args, aux)
+			if err != nil {
+				return nil, err
+			}
+			substituteWindowValues(out, exprs, winKeys, winVals)
+		}
+		if len(st.OrderBy) > 0 {
+			sort.SliceStable(out, func(i, j int) bool {
+				li := rowFromOutput(cols, out[i])
+				lj := rowFromOutput(cols, out[j])
+				for _, item := range st.OrderBy {
+					lv, _ := evalExprState(s, item.Expr, li, &binder{args: args})
+					rv, _ := evalExprState(s, item.Expr, lj, &binder{args: args})
+					c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
+					if c == 0 {
+						continue
+					}
+					if item.Desc {
+						return c > 0
+					}
+					return c < 0
+				}
+				return false
+			})
+		}
+		if st.Distinct {
+			out = distinctRowsKeepFirst(len(cols), out)
+		}
+		out, err = applyLimit(out, st.Limit, args)
+		if err != nil {
+			return nil, err
+		}
+		return isql.NewRows(cols, out), nil
 	}
-	for _, row := range filtered {
+
+	var winVals map[ast.Expr][]any
+	if len(winCalls) > 0 {
+		base := make([]map[string]any, len(filtered))
+		for i, r := range filtered {
+			base[i] = r.Values
+		}
+		winVals, err = evalWindowValues(s, winCalls, base, args, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Projection runs first so that ORDER BY can resolve output column
+	// ordinals and aliases, then rows are reordered together with their input
+	// contexts so ORDER BY can also reference columns that are not selected.
+	var out [][]any
+	for i, row := range filtered {
 		values := make([]any, 0, len(exprs))
 		for _, expr := range exprs {
-			v, err := evalExprState(s, expr, row.Values, &bind)
+			var v any
+			var err error
+			if winVals != nil {
+				v, err = evalExprWithWindows(s, expr, row.Values, winVals, i, &bind)
+			} else {
+				v, err = evalExprState(s, expr, row.Values, &bind)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -2850,36 +3505,115 @@ func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows
 		}
 		out = append(out, values)
 	}
-	if len(st.GroupBy) > 0 || hasAggregate(exprs) {
-		out, cols, err = aggregateRows(s, contexts, st, cols, exprs, args)
-		if err != nil {
-			return nil, err
-		}
+	if len(st.OrderBy) > 0 && len(out) > 1 {
+		sortProjectedRows(s, st, tables, cols, out, filtered, winVals, args)
 	}
-	if (len(st.GroupBy) > 0 || hasAggregate(exprs)) && len(st.OrderBy) > 0 {
-		sort.SliceStable(out, func(i, j int) bool {
-			li := rowFromOutput(cols, out[i])
-			lj := rowFromOutput(cols, out[j])
-			for _, item := range st.OrderBy {
-				lv, _ := evalExprState(s, item.Expr, li, &binder{args: args})
-				rv, _ := evalExprState(s, item.Expr, lj, &binder{args: args})
-				c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
-				if c == 0 {
-					continue
-				}
-				if item.Desc {
-					return c > 0
-				}
-				return c < 0
-			}
-			return false
-		})
+	if st.Distinct {
+		out = distinctRowsKeepFirst(len(cols), out)
 	}
 	out, err = applyLimit(out, st.Limit, args)
 	if err != nil {
 		return nil, err
 	}
 	return isql.NewRows(cols, out), nil
+}
+
+// substituteWindowValues overwrites window-function slots in already-projected
+// rows. Window expressions are not visible to ordinary expression evaluation,
+// so aggregateRows leaves those positions empty and they are filled here.
+func substituteWindowValues(out [][]any, exprs, _ []ast.Expr, winVals map[ast.Expr][]any) {
+	if len(winVals) == 0 {
+		return
+	}
+	lookup := make(map[ast.Expr][]any, len(winVals))
+	for k, v := range winVals {
+		lookup[k] = v
+	}
+	for rowIdx := range out {
+		for colIdx, expr := range exprs {
+			if vals, ok := lookup[expr]; ok && rowIdx < len(vals) {
+				if colIdx < len(out[rowIdx]) {
+					out[rowIdx][colIdx] = vals[rowIdx]
+				}
+			}
+		}
+	}
+}
+
+// sortProjectedRows reorders projected rows by an ORDER BY clause. Terms may
+// reference output ordinals (ORDER BY 1), output column names or aliases, or
+// ordinary expressions over the input row including window results.
+func sortProjectedRows(s *persistedState, st *ast.SelectStmt, tables []*catalog.Table, cols []string, out [][]any, filtered []rowContext, winVals map[ast.Expr][]any, args []any) {
+	// out is indexed together with filtered; sort a permutation so that the
+	// input contexts stay reachable for ORDER BY expressions.
+	rank := map[string]int{}
+	for i := range cols {
+		rank[strings.ToLower(cols[i])] = i
+	}
+	termValue := func(item ast.OrderByItem, idx int) any {
+		expr := item.Expr
+		if lit, ok := expr.(*ast.Literal); ok {
+			raw := strings.TrimSpace(string(lit.Raw))
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 1 && int(n) <= len(cols) {
+				return out[idx][int(n)-1]
+			}
+		}
+		if name := sortTermName(expr); name != "" {
+			if c, ok := rank[name]; ok && c < len(out[idx]) {
+				return out[idx][c]
+			}
+		}
+		if winVals != nil {
+			if v, err := evalExprWithWindows(s, expr, filtered[idx].Values, winVals, idx, &binder{args: args}); err == nil {
+				return v
+			}
+		}
+		v, _ := evalExprState(s, expr, filtered[idx].Values, &binder{args: args})
+		return v
+	}
+	idxs := make([]int, len(out))
+	for i := range idxs {
+		idxs[i] = i
+	}
+	sort.SliceStable(idxs, func(i, j int) bool {
+		a, b := idxs[i], idxs[j]
+		for _, item := range st.OrderBy {
+			lv := termValue(item, a)
+			rv := termValue(item, b)
+			c, _ := compareValues(lv, rv, collationForExpr(tables, item.Expr))
+			if c == 0 {
+				continue
+			}
+			if item.Desc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return false
+	})
+	sortedOut := make([][]any, len(out))
+	sortedIn := make([]rowContext, len(filtered))
+	for i, src := range idxs {
+		sortedOut[i] = out[src]
+		if src < len(filtered) {
+			sortedIn[i] = filtered[src]
+		}
+	}
+	copy(out, sortedOut)
+	copy(filtered, sortedIn)
+}
+
+// sortTermName returns the identifier an ORDER BY term names, if any.
+func sortTermName(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return strings.ToLower(e.Unquoted)
+	case *ast.QualifiedIdent:
+		if len(e.Parts) > 0 {
+			return strings.ToLower(e.Parts[len(e.Parts)-1].Unquoted)
+		}
+	}
+	return ""
 }
 
 func explain(st *ast.ExplainStmt) *Rows {
@@ -2890,11 +3624,17 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 	if len(st.From) != 1 || len(st.GroupBy) > 0 || st.Having != nil || st.SetOp != nil || hasAggregateSelect(st.Columns) {
 		return nil, false, nil
 	}
+	if st.Distinct || hasWindowSelect(st) {
+		return nil, false, nil
+	}
 	simple, ok := st.From[0].(*ast.SimpleTable)
 	if !ok {
 		return nil, false, nil
 	}
 	name := qname(simple.Name)
+	if _, isVT := hasVirtualTables(s, name); isVT {
+		return nil, false, nil
+	}
 	t, ok := s.Catalog.Table(name)
 	if !ok {
 		if _, viewOK := s.Catalog.View(name); viewOK {
@@ -2961,6 +3701,12 @@ func fastJoinAggregateSelect(s *persistedState, st *ast.SelectStmt, args []any) 
 	if len(args) != 0 || len(st.From) != 1 || st.Where != nil || st.Having != nil || st.Limit != nil || st.SetOp != nil {
 		return nil, false, nil
 	}
+	if _, isVT := hasVirtualTables(s, refSimpleName(st.From[0])); isVT {
+		return nil, false, nil
+	}
+	if st.Distinct || hasWindowSelect(st) {
+		return nil, false, nil
+	}
 	if len(st.Columns) != 3 || len(st.GroupBy) != 1 {
 		return nil, false, nil
 	}
@@ -3016,6 +3762,9 @@ func fastJoinAggregateSelect(s *persistedState, st *ast.SelectStmt, args []any) 
 		return nil, false, nil
 	}
 	if len(st.OrderBy) == 1 {
+		if st.OrderBy[0].NullsFirst != nil {
+			return nil, false, nil
+		}
 		orderRef, ok := qualifiedColumn(st.OrderBy[0].Expr)
 		if !ok || orderRef.table != groupTable || orderRef.col != groupCol {
 			return nil, false, nil
@@ -3043,28 +3792,71 @@ func fastJoinAggregateSelect(s *persistedState, st *ast.SelectStmt, args []any) 
 	if groupData == nil || sumData == nil {
 		return isql.NewRows([]string{groupCol, "expr", "expr"}, nil), true, nil
 	}
+	groupSchema := s.Catalog.Tables[groupTable]
+	sumSchema := s.Catalog.Tables[sumTable]
+	if groupSchema == nil || sumSchema == nil {
+		return nil, false, nil
+	}
+	_, groupJoinPos, ok := groupSchema.Column(groupJoinCol)
+	if !ok {
+		return nil, false, nil
+	}
+	_, groupValuePos, ok := groupSchema.Column(groupCol)
+	if !ok {
+		return nil, false, nil
+	}
+	_, sumJoinPos, ok := sumSchema.Column(sumJoinCol)
+	if !ok {
+		return nil, false, nil
+	}
+	_, sumValuePos, ok := sumSchema.Column(sumCol)
+	if !ok {
+		return nil, false, nil
+	}
 	groupValueByJoin := make(map[any]any, len(groupData.Rows))
 	for _, row := range groupData.Rows {
 		if row.Deleted != 0 {
 			continue
 		}
-		key, ok := comparableKey(row.Values[groupJoinCol])
+		joinValue, exists := row.positionalAt(groupJoinPos)
+		if !exists {
+			joinValue = row.Values[groupJoinCol]
+		}
+		if joinValue == nil {
+			continue
+		}
+		key, ok := comparableKey(joinValue)
 		if !ok {
 			return nil, false, nil
 		}
-		groupValueByJoin[key] = row.Values[groupCol]
+		groupValue, exists := row.positionalAt(groupValuePos)
+		if !exists {
+			groupValue = row.Values[groupCol]
+		}
+		groupValueByJoin[key] = groupValue
 	}
 	type aggregate struct {
-		key   any
-		count int64
-		sum   float64
+		key      any
+		count    int64
+		sumCount int64
+		sumFloat float64
+		sumInt   int64
+		allInt   bool
+		overflow bool
 	}
 	byGroup := make(map[any]aggregate, len(groupValueByJoin))
 	for _, row := range sumData.Rows {
 		if row.Deleted != 0 {
 			continue
 		}
-		joinKey, ok := comparableKey(row.Values[sumJoinCol])
+		joinValue, exists := row.positionalAt(sumJoinPos)
+		if !exists {
+			joinValue = row.Values[sumJoinCol]
+		}
+		if joinValue == nil {
+			continue
+		}
+		joinKey, ok := comparableKey(joinValue)
 		if !ok {
 			return nil, false, nil
 		}
@@ -3077,44 +3869,244 @@ func fastJoinAggregateSelect(s *persistedState, st *ast.SelectStmt, args []any) 
 			return nil, false, nil
 		}
 		agg := byGroup[key]
-		agg.key = groupValue
+		if agg.count == 0 {
+			agg.key = groupValue
+		}
 		agg.count++
-		if score, ok := asFloat(row.Values[sumCol]); ok {
-			agg.sum += score
+		scoreValue, exists := row.positionalAt(sumValuePos)
+		if !exists {
+			scoreValue = row.Values[sumCol]
+		}
+		if integer, ok := aggregateIntegerValue(scoreValue); ok {
+			if agg.sumCount == 0 {
+				agg.allInt = true
+			}
+			agg.sumCount++
+			if agg.allInt {
+				if (integer > 0 && agg.sumInt > math.MaxInt64-integer) || (integer < 0 && agg.sumInt < math.MinInt64-integer) {
+					agg.overflow = true
+				} else {
+					agg.sumInt += integer
+				}
+			}
+			agg.sumFloat += float64(integer)
+		} else if score, ok := sumFloatValue(scoreValue); ok {
+			if agg.sumCount == 0 {
+				agg.allInt = false
+			}
+			agg.sumCount++
+			agg.allInt = false
+			agg.sumFloat += score
 		}
 		byGroup[key] = agg
+	}
+	for _, agg := range byGroup {
+		if agg.overflow {
+			return nil, true, errors.New("integer overflow")
+		}
 	}
 	groups := make([]aggregate, 0, len(byGroup))
 	for _, agg := range byGroup {
 		groups = append(groups, agg)
 	}
-	sort.SliceStable(groups, func(i, j int) bool {
-		c, ok := compareValues(groups[i].key, groups[j].key, "BINARY")
+	groupCollation := columnCollation(groupSchema, groupCol)
+	descending := len(st.OrderBy) == 1 && st.OrderBy[0].Desc
+	sort.Slice(groups, func(i, j int) bool {
+		c, ok := compareGroupOrderValues(groups[i].key, groups[j].key, groupCollation)
 		if !ok {
 			return fmt.Sprint(groups[i].key) < fmt.Sprint(groups[j].key)
 		}
-		if len(st.OrderBy) == 1 && st.OrderBy[0].Desc {
+		if descending {
 			return c > 0
 		}
 		return c < 0
 	})
 	out := make([]any, 0, len(groups)*3)
 	for _, agg := range groups {
-		out = append(out, agg.key, agg.count, agg.sum)
+		var sum any
+		if agg.sumCount > 0 {
+			if agg.allInt {
+				sum = agg.sumInt
+			} else {
+				sum = agg.sumFloat
+			}
+		}
+		out = append(out, agg.key, agg.count, sum)
 	}
 	return isql.NewFlatRows([]string{groupCol, "expr", "expr"}, out), true, nil
 }
 
+func compareGroupOrderValues(left, right any, collation string) (int, bool) {
+	leftClass, rightClass := sqliteOrderClass(left), sqliteOrderClass(right)
+	if leftClass >= 0 && rightClass >= 0 && leftClass != rightClass {
+		return leftClass - rightClass, true
+	}
+	leftText, leftIsText := left.(string)
+	rightText, rightIsText := right.(string)
+	if leftIsText && rightIsText {
+		switch collation {
+		case "NOCASE":
+			return compareNoCaseASCII(leftText, rightText), true
+		case "RTRIM":
+			leftText = strings.TrimRight(leftText, " ")
+			rightText = strings.TrimRight(rightText, " ")
+		}
+		return strings.Compare(leftText, rightText), true
+	}
+	leftBlob, leftIsBlob := left.([]byte)
+	rightBlob, rightIsBlob := right.([]byte)
+	if leftIsBlob && rightIsBlob {
+		return bytes.Compare(leftBlob, rightBlob), true
+	}
+	if leftClass < 0 || rightClass < 0 {
+		return compareValues(left, right, collation)
+	}
+	return compareValues(left, right, collation)
+}
+
+func aggregateIntegerValue(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case bool:
+		if v {
+			return 1, true
+		}
+		return 0, true
+	default:
+		if !isIntegerValue(value) {
+			return 0, false
+		}
+		return asInt(value)
+	}
+}
+
+func sumFloatValue(value any) (float64, bool) {
+	switch v := value.(type) {
+	case string:
+		parsed, _ := sqliteNumericPrefix(v)
+		return parsed, true
+	case []byte:
+		parsed, _ := sqliteNumericPrefix(string(v))
+		return parsed, true
+	default:
+		return asFloat(value)
+	}
+}
+
+func sqliteNumericPrefix(value string) (float64, bool) {
+	value = strings.TrimLeft(value, " \t\n\r\f\v")
+	if value == "" {
+		return 0, false
+	}
+	pos := 0
+	if value[pos] == '+' || value[pos] == '-' {
+		pos++
+	}
+	digits := 0
+	for pos < len(value) && value[pos] >= '0' && value[pos] <= '9' {
+		pos++
+		digits++
+	}
+	if pos < len(value) && value[pos] == '.' {
+		pos++
+		for pos < len(value) && value[pos] >= '0' && value[pos] <= '9' {
+			pos++
+			digits++
+		}
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	mantissaEnd := pos
+	if pos < len(value) && (value[pos] == 'e' || value[pos] == 'E') {
+		exponent := pos + 1
+		if exponent < len(value) && (value[exponent] == '+' || value[exponent] == '-') {
+			exponent++
+		}
+		exponentDigits := exponent
+		for exponent < len(value) && value[exponent] >= '0' && value[exponent] <= '9' {
+			exponent++
+		}
+		if exponent > exponentDigits {
+			pos = exponent
+		} else {
+			pos = mantissaEnd
+		}
+	}
+	parsed, err := strconv.ParseFloat(value[:pos], 64)
+	return parsed, err == nil
+}
+
+func sqliteOrderClass(value any) int {
+	switch value.(type) {
+	case nil:
+		return 0
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, bool, json.Number:
+		return 1
+	case string:
+		return 2
+	case []byte:
+		return 3
+	default:
+		return -1
+	}
+}
+
+func compareNoCaseASCII(left, right string) int {
+	limit := len(left)
+	if len(right) < limit {
+		limit = len(right)
+	}
+	for i := 0; i < limit; i++ {
+		l, r := left[i], right[i]
+		if l >= 'A' && l <= 'Z' {
+			l += 'a' - 'A'
+		}
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		if l < r {
+			return -1
+		}
+		if l > r {
+			return 1
+		}
+	}
+	return len(left) - len(right)
+}
+
 func comparableKey(v any) (any, bool) {
 	switch x := v.(type) {
-	case nil, int, int64, float64, string, bool:
+	case nil, string:
 		return x, true
+	case int:
+		return int64(x), true
+	case int8:
+		return int64(x), true
+	case int16:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case int64:
+		return x, true
+	case bool:
+		if x {
+			return int64(1), true
+		}
+		return int64(0), true
+	case float32:
+		return comparableFloatKey(float64(x)), true
+	case float64:
+		return comparableFloatKey(x), true
 	case json.Number:
 		if i, err := x.Int64(); err == nil {
 			return i, true
 		}
 		if f, err := x.Float64(); err == nil {
-			return f, true
+			return comparableFloatKey(f), true
 		}
 		return nil, false
 	default:
@@ -3122,20 +4114,13 @@ func comparableKey(v any) (any, bool) {
 	}
 }
 
-func fastOrderCovered(order []fastOrderTerm, cols []string) bool {
-	for _, ord := range order {
-		found := false
-		for _, col := range cols {
-			if catalog.Normalize(col) == ord.col {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
+func comparableFloatKey(value float64) any {
+	const int64UpperExclusive = 9223372036854775808.0
+	const int64LowerInclusive = -9223372036854775808.0
+	if !math.IsNaN(value) && !math.IsInf(value, 0) && value == math.Trunc(value) && value >= int64LowerInclusive && value < int64UpperExclusive {
+		return int64(value)
 	}
-	return true
+	return value
 }
 
 func fastProjectors(t *catalog.Table, cols []ast.SelectColumn) ([]string, []func(rowVersion) any, bool) {
@@ -3399,23 +4384,6 @@ func runtimeIndexLookupKeyBytes(idx catalog.Index, val any) []byte {
 	}
 }
 
-type fastOrderTerm struct {
-	col  string
-	desc bool
-}
-
-func fastOrder(items []ast.OrderByItem) ([]fastOrderTerm, bool) {
-	out := make([]fastOrderTerm, 0, len(items))
-	for _, item := range items {
-		col := exprColumnName(item.Expr)
-		if col == "" {
-			return nil, false
-		}
-		out = append(out, fastOrderTerm{col: col, desc: item.Desc})
-	}
-	return out, true
-}
-
 func hasAggregateSelect(cols []ast.SelectColumn) bool {
 	for _, col := range cols {
 		if _, ok := col.Expr.(*ast.FuncCall); ok {
@@ -3430,6 +4398,8 @@ func queryPlan(s *persistedState, query string) (*Rows, bool) {
 	if !strings.HasPrefix(strings.ToLower(q), "explain query plan ") {
 		return nil, false
 	}
+	parseMu.Lock()
+	defer parseMu.Unlock()
 	inner := strings.TrimSpace(q[len("explain query plan "):])
 	stmt, err := parseStatementCached(inner)
 	if err != nil {
@@ -3542,14 +4512,6 @@ func orderByUsesIndex(s *persistedState, sel *ast.SelectStmt) bool {
 	}
 	ecol, _, eok, _ := indexedEqualityPredicate(sel.Where, nil)
 	return eok && ecol == col
-}
-
-func usableIndexForWhere(s *persistedState, table string, expr ast.Expr) string {
-	idx, primary := usableAccessForWhere(s, table, expr)
-	if primary {
-		return ""
-	}
-	return idx
 }
 
 func usableAccessForWhere(s *persistedState, table string, expr ast.Expr) (string, bool) {
@@ -3796,6 +4758,9 @@ func pragmaForeignKeyList(s *persistedState, table string) *Rows {
 	var rows [][]any
 	for i, fk := range t.ForeignKeys {
 		refCols := resolveFKColumnsForPragma(fk.RefColumns)
+		if parent, ok := s.Catalog.Table(fk.RefTable); ok {
+			refCols = resolveFKColumns(parent, fk.RefColumns)
+		}
 		for j, col := range fk.Columns {
 			to := ""
 			if j < len(refCols) {
@@ -3912,9 +4877,10 @@ func buildRowSetForSelect(s *persistedState, refs []ast.TableRef, where ast.Expr
 	if len(refs) == 1 {
 		if simple, ok := refs[0].(*ast.SimpleTable); ok {
 			name := qname(simple.Name)
+			_, isCTE := s.ctes[catalog.Normalize(name)]
 			if col, val, ok, err := indexedEqualityPredicate(where, args); err != nil {
 				return nil, nil, err
-			} else if ok {
+			} else if ok && !isCTE {
 				if rows, used, err := buildIndexedRows(s, simple, col, val); used || err != nil {
 					if err != nil {
 						return nil, nil, err
@@ -3924,7 +4890,7 @@ func buildRowSetForSelect(s *persistedState, refs []ast.TableRef, where ast.Expr
 				}
 			} else if col, start, end, ok, err := indexedRangePredicate(where, args); err != nil {
 				return nil, nil, err
-			} else if ok {
+			} else if ok && !isCTE {
 				if rows, used, err := buildRangeRows(s, simple, col, start, end); used || err != nil {
 					if err != nil {
 						return nil, nil, err
@@ -3940,6 +4906,9 @@ func buildRowSetForSelect(s *persistedState, refs []ast.TableRef, where ast.Expr
 
 func buildRangeRows(s *persistedState, simple *ast.SimpleTable, col string, start, end *rangeBound) ([]rowContext, bool, error) {
 	name := qname(simple.Name)
+	if _, isVT := hasVirtualTables(s, name); isVT {
+		return nil, false, nil
+	}
 	t, ok := s.Catalog.Table(name)
 	if !ok {
 		if _, viewOK := s.Catalog.View(name); viewOK {
@@ -3967,6 +4936,12 @@ func buildRangeRows(s *persistedState, simple *ast.SimpleTable, col string, star
 
 func buildIndexedRows(s *persistedState, simple *ast.SimpleTable, col string, val any) ([]rowContext, bool, error) {
 	name := qname(simple.Name)
+	if _, isCTE := s.ctes[catalog.Normalize(name)]; isCTE {
+		return nil, false, nil
+	}
+	if _, isVT := hasVirtualTables(s, name); isVT {
+		return nil, false, nil
+	}
 	t, ok := s.Catalog.Table(name)
 	if !ok {
 		if _, viewOK := s.Catalog.View(name); viewOK {
@@ -4278,6 +5253,18 @@ func buildRefRows(s *persistedState, ref ast.TableRef) ([]*catalog.Table, []rowC
 
 func buildSimpleRows(s *persistedState, r *ast.SimpleTable, keep func(rowVersion) bool) ([]*catalog.Table, []rowContext, error) {
 	name := qname(r.Name)
+	if s.compositeRead && r.Name != nil && len(r.Name.Parts) > 1 {
+		name = catalog.Normalize(r.Name.Parts[0].Unquoted) + "." + name
+	}
+	if mat, ok := s.ctes[catalog.Normalize(name)]; ok {
+		if keep != nil {
+			return nil, nil, errors.New("CTE rows cannot be filtered by row predicate")
+		}
+		return buildCTERows(r, mat)
+	}
+	if vt, isVT := hasVirtualTables(s, name); isVT {
+		return buildVirtualRows(s, vt, r, keep)
+	}
 	t, ok := s.Catalog.Table(name)
 	if !ok {
 		if view, viewOK := s.Catalog.View(name); viewOK {
@@ -4415,7 +5402,7 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 		if col.NotNull && v == nil {
 			return fmt.Errorf("column %s cannot be null", col.Name)
 		}
-		if col.PrimaryKey || col.Unique {
+		if col.Unique || isSingleColumnPrimaryKey(t, col.Name) {
 			for _, row := range data.Rows {
 				if row.Deleted == 0 && row.RowID != self && valuesEqual(row.Values[col.Name], v, col.Collation) {
 					return fmt.Errorf("unique constraint failed: %s.%s", t.Name, col.Name)
@@ -4635,6 +5622,9 @@ func validateForeignKey(s *persistedState, fk catalog.ForeignKey, values map[str
 	}
 	refData := s.Tables[refTable.Name]
 	refCols := resolveFKColumns(refTable, fk.RefColumns)
+	if len(refCols) != len(fk.Columns) {
+		return errors.New("foreign key mismatch")
+	}
 	for _, col := range fk.Columns {
 		if values[col] == nil {
 			return nil
@@ -4656,37 +5646,86 @@ func validateForeignKey(s *persistedState, fk catalog.ForeignKey, values map[str
 }
 
 func resolveFKColumns(t *catalog.Table, cols []string) []string {
-	out := append([]string(nil), cols...)
-	for i, col := range out {
+	var out []string
+	for _, col := range cols {
 		if col == primaryKeyNamePlaceholder {
-			out[i] = primaryKeyColumn(t)
+			out = append(out, primaryKeyColumns(t)...)
+		} else {
+			out = append(out, col)
 		}
 	}
 	return out
 }
 
-func primaryKeyColumn(t *catalog.Table) string {
+func primaryKeyColumns(t *catalog.Table) []string {
+	if t == nil {
+		return nil
+	}
+	if len(t.PrimaryKeyColumns) > 0 {
+		return t.PrimaryKeyColumns
+	}
+	// Older snapshots do not store key order explicitly. Preserve their
+	// primary-key membership using the table's column order until rewritten.
+	var cols []string
 	for _, col := range t.Columns {
 		if col.PrimaryKey {
-			return col.Name
+			cols = append(cols, col.Name)
 		}
 	}
-	if len(t.Columns) > 0 {
-		return t.Columns[0].Name
-	}
-	return ""
+	return cols
 }
 
 func integerPrimaryKeyColumn(t *catalog.Table) string {
+	if t == nil {
+		return ""
+	}
+	primaryKeyName := ""
+	primaryKeyDecl := ""
 	for _, col := range t.Columns {
-		if col.PrimaryKey && col.Type == catalog.Integer {
-			return col.Name
+		if !col.PrimaryKey {
+			continue
 		}
+		if primaryKeyName != "" {
+			return ""
+		}
+		primaryKeyName = col.Name
+		primaryKeyDecl = col.DeclType
+	}
+	if primaryKeyName != "" && strings.EqualFold(strings.TrimSpace(primaryKeyDecl), "INTEGER") {
+		return primaryKeyName
 	}
 	return ""
 }
 
+func isSingleColumnPrimaryKey(t *catalog.Table, name string) bool {
+	if t == nil {
+		return false
+	}
+	var primaryKey string
+	for _, col := range t.Columns {
+		if !col.PrimaryKey {
+			continue
+		}
+		if primaryKey != "" {
+			return false
+		}
+		primaryKey = col.Name
+	}
+	return primaryKey != "" && primaryKey == name
+}
+
 func coerce(col catalog.Column, v any, strict bool) (any, error) {
+	// These values are already canonical SQLite storage values. Keep common
+	// integer and text binds out of the reflection and conversion path.
+	switch v.(type) {
+	case int64, string:
+	default:
+		var err error
+		v, err = normalizeSQLiteBindValue(v)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if v == nil {
 		if col.NotNull {
 			return nil, fmt.Errorf("column %s cannot be null", col.Name)
@@ -4748,7 +5787,7 @@ func applyAffinity(col catalog.Column, v any) any {
 	case catalog.Text:
 		switch x := v.(type) {
 		case string:
-			return x
+			return v
 		case []byte:
 			return string(x)
 		default:
@@ -4787,7 +5826,7 @@ func (b *binder) next() (any, error) {
 		if isNamedSource(v) {
 			continue
 		}
-		return v, nil
+		return normalizeSQLiteBindValue(v)
 	}
 	return nil, errors.New("not enough bind parameters")
 }
@@ -4804,12 +5843,192 @@ func (b *binder) param(raw []byte) (any, error) {
 		}
 	}
 	if v, ok := b.named[name]; ok {
-		return v, nil
+		return normalizeSQLiteBindValue(v)
 	}
 	if v, ok := b.named[catalog.Normalize(name)]; ok {
-		return v, nil
+		return normalizeSQLiteBindValue(v)
 	}
 	return nil, fmt.Errorf("missing named bind parameter: %s", name)
+}
+
+func (b *binder) rawParam(raw []byte) (any, error) {
+	name := parameterName(raw)
+	if name == "" {
+		if b.pos >= len(b.args) {
+			return nil, errors.New("not enough bind parameters")
+		}
+		value := b.args[b.pos]
+		b.pos++
+		return value, nil
+	}
+	if b.named == nil {
+		b.named = make(map[string]any)
+		for _, arg := range b.args {
+			addNamedSource(b.named, arg)
+		}
+	}
+	if value, ok := b.named[name]; ok {
+		return value, nil
+	}
+	if value, ok := b.named[catalog.Normalize(name)]; ok {
+		return value, nil
+	}
+	return nil, fmt.Errorf("missing named bind parameter: %s", name)
+}
+
+// normalizeSQLiteBindValue maps common Go inputs onto SQLite's five storage
+// classes. database/sql already does this conversion for the driver API, but
+// users of DB.Exec and DB.Query can call the embedded API directly.
+func normalizeSQLiteBindValue(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if valuer, ok := v.(driver.Valuer); ok {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return nil, nil
+		}
+		value, err := valuer.Value()
+		if err != nil {
+			return nil, err
+		}
+		if !driver.IsValue(value) {
+			return nil, fmt.Errorf("driver.Valuer returned unsupported SQLite value %T", value)
+		}
+		return normalizeSQLiteBindValue(value)
+	}
+	if marshaler, ok := v.(encoding.TextMarshaler); ok {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return nil, nil
+		}
+		text, err := marshaler.MarshalText()
+		if err != nil {
+			return nil, err
+		}
+		return string(text), nil
+	}
+	// These are already canonical SQLite bind values. Handle them before
+	// reflection to keep ordinary scalar binds on the fast path.
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case int:
+		return int64(x), nil
+	case int64:
+		return x, nil
+	case float64:
+		return normalizeSQLiteFloat(x), nil
+	case string:
+		return x, nil
+	case []byte:
+		if x == nil {
+			return nil, nil
+		}
+		return cloneSQLiteBlob(x), nil
+	}
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil, nil
+		}
+		v = rv.Elem().Interface()
+		rv = reflect.ValueOf(v)
+	}
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	case int:
+		return int64(x), nil
+	case int8:
+		return int64(x), nil
+	case int16:
+		return int64(x), nil
+	case int32:
+		return int64(x), nil
+	case int64:
+		return x, nil
+	case uint:
+		if uint64(x) > math.MaxInt64 {
+			return nil, errors.New("unsigned integer exceeds SQLite INTEGER range")
+		}
+		return int64(x), nil
+	case uint8:
+		return int64(x), nil
+	case uint16:
+		return int64(x), nil
+	case uint32:
+		return int64(x), nil
+	case uint64:
+		if x > math.MaxInt64 {
+			return nil, errors.New("unsigned integer exceeds SQLite INTEGER range")
+		}
+		return int64(x), nil
+	case float32:
+		return normalizeSQLiteFloat(float64(x)), nil
+	case float64:
+		return normalizeSQLiteFloat(x), nil
+	case string:
+		return v, nil
+	case json.Number:
+		// database/sql treats json.Number as its underlying string type. Keep
+		// the same SQLite TEXT storage class for direct DB bindings.
+		return string(x), nil
+	case []byte:
+		if x == nil {
+			return nil, nil
+		}
+		return cloneSQLiteBlob(x), nil
+	case time.Time:
+		return x.Format(time.RFC3339Nano), nil
+	default:
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return rv.Int(), nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			if rv.Uint() > math.MaxInt64 {
+				return nil, errors.New("unsigned integer exceeds SQLite INTEGER range")
+			}
+			return int64(rv.Uint()), nil
+		case reflect.Float32, reflect.Float64:
+			return normalizeSQLiteFloat(rv.Convert(reflect.TypeOf(float64(0))).Float()), nil
+		case reflect.String:
+			return rv.String(), nil
+		case reflect.Slice:
+			if rv.Type().Elem().Kind() == reflect.Uint8 {
+				if rv.IsNil() {
+					return nil, nil
+				}
+				return cloneSQLiteBlob(rv.Bytes()), nil
+			}
+		}
+		// The direct API accepts structured values as JSON text. Convert before
+		// storing so live rows and recovered rows have the same SQLite class.
+		switch rv.Kind() {
+		case reflect.Array, reflect.Slice, reflect.Map, reflect.Struct:
+			encoded, err := json.Marshal(v)
+			if err != nil {
+				return nil, err
+			}
+			return string(encoded), nil
+		default:
+			return nil, fmt.Errorf("unsupported SQLite bind type %T", v)
+		}
+	}
+}
+
+func normalizeSQLiteFloat(value float64) any {
+	if math.IsNaN(value) {
+		return nil
+	}
+	return value
 }
 
 func namedArg(v any) (NamedArg, bool) {
@@ -4830,6 +6049,15 @@ func isNamedSource(v any) bool {
 	if _, ok := namedArg(v); ok {
 		return true
 	}
+	if _, ok := v.(driver.Valuer); ok {
+		return false
+	}
+	if _, ok := v.(encoding.TextMarshaler); ok {
+		return false
+	}
+	if _, ok := v.(time.Time); ok {
+		return false
+	}
 	rv := reflect.ValueOf(v)
 	if !rv.IsValid() {
 		return false
@@ -4839,6 +6067,9 @@ func isNamedSource(v any) bool {
 			return false
 		}
 		rv = rv.Elem()
+	}
+	if rv.Type() == reflect.TypeOf(time.Time{}) {
+		return false
 	}
 	switch rv.Kind() {
 	case reflect.Map:
@@ -4853,6 +6084,9 @@ func isNamedSource(v any) bool {
 func addNamedSource(out map[string]any, v any) {
 	if n, ok := namedArg(v); ok {
 		addNamedValue(out, n.Name, n.Value)
+		return
+	}
+	if !isNamedSource(v) {
 		return
 	}
 	rv := reflect.ValueOf(v)
@@ -4962,6 +6196,9 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 	case *ast.Param:
 		return b.param(e.Raw)
 	case *ast.Ident:
+		if v, ok := triggerLookup("", e.Unquoted); ok {
+			return v, nil
+		}
 		return row[catalog.Normalize(e.Unquoted)], nil
 	case *ast.QualifiedIdent:
 		if len(e.Parts) == 0 {
@@ -4970,6 +6207,11 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 		var parts []string
 		for _, p := range e.Parts {
 			parts = append(parts, catalog.Normalize(p.Unquoted))
+		}
+		if len(e.Parts) >= 2 {
+			if v, ok := triggerLookup(e.Parts[0].Unquoted, e.Parts[1].Unquoted); ok {
+				return v, nil
+			}
 		}
 		if v, ok := row[strings.Join(parts, ".")]; ok {
 			return v, nil
@@ -5090,12 +6332,7 @@ func evalExpr(expr ast.Expr, row map[string]any, b *binder) (any, error) {
 			return nil, err
 		}
 		if e.Op == lexer.MINUS {
-			switch x := v.(type) {
-			case int64:
-				return -x, nil
-			case float64:
-				return -x, nil
-			}
+			return negateNumeric(v)
 		}
 		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
 			return !truthy(v), nil
@@ -5192,15 +6429,18 @@ func evalBinary(left, right any, op lexer.TokenType) (any, error) {
 	case lexer.OR:
 		return truthy(left) || truthy(right), nil
 	case lexer.PLUS, lexer.MINUS, lexer.STAR, lexer.SLASH, lexer.PERCENT:
-		return arithmetic(left, right, op)
+		value, err := arithmetic(left, right, op)
+		if err != nil {
+			return nil, err
+		}
+		if number, ok := value.(float64); ok {
+			return normalizeSQLiteFloat(number), nil
+		}
+		return value, nil
 	case lexer.DBAR:
 		return fmt.Sprint(left) + fmt.Sprint(right), nil
 	}
 	return nil, fmt.Errorf("unsupported binary operator: %s", op)
-}
-
-func compare(left, right any) (int, bool) {
-	return compareValues(left, right, "BINARY")
 }
 
 func compareValues(left, right any, collate string) (int, bool) {
@@ -5241,10 +6481,6 @@ func valuesEqual(left, right any, collate string) bool {
 }
 
 func evalFunc(fn *ast.FuncCall, row map[string]any, b *binder) (any, error) {
-	name := ""
-	if fn.Name != nil && len(fn.Name.Parts) > 0 {
-		name = strings.ToLower(fn.Name.Parts[len(fn.Name.Parts)-1].Unquoted)
-	}
 	args := make([]any, 0, len(fn.Args))
 	for _, expr := range fn.Args {
 		v, err := evalExpr(expr, row, b)
@@ -5253,25 +6489,55 @@ func evalFunc(fn *ast.FuncCall, row map[string]any, b *binder) (any, error) {
 		}
 		args = append(args, v)
 	}
+	return callScalarFunc(funcCallName(fn), args)
+}
+
+// callScalarFunc dispatches a scalar function by name. It is shared by ordinary
+// expression evaluation and window-function argument evaluation, where nested
+// aggregates must be substituted before the call.
+func callScalarFunc(name string, args []any) (any, error) {
+	value, err := callScalarFuncRaw(name, args)
+	if err != nil {
+		return nil, err
+	}
+	if number, ok := value.(float64); ok {
+		return normalizeSQLiteFloat(number), nil
+	}
+	return value, nil
+}
+
+func callScalarFuncRaw(name string, args []any) (any, error) {
 	switch name {
 	case "lower":
 		if len(args) != 1 {
 			return nil, errors.New("lower expects 1 argument")
 		}
-		return strings.ToLower(fmt.Sprint(args[0])), nil
+		if args[0] == nil {
+			return nil, nil
+		}
+		// SQLite's lower() only folds ASCII unless an extension like ICU is
+		// loaded, so non-ASCII runes are left alone.
+		return asciiCase(stringifySQL(args[0]), false), nil
 	case "upper":
 		if len(args) != 1 {
 			return nil, errors.New("upper expects 1 argument")
 		}
-		return strings.ToUpper(fmt.Sprint(args[0])), nil
+		if args[0] == nil {
+			return nil, nil
+		}
+		return asciiCase(stringifySQL(args[0]), true), nil
 	case "length":
 		if len(args) != 1 {
 			return nil, errors.New("length expects 1 argument")
 		}
+		if args[0] == nil {
+			return nil, nil
+		}
 		if b, ok := args[0].([]byte); ok {
 			return int64(len(b)), nil
 		}
-		return int64(len(fmt.Sprint(args[0]))), nil
+		// Text length counts characters, not bytes.
+		return int64(utf8.RuneCountInString(stringifySQL(args[0]))), nil
 	case "hex":
 		if len(args) != 1 {
 			return nil, errors.New("hex expects 1 argument")
@@ -5287,15 +6553,6 @@ func evalFunc(fn *ast.FuncCall, row map[string]any, b *binder) (any, error) {
 			return nil, errors.New("typeof expects 1 argument")
 		}
 		return sqliteTypeOf(args[0]), nil
-	case "json_valid":
-		if len(args) != 1 {
-			return nil, errors.New("json_valid expects 1 argument")
-		}
-		var js any
-		if err := json.Unmarshal([]byte(fmt.Sprint(args[0])), &js); err == nil {
-			return int64(1), nil
-		}
-		return int64(0), nil
 	case "coalesce":
 		for _, arg := range args {
 			if arg != nil {
@@ -5319,23 +6576,38 @@ func evalFunc(fn *ast.FuncCall, row map[string]any, b *binder) (any, error) {
 			return nil, nil
 		}
 		return args[0], nil
-	case "abs":
-		if len(args) != 1 {
-			return nil, errors.New("abs expects 1 argument")
-		}
-		f, ok := asFloat(args[0])
-		if !ok {
-			return nil, errors.New("abs expects numeric argument")
-		}
-		if f < 0 {
-			f = -f
-		}
-		return f, nil
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "total", "group_concat", "string_agg":
+		// Single-argument aggregates are resolved by the grouping machinery,
+		// not here.
 		return nil, nil
+	case "min", "max":
+		if len(args) <= 1 {
+			return nil, nil
+		}
+		// min(a, b, c) with several arguments is a scalar function.
+		return callExtendedFunc(name, args)
 	default:
-		return nil, fmt.Errorf("unsupported function: %s", name)
+		return callExtendedFunc(name, args)
 	}
+}
+
+// asciiCase upper- or lower-cases ASCII letters only, matching SQLite's
+// built-in lower()/upper() without an ICU extension.
+func asciiCase(s string, upper bool) string {
+	b := []byte(s)
+	for i := range b {
+		c := b[i]
+		if upper {
+			if c >= 'a' && c <= 'z' {
+				b[i] = c - 32
+			}
+		} else {
+			if c >= 'A' && c <= 'Z' {
+				b[i] = c + 32
+			}
+		}
+	}
+	return string(b)
 }
 
 func sqliteTypeOf(v any) string {
@@ -5351,10 +6623,6 @@ func sqliteTypeOf(v any) string {
 	default:
 		return "text"
 	}
-}
-
-func like(value, pattern string) bool {
-	return likeWithEscape(value, pattern, 0)
 }
 
 func likeWithEscape(value, pattern string, escape byte) bool {
@@ -5383,37 +6651,118 @@ func likeWithEscape(value, pattern string, escape byte) bool {
 	return rec(0, 0)
 }
 
+// arithmetic applies SQLite's binary numeric operators. When both operands are
+// integers the result stays an integer and division truncates toward zero;
+// introducing a real anywhere makes the result a real. Division by zero yields
+// NULL rather than an error.
 func arithmetic(left, right any, op lexer.TokenType) (any, error) {
 	lf, lok := asFloat(left)
 	rf, rok := asFloat(right)
 	if !lok || !rok {
 		return nil, errors.New("arithmetic requires numeric values")
 	}
+	bothInt := isIntegerValue(left) && isIntegerValue(right)
 	switch op {
 	case lexer.PLUS:
+		if bothInt {
+			li, _ := asInt(left)
+			ri, _ := asInt(right)
+			if (ri > 0 && li > math.MaxInt64-ri) || (ri < 0 && li < math.MinInt64-ri) {
+				return nil, errors.New("integer overflow")
+			}
+			return li + ri, nil
+		}
 		return lf + rf, nil
 	case lexer.MINUS:
+		if bothInt {
+			li, _ := asInt(left)
+			ri, _ := asInt(right)
+			if (ri < 0 && li > math.MaxInt64+ri) || (ri > 0 && li < math.MinInt64+ri) {
+				return nil, errors.New("integer overflow")
+			}
+			return li - ri, nil
+		}
 		return lf - rf, nil
 	case lexer.STAR:
+		if bothInt {
+			li, _ := asInt(left)
+			ri, _ := asInt(right)
+			if li != 0 && ri != 0 {
+				p := li * ri
+				if p/ri != li {
+					return nil, errors.New("integer overflow")
+				}
+			}
+			return li * ri, nil
+		}
 		return lf * rf, nil
 	case lexer.SLASH:
 		if rf == 0 {
-			return nil, errors.New("division by zero")
+			return nil, nil
+		}
+		if bothInt {
+			li, _ := asInt(left)
+			ri, _ := asInt(right)
+			if ri == 0 {
+				return nil, nil
+			}
+			// SQLite truncates integer division toward zero.
+			q := li / ri
+			return q, nil
 		}
 		return lf / rf, nil
 	case lexer.PERCENT:
+		if rf == 0 {
+			return nil, nil
+		}
 		li, lok := asInt(left)
 		ri, rok := asInt(right)
 		if !lok || !rok {
 			return nil, errors.New("modulo requires integer values")
 		}
 		if ri == 0 {
-			return nil, errors.New("division by zero")
+			return nil, nil
 		}
 		return li % ri, nil
 	default:
 		return nil, errors.New("unknown arithmetic operator")
 	}
+}
+
+// negateNumeric applies unary minus, preserving integer-ness.
+func negateNumeric(v any) (any, error) {
+	if isIntegerValue(v) {
+		i, ok := asInt(v)
+		if !ok {
+			return nil, errors.New("unary minus requires a numeric value")
+		}
+		if i == math.MinInt64 {
+			return nil, errors.New("integer overflow")
+		}
+		return -i, nil
+	}
+	f, ok := asFloat(v)
+	if !ok {
+		return nil, errors.New("unary minus requires a numeric value")
+	}
+	return -f, nil
+}
+
+// isIntegerValue reports whether a value carries SQLite's INTEGER class after
+// numeric conversion. Text that parses as an integer counts as an integer —
+// '3'+1 is 4, not 4.0 — while text that parses only as a real does not.
+func isIntegerValue(v any) bool {
+	switch x := v.(type) {
+	case int, int64, bool:
+		return true
+	case string:
+		_, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		return err == nil
+	case json.Number:
+		_, err := x.Int64()
+		return err == nil
+	}
+	return false
 }
 
 func asFloat(v any) (float64, bool) {
@@ -5485,10 +6834,6 @@ func truthy(v any) bool {
 	}
 }
 
-func matchWhere(expr ast.Expr, row map[string]any, b *binder) (bool, error) {
-	return matchWhereState(nil, expr, row, b)
-}
-
 func matchWhereState(s *persistedState, expr ast.Expr, row map[string]any, b *binder) (bool, error) {
 	if expr == nil {
 		return true, nil
@@ -5518,12 +6863,7 @@ func evalExprState(s *persistedState, expr ast.Expr, row map[string]any, b *bind
 			return nil, err
 		}
 		if e.Op == lexer.MINUS {
-			switch x := v.(type) {
-			case int64:
-				return -x, nil
-			case float64:
-				return -x, nil
-			}
+			return negateNumeric(v)
 		}
 		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
 			return !truthy(v), nil
@@ -5616,29 +6956,104 @@ func evalInExprState(s *persistedState, e *ast.InExpr, row map[string]any, b *bi
 }
 
 func hasAggregate(exprs []ast.Expr) bool {
-	for _, expr := range exprs {
-		if fn, ok := expr.(*ast.FuncCall); ok {
-			name := ""
-			if fn.Name != nil && len(fn.Name.Parts) > 0 {
-				name = strings.ToLower(fn.Name.Parts[len(fn.Name.Parts)-1].Unquoted)
+	return slices.ContainsFunc(exprs, hasAggregateExpr)
+}
+
+// hasAggregateExpr reports whether an expression contains a bare aggregate
+// function call. Window invocations such as sum(x) OVER () are not aggregates:
+// they are evaluated per row after grouping.
+func hasAggregateExpr(expr ast.Expr) bool {
+	found := false
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		switch x := e.(type) {
+		case *ast.FuncCall:
+			if isWindowCall(x) {
+				return
 			}
-			switch name {
-			case "count", "sum", "avg", "min", "max":
-				return true
+			if isAggregateCall(x) {
+				found = true
+				return
 			}
+			for _, a := range x.Args {
+				walk(a)
+			}
+		case *ast.BinaryExpr:
+			walk(x.Left)
+			walk(x.Right)
+		case *ast.UnaryExpr:
+			walk(x.Expr)
+		case *ast.CastExpr:
+			walk(x.Expr)
+		case *ast.CaseExpr:
+			if x.Else != nil {
+				walk(x.Else)
+			}
+			if x.Operand != nil {
+				walk(x.Operand)
+			}
+			for _, w := range x.Whens {
+				walk(w.Cond)
+				walk(w.Result)
+			}
+		case *ast.BetweenExpr:
+			walk(x.Expr)
+		case *ast.IsNullExpr:
+			walk(x.Expr)
+		case *ast.LikeExpr:
+			if x.Expr != nil {
+				walk(x.Expr)
+			}
+			if x.Pattern != nil {
+				walk(x.Pattern)
+			}
+		case *ast.InExpr:
+			walk(x.Expr)
 		}
+	}
+	walk(expr)
+	return found
+}
+
+// isAggregateCall reports whether a function call is a group aggregate.
+// min()/max() are aggregates only in their single-argument form; min(a,b,c) is
+// an ordinary scalar function.
+func isAggregateCall(fn *ast.FuncCall) bool {
+	if fn == nil || isWindowCall(fn) {
+		return false
+	}
+	name := funcCallName(fn)
+	if name == "min" || name == "max" {
+		return len(fn.Args) <= 1
+	}
+	return isAggregateFuncName(name)
+}
+
+// isAggregateFuncName reports whether a function name is an aggregate.
+func isAggregateFuncName(name string) bool {
+	switch name {
+	case "count", "sum", "total", "avg", "min", "max", "group_concat", "string_agg":
+		return true
 	}
 	return false
 }
 
-func aggregateRows(s *persistedState, contexts []rowContext, st *ast.SelectStmt, cols []string, exprs []ast.Expr, args []any) ([][]any, []string, error) {
+// funcCallName lowercases the trailing identifier of a function call.
+func funcCallName(fn *ast.FuncCall) string {
+	if fn == nil || fn.Name == nil || len(fn.Name.Parts) == 0 {
+		return ""
+	}
+	return strings.ToLower(fn.Name.Parts[len(fn.Name.Parts)-1].Unquoted)
+}
+
+func aggregateRows(s *persistedState, contexts []rowContext, st *ast.SelectStmt, cols []string, exprs, extra []ast.Expr, args []any) ([][]any, []string, [][]any, error) {
 	groups := map[string][]rowContext{}
 	order := []string{}
 	for _, row := range contexts {
 		b := binder{args: args}
 		ok, err := matchWhereState(s, st.Where, row.Values, &b)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if !ok {
 			continue
@@ -5649,7 +7064,7 @@ func aggregateRows(s *persistedState, contexts []rowContext, st *ast.SelectStmt,
 			for _, g := range st.GroupBy {
 				v, err := evalExpr(g, row.Values, &binder{args: args})
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				keyParts = append(keyParts, fmt.Sprint(v))
 			}
@@ -5665,28 +7080,38 @@ func aggregateRows(s *persistedState, contexts []rowContext, st *ast.SelectStmt,
 		order = append(order, "__all__")
 	}
 	var out [][]any
+	var extraOut [][]any
 	for _, key := range order {
 		group := groups[key]
 		var values []any
 		for _, expr := range exprs {
 			v, err := evalAggregateExpr(expr, group, args)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			values = append(values, v)
 		}
 		if st.Having != nil {
 			hv, err := evalAggregateExpr(st.Having, group, args)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			if !truthy(hv) {
 				continue
 			}
 		}
+		var extraVals []any
+		for _, expr := range extra {
+			v, err := evalAggregateExpr(expr, group, args)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			extraVals = append(extraVals, v)
+		}
 		out = append(out, values)
+		extraOut = append(extraOut, extraVals)
 	}
-	return out, cols, nil
+	return out, cols, extraOut, nil
 }
 
 func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, error) {
@@ -5707,12 +7132,7 @@ func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, erro
 			return nil, err
 		}
 		if e.Op == lexer.MINUS {
-			switch x := v.(type) {
-			case int64:
-				return -x, nil
-			case float64:
-				return -x, nil
-			}
+			return negateNumeric(v)
 		}
 		if e.Op == lexer.NOT || strings.EqualFold(e.Op.String(), "UNKNOWN") || fmt.Sprint(e.Op) == "UNKNOWN" {
 			return !truthy(v), nil
@@ -5726,6 +7146,20 @@ func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, erro
 		}
 		return evalExpr(expr, group[0].Values, &binder{args: args})
 	}
+	// Window invocations are not group aggregates. They are computed after
+	// grouping, over the grouped rows, and their slots are filled in by
+	// substituteWindowValues.
+	if isWindowCall(fn) {
+		return nil, nil
+	}
+	if !isAggregateCall(fn) {
+		if len(group) == 0 {
+			return nil, nil
+		}
+		// Scalar functions (including multi-argument min/max) evaluate against
+		// the group's first row, matching SQL's bare-column rules.
+		return evalFunc(fn, group[0].Values, &binder{args: args})
+	}
 	name := ""
 	if fn.Name != nil && len(fn.Name.Parts) > 0 {
 		name = strings.ToLower(fn.Name.Parts[len(fn.Name.Parts)-1].Unquoted)
@@ -5734,6 +7168,9 @@ func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, erro
 	case "count":
 		if fn.Star {
 			return int64(len(group)), nil
+		}
+		if len(fn.Args) == 0 {
+			return nil, errors.New("count expects 1 argument")
 		}
 		var n int64
 		for _, row := range group {
@@ -5746,27 +7183,65 @@ func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, erro
 			}
 		}
 		return n, nil
-	case "sum", "avg":
-		var sum float64
+	case "sum", "avg", "total":
+		if len(fn.Args) == 0 {
+			return nil, fmt.Errorf("%s expects 1 argument", name)
+		}
+		sumF := float64(0)
+		var sumI int64
+		allInt := true
 		var n int64
+		overflow := false
 		for _, row := range group {
 			v, err := evalExpr(fn.Args[0], row.Values, &binder{args: args})
 			if err != nil {
 				return nil, err
 			}
-			if f, ok := asFloat(v); ok {
-				sum += f
-				n++
+			if v == nil {
+				continue
 			}
+			f, ok := sumFloatValue(v)
+			if !ok {
+				continue
+			}
+			if !isIntegerValue(v) {
+				allInt = false
+			}
+			if allInt {
+				iv, iok := asInt(v)
+				if !iok {
+					allInt = false
+				} else if (iv > 0 && sumI > math.MaxInt64-iv) || (iv < 0 && sumI < math.MinInt64-iv) {
+					// SQLite raises an error on integer overflow in sum().
+					overflow = true
+				} else {
+					sumI += iv
+				}
+			}
+			sumF += f
+			n++
+		}
+		if overflow {
+			return nil, errors.New("integer overflow")
+		}
+		if name == "total" {
+			return sumF, nil
 		}
 		if n == 0 {
 			return nil, nil
 		}
 		if name == "avg" {
-			return sum / float64(n), nil
+			// avg always yields a real, even for all-integer input.
+			return sumF / float64(n), nil
 		}
-		return sum, nil
+		if allInt {
+			return sumI, nil
+		}
+		return sumF, nil
 	case "min", "max":
+		if len(fn.Args) == 0 {
+			return nil, fmt.Errorf("%s expects 1 argument", name)
+		}
 		var best any
 		for _, row := range group {
 			v, err := evalExpr(fn.Args[0], row.Values, &binder{args: args})
@@ -5786,11 +7261,61 @@ func evalAggregateExpr(expr ast.Expr, group []rowContext, args []any) (any, erro
 			}
 		}
 		return best, nil
+	case "group_concat", "string_agg":
+		if len(fn.Args) == 0 {
+			return nil, fmt.Errorf("%s expects 1 argument", name)
+		}
+		sep := ","
+		if len(fn.Args) > 1 {
+			if s, ok := fn.Args[1].(*ast.Literal); ok {
+				sep = unquoteSQL(string(s.Raw))
+			}
+		}
+		var parts []string
+		for _, row := range group {
+			v, err := evalExpr(fn.Args[0], row.Values, &binder{args: args})
+			if err != nil {
+				return nil, err
+			}
+			if v == nil {
+				continue
+			}
+			parts = append(parts, stringifySQL(v))
+		}
+		if len(parts) == 0 {
+			return nil, nil
+		}
+		return strings.Join(parts, sep), nil
 	default:
 		if len(group) == 0 {
 			return nil, nil
 		}
 		return evalFunc(fn, group[0].Values, &binder{args: args})
+	}
+}
+
+// stringifySQL renders a value the way SQLite text-concatenates it.
+func stringifySQL(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	case bool:
+		if x {
+			return "1"
+		}
+		return "0"
+	case int:
+		return strconv.FormatInt(int64(x), 10)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	default:
+		return fmt.Sprint(x)
 	}
 }
 
