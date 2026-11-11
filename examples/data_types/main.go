@@ -8,7 +8,7 @@ import (
 	"log"
 	"time"
 
-	sqlite "github.com/sujit/sqlite"
+	sqlite "github.com/oarkflow/sqlite"
 )
 
 type Profile struct {

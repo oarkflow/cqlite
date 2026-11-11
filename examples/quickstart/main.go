@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	sqlite "github.com/sujit/sqlite"
+	sqlite "github.com/oarkflow/sqlite"
 )
 
 func main() {

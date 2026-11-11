@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	sqlite "github.com/sujit/sqlite"
+	sqlite "github.com/oarkflow/sqlite"
 )
 
 func TestSchemaReturnsTablesAndViews(t *testing.T) {

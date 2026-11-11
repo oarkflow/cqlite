@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	catalog "github.com/sujit/sqlite/internal/catalog"
+	catalog "github.com/oarkflow/sqlite/internal/catalog"
 )
 
 // VirtualTable is an alias for the catalog's persisted CREATE VIRTUAL TABLE

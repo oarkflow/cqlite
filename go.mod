@@ -1,4 +1,4 @@
-module github.com/sujit/sqlite
+module github.com/oarkflow/sqlite
 
 go 1.26.0
 

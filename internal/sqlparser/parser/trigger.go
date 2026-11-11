@@ -1,8 +1,8 @@
 package parser
 
 import (
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 )
 
 // parseCreateTrigger parses SQLite's CREATE TRIGGER statement, including the

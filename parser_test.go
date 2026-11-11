@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	"github.com/sujit/sqlite/internal/sqlparser"
+	"github.com/oarkflow/sqlite/internal/sqlparser"
 )
 
 func TestParserAcceptsV1InsertShapes(t *testing.T) {

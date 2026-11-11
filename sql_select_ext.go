@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	catalog "github.com/sujit/sqlite/internal/catalog"
-	isql "github.com/sujit/sqlite/internal/sql"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	catalog "github.com/oarkflow/sqlite/internal/catalog"
+	isql "github.com/oarkflow/sqlite/internal/sql"
 )
 
 // cteMaterial is a fully materialized common table expression.

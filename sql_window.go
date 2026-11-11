@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sujit/sqlite/internal/catalog"
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 )
 
 // windowCall is one window function invocation found in a select list, bound to

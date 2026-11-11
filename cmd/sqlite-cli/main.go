@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	db "github.com/sujit/sqlite"
+	db "github.com/oarkflow/sqlite"
 )
 
 type cliState struct {

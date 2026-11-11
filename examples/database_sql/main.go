@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	_ "github.com/sujit/sqlite/driver"
+	_ "github.com/oarkflow/sqlite/driver"
 )
 
 func main() {

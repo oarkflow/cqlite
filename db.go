@@ -18,14 +18,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sujit/sqlite/internal/buffer"
-	"github.com/sujit/sqlite/internal/catalog"
-	"github.com/sujit/sqlite/internal/page"
-	"github.com/sujit/sqlite/internal/pager"
-	isql "github.com/sujit/sqlite/internal/sql"
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/txn"
-	"github.com/sujit/sqlite/internal/wal"
+	"github.com/oarkflow/sqlite/internal/buffer"
+	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/page"
+	"github.com/oarkflow/sqlite/internal/pager"
+	isql "github.com/oarkflow/sqlite/internal/sql"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/txn"
+	"github.com/oarkflow/sqlite/internal/wal"
 )
 
 type DB struct {
@@ -88,7 +88,7 @@ type simpleWALRecord struct {
 // stored as a single packed file; all others are directories.
 func Open(path string, opts Options) (*DB, error) {
 	if isMemoryDatabaseName(path) || path == "" {
-		root, err := os.MkdirTemp("", "sujit-sqlite-ephemeral-*")
+		root, err := os.MkdirTemp("", "cqlite-ephemeral-*")
 		if err != nil {
 			return nil, err
 		}
@@ -273,7 +273,7 @@ func prepareDatabaseStorage(path string) (storagePath, lockPath, singleFile stri
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", "", "", false, false, err
 	}
-	storagePath, err = os.MkdirTemp("", "sujit-sqlite-db-*")
+	storagePath, err = os.MkdirTemp("", "cqlite-db-*")
 	if err != nil {
 		return "", "", "", false, false, err
 	}

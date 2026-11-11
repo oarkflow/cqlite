@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/sujit/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/catalog"
 )
 
 func TestRowCodecRoundTrip(t *testing.T) {

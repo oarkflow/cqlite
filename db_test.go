@@ -12,16 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sujit/sqlite/internal/page"
-	"github.com/sujit/sqlite/internal/pager"
-	"github.com/sujit/sqlite/internal/wal"
+	"github.com/oarkflow/sqlite/internal/page"
+	"github.com/oarkflow/sqlite/internal/pager"
+	"github.com/oarkflow/sqlite/internal/wal"
 )
 
 func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
-	if os.Getenv("SUJIT_SQLITE_LOCK_HELPER") == "1" {
-		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
-		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
-		done := os.Getenv("SUJIT_SQLITE_LOCK_DONE")
+	if os.Getenv("CQLITE_LOCK_HELPER") == "1" {
+		dir := os.Getenv("CQLITE_LOCK_DIR")
+		ready := os.Getenv("CQLITE_LOCK_READY")
+		done := os.Getenv("CQLITE_LOCK_DONE")
 		d, err := Open(dir, Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -45,10 +45,10 @@ func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
 	done := filepath.Join(dir, "done")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseFileLockAllowsCompetingReaders$", "-test.v")
 	cmd.Env = append(os.Environ(),
-		"SUJIT_SQLITE_LOCK_HELPER=1",
-		"SUJIT_SQLITE_LOCK_DIR="+dir,
-		"SUJIT_SQLITE_LOCK_READY="+ready,
-		"SUJIT_SQLITE_LOCK_DONE="+done,
+		"CQLITE_LOCK_HELPER=1",
+		"CQLITE_LOCK_DIR="+dir,
+		"CQLITE_LOCK_READY="+ready,
+		"CQLITE_LOCK_DONE="+done,
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -78,10 +78,10 @@ func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
 }
 
 func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
-	if os.Getenv("SUJIT_SQLITE_WRITE_LOCK_HELPER") == "1" {
-		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
-		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
-		done := os.Getenv("SUJIT_SQLITE_LOCK_DONE")
+	if os.Getenv("CQLITE_WRITE_LOCK_HELPER") == "1" {
+		dir := os.Getenv("CQLITE_LOCK_DIR")
+		ready := os.Getenv("CQLITE_LOCK_READY")
+		done := os.Getenv("CQLITE_LOCK_DONE")
 		d, err := Open(dir, Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -121,10 +121,10 @@ func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 	done := filepath.Join(dir, "write-done")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseWriteLockRejectsCompetingWriter$", "-test.v")
 	cmd.Env = append(os.Environ(),
-		"SUJIT_SQLITE_WRITE_LOCK_HELPER=1",
-		"SUJIT_SQLITE_LOCK_DIR="+dir,
-		"SUJIT_SQLITE_LOCK_READY="+ready,
-		"SUJIT_SQLITE_LOCK_DONE="+done,
+		"CQLITE_WRITE_LOCK_HELPER=1",
+		"CQLITE_LOCK_DIR="+dir,
+		"CQLITE_LOCK_READY="+ready,
+		"CQLITE_LOCK_DONE="+done,
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -157,10 +157,10 @@ func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 }
 
 func TestDatabaseWriteLockWaitsForCompetingProcess(t *testing.T) {
-	if os.Getenv("SUJIT_SQLITE_WAIT_LOCK_HELPER") == "1" {
-		dir := os.Getenv("SUJIT_SQLITE_LOCK_DIR")
-		ready := os.Getenv("SUJIT_SQLITE_LOCK_READY")
-		release := os.Getenv("SUJIT_SQLITE_LOCK_RELEASE")
+	if os.Getenv("CQLITE_WAIT_LOCK_HELPER") == "1" {
+		dir := os.Getenv("CQLITE_LOCK_DIR")
+		ready := os.Getenv("CQLITE_LOCK_READY")
+		release := os.Getenv("CQLITE_LOCK_RELEASE")
 		d, err := Open(dir, Options{})
 		if err != nil {
 			t.Fatal(err)
@@ -198,10 +198,10 @@ func TestDatabaseWriteLockWaitsForCompetingProcess(t *testing.T) {
 	release := filepath.Join(dir, "wait-lock-release")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseWriteLockWaitsForCompetingProcess$")
 	cmd.Env = append(os.Environ(),
-		"SUJIT_SQLITE_WAIT_LOCK_HELPER=1",
-		"SUJIT_SQLITE_LOCK_DIR="+dir,
-		"SUJIT_SQLITE_LOCK_READY="+ready,
-		"SUJIT_SQLITE_LOCK_RELEASE="+release,
+		"CQLITE_WAIT_LOCK_HELPER=1",
+		"CQLITE_LOCK_DIR="+dir,
+		"CQLITE_LOCK_READY="+ready,
+		"CQLITE_LOCK_RELEASE="+release,
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

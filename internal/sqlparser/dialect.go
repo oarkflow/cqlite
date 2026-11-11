@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 )
 
 type Dialect string

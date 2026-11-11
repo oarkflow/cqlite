@@ -1,6 +1,6 @@
 # Production Readiness Tasks
 
-This roadmap is the canonical checklist for making `github.com/sujit/sqlite` production-ready. The project must not be described as production-ready until every P0-P8 milestone is complete and the required correctness, crash, fuzz, race, parity, and benchmark gates pass.
+This roadmap is the canonical checklist for making `github.com/oarkflow/sqlite` production-ready. The project must not be described as production-ready until every P0-P8 milestone is complete and the required correctness, crash, fuzz, race, parity, and benchmark gates pass.
 
 Status legend:
 

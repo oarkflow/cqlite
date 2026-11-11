@@ -19,11 +19,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/sujit/sqlite/internal/catalog"
-	isql "github.com/sujit/sqlite/internal/sql"
-	"github.com/sujit/sqlite/internal/sqlparser"
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/sqlite/internal/catalog"
+	isql "github.com/oarkflow/sqlite/internal/sql"
+	"github.com/oarkflow/sqlite/internal/sqlparser"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 )
 
 const primaryKeyNamePlaceholder = "__primary_key__"

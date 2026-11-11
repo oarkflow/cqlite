@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/sujit/sqlite/internal/btree"
-	"github.com/sujit/sqlite/internal/catalog"
-	"github.com/sujit/sqlite/internal/pager"
+	"github.com/oarkflow/sqlite/internal/btree"
+	"github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/pager"
 )
 
 type rowVersion struct {

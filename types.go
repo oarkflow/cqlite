@@ -3,8 +3,8 @@ package db
 import (
 	"time"
 
-	isql "github.com/sujit/sqlite/internal/sql"
-	"github.com/sujit/sqlite/internal/txn"
+	isql "github.com/oarkflow/sqlite/internal/sql"
+	"github.com/oarkflow/sqlite/internal/txn"
 )
 
 type SyncPolicy string

@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	custom "github.com/sujit/sqlite/driver"
-	_ "github.com/sujit/sqlite/internal/native/sqlite3"
+	custom "github.com/oarkflow/sqlite/driver"
+	_ "github.com/oarkflow/sqlite/internal/native/sqlite3"
 )
 
 func BenchmarkSQLiteNativeComparison(b *testing.B) {

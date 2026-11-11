@@ -7,7 +7,7 @@ import (
 	"log"
 	"sync"
 
-	sqlite "github.com/sujit/sqlite"
+	sqlite "github.com/oarkflow/sqlite"
 )
 
 func main() {

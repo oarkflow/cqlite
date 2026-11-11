@@ -1,4 +1,4 @@
-EXTENSION_ID := sujit.sujit-sqlite-tools-0.1.0
+EXTENSION_ID := sujit.cqlite-tools-0.1.0
 EXTENSION_SRC := vscode-extension
 EXTENSION_DIR ?= $(HOME)/.vscode/extensions/$(EXTENSION_ID)
 BRIDGE_BIN := bin/sqlite-vscode-bridge

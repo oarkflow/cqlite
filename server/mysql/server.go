@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net"
 
-	db "github.com/sujit/sqlite"
+	db "github.com/oarkflow/sqlite"
 )
 
 type Server struct {

@@ -1,158 +1,158 @@
 {
-  "name": "sujit-sqlite-tools",
-  "displayName": "Sujit SQLite Tools",
-  "description": "Viewer, schema explorer, and query runner for github.com/sujit/sqlite databases.",
-  "version": "0.1.0",
-  "publisher": "sujit",
-  "engines": {
-    "vscode": "^1.90.0"
-  },
-  "categories": [
-    "Database",
-    "Other"
-  ],
-  "activationEvents": [
-    "onCustomEditor:sujitSqlite.databaseViewer",
-    "onView:sujitSqliteExplorer",
-    "onCommand:sujitSqlite.openDatabase",
-    "onCommand:sujitSqlite.refresh",
-    "onCommand:sujitSqlite.newQuery",
-    "onCommand:sujitSqlite.runQuery",
-    "onCommand:sujitSqlite.showTable"
-  ],
-  "main": "./src/extension.js",
-  "contributes": {
-    "configuration": {
-      "title": "Sujit SQLite",
-      "properties": {
-        "sujitSqlite.database": {
-          "type": "string",
-          "default": "",
-          "description": "Path to a github.com/sujit/sqlite database file or directory."
-        },
-        "sujitSqlite.bridgeCommand": {
-          "type": "string",
-          "default": "go",
-          "description": "Command used to launch the SQLite bridge."
-        },
-        "sujitSqlite.bridgeArgs": {
-          "type": "array",
-          "default": [
-            "run",
-            "./cmd/sqlite-vscode-bridge"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "description": "Arguments used before bridge flags. The default works from this repository workspace."
-        },
-        "sujitSqlite.resultLimit": {
-          "type": "number",
-          "default": 200,
-          "minimum": 1,
-          "description": "Maximum rows returned by viewer commands."
-        }
-      }
-    },
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "sujitSqlite",
-          "title": "Sujit SQLite",
-          "icon": "resources/database.svg"
-        }
-      ]
-    },
-    "views": {
-      "sujitSqlite": [
-        {
-          "id": "sujitSqliteExplorer",
-          "name": "Databases"
-        }
-      ]
-    },
-    "customEditors": [
-      {
-        "viewType": "sujitSqlite.databaseViewer",
-        "displayName": "Sujit SQLite Database",
-        "selector": [
-          {
-            "filenamePattern": "*.db"
-          }
-        ],
-        "priority": "default"
-      }
-    ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "sujitSqlite.openDatabase",
-          "when": "view == sujitSqliteExplorer",
-          "group": "navigation"
-        },
-        {
-          "command": "sujitSqlite.refresh",
-          "when": "view == sujitSqliteExplorer",
-          "group": "navigation"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "sujitSqlite.showTable",
-          "when": "view == sujitSqliteExplorer && viewItem == table",
-          "group": "inline"
-        },
-        {
-          "command": "sujitSqlite.showTable",
-          "when": "view == sujitSqliteExplorer && viewItem == view",
-          "group": "inline"
-        }
-      ],
-      "editor/context": [
-        {
-          "command": "sujitSqlite.runQuery",
-          "when": "editorLangId == sql || editorLangId == sujit-sql",
-          "group": "navigation"
-        }
-      ]
-    },
-    "commands": [
-      {
-        "command": "sujitSqlite.openDatabase",
-        "title": "Sujit SQLite: Open Database",
-        "icon": "$(folder-opened)"
-      },
-      {
-        "command": "sujitSqlite.refresh",
-        "title": "Sujit SQLite: Refresh",
-        "icon": "$(refresh)"
-      },
-      {
-        "command": "sujitSqlite.newQuery",
-        "title": "Sujit SQLite: New Query",
-        "icon": "$(new-file)"
-      },
-      {
-        "command": "sujitSqlite.runQuery",
-        "title": "Sujit SQLite: Run Query",
-        "icon": "$(play)"
-      },
-      {
-        "command": "sujitSqlite.showTable",
-        "title": "Show Table Data",
-        "icon": "$(table)"
-      }
-    ],
-    "languages": [
-      {
-        "id": "sujit-sql",
-        "aliases": [
-          "Sujit SQL"
-        ],
-        "extensions": [
-          ".sujit.sql"
-        ]
-      }
-    ]
-  }
+	"name": "cqlite-tools",
+	"displayName": "cQlite Tools",
+	"description": "Viewer, schema explorer, and query runner for github.com/oarkflow/sqlite databases.",
+	"version": "0.1.0",
+	"publisher": "sujit",
+	"engines": {
+		"vscode": "^1.90.0"
+	},
+	"categories": [
+		"Database",
+		"Other"
+	],
+	"activationEvents": [
+		"onCustomEditor:cQlite.databaseViewer",
+		"onView:cQliteExplorer",
+		"onCommand:cQlite.openDatabase",
+		"onCommand:cQlite.refresh",
+		"onCommand:cQlite.newQuery",
+		"onCommand:cQlite.runQuery",
+		"onCommand:cQlite.showTable"
+	],
+	"main": "./src/extension.js",
+	"contributes": {
+		"configuration": {
+			"title": "cQlite",
+			"properties": {
+				"cQlite.database": {
+					"type": "string",
+					"default": "",
+					"description": "Path to a github.com/oarkflow/sqlite database file or directory."
+				},
+				"cQlite.bridgeCommand": {
+					"type": "string",
+					"default": "go",
+					"description": "Command used to launch the SQLite bridge."
+				},
+				"cQlite.bridgeArgs": {
+					"type": "array",
+					"default": [
+						"run",
+						"./cmd/sqlite-vscode-bridge"
+					],
+					"items": {
+						"type": "string"
+					},
+					"description": "Arguments used before bridge flags. The default works from this repository workspace."
+				},
+				"cQlite.resultLimit": {
+					"type": "number",
+					"default": 200,
+					"minimum": 1,
+					"description": "Maximum rows returned by viewer commands."
+				}
+			}
+		},
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "cQlite",
+					"title": "cQlite",
+					"icon": "resources/database.svg"
+				}
+			]
+		},
+		"views": {
+			"cQlite": [
+				{
+					"id": "cQliteExplorer",
+					"name": "Databases"
+				}
+			]
+		},
+		"customEditors": [
+			{
+				"viewType": "cQlite.databaseViewer",
+				"displayName": "cQlite Database",
+				"selector": [
+					{
+						"filenamePattern": "*.db"
+					}
+				],
+				"priority": "default"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "cQlite.openDatabase",
+					"when": "view == cQliteExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "cQlite.refresh",
+					"when": "view == cQliteExplorer",
+					"group": "navigation"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "cQlite.showTable",
+					"when": "view == cQliteExplorer && viewItem == table",
+					"group": "inline"
+				},
+				{
+					"command": "cQlite.showTable",
+					"when": "view == cQliteExplorer && viewItem == view",
+					"group": "inline"
+				}
+			],
+			"editor/context": [
+				{
+					"command": "cQlite.runQuery",
+					"when": "editorLangId == sql || editorLangId == cqlite-sql",
+					"group": "navigation"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "cQlite.openDatabase",
+				"title": "cQlite: Open Database",
+				"icon": "$(folder-opened)"
+			},
+			{
+				"command": "cQlite.refresh",
+				"title": "cQlite: Refresh",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "cQlite.newQuery",
+				"title": "cQlite: New Query",
+				"icon": "$(new-file)"
+			},
+			{
+				"command": "cQlite.runQuery",
+				"title": "cQlite: Run Query",
+				"icon": "$(play)"
+			},
+			{
+				"command": "cQlite.showTable",
+				"title": "Show Table Data",
+				"icon": "$(table)"
+			}
+		],
+		"languages": [
+			{
+				"id": "cqlite-sql",
+				"aliases": [
+					"cQlite SQL"
+				],
+				"extensions": [
+					".cqlite.sql"
+				]
+			}
+		]
+	}
 }

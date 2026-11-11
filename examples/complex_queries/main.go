@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	sqlite "github.com/sujit/sqlite"
-	_ "github.com/sujit/sqlite/driver"
+	sqlite "github.com/oarkflow/sqlite"
+	_ "github.com/oarkflow/sqlite/driver"
 )
 
 type orderRow struct {

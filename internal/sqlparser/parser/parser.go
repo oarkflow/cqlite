@@ -9,8 +9,8 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
-	"github.com/sujit/sqlite/internal/sqlparser/lexer"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
+	"github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 )
 
 // ParseError records a parse failure.

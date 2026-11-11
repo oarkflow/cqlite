@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	db "github.com/sujit/sqlite"
-	customdriver "github.com/sujit/sqlite/driver"
+	db "github.com/oarkflow/sqlite"
+	customdriver "github.com/oarkflow/sqlite/driver"
 
 	_ "github.com/mattn/go-sqlite3"
 )

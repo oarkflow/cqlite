@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	catalog "github.com/sujit/sqlite/internal/catalog"
+	catalog "github.com/oarkflow/sqlite/internal/catalog"
 )
 
 func init() {

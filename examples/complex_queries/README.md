@@ -1,6 +1,6 @@
 # Complex Query Examples
 
-This directory contains runnable examples for `github.com/sujit/sqlite` plus a dialect corpus for adapter authors.
+This directory contains runnable examples for `github.com/oarkflow/sqlite` plus a dialect corpus for adapter authors.
 
 ## Run
 

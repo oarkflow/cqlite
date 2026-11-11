@@ -7,7 +7,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/sujit/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/catalog"
 )
 
 const (

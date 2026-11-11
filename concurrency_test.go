@@ -117,10 +117,10 @@ func TestConcurrentWriterSerialization(t *testing.T) {
 func TestConcurrentCrossProcessWritersNoLostUpdates(t *testing.T) {
 	const updatesPerProcess = 100
 	ctx := context.Background()
-	if os.Getenv("SUJIT_SQLITE_CROSS_PROCESS_WRITER") == "1" {
-		dir := os.Getenv("SUJIT_SQLITE_CROSS_PROCESS_DIR")
-		ready := os.Getenv("SUJIT_SQLITE_CROSS_PROCESS_READY")
-		start := os.Getenv("SUJIT_SQLITE_CROSS_PROCESS_START")
+	if os.Getenv("CQLITE_CROSS_PROCESS_WRITER") == "1" {
+		dir := os.Getenv("CQLITE_CROSS_PROCESS_DIR")
+		ready := os.Getenv("CQLITE_CROSS_PROCESS_READY")
+		start := os.Getenv("CQLITE_CROSS_PROCESS_START")
 		d, err := Open(dir, Options{SyncPolicy: SyncFull})
 		if err != nil {
 			t.Fatal(err)
@@ -170,10 +170,10 @@ func TestConcurrentCrossProcessWritersNoLostUpdates(t *testing.T) {
 	start := filepath.Join(dir, "cross-process-start")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestConcurrentCrossProcessWritersNoLostUpdates$")
 	cmd.Env = append(os.Environ(),
-		"SUJIT_SQLITE_CROSS_PROCESS_WRITER=1",
-		"SUJIT_SQLITE_CROSS_PROCESS_DIR="+dir,
-		"SUJIT_SQLITE_CROSS_PROCESS_READY="+ready,
-		"SUJIT_SQLITE_CROSS_PROCESS_START="+start,
+		"CQLITE_CROSS_PROCESS_WRITER=1",
+		"CQLITE_CROSS_PROCESS_DIR="+dir,
+		"CQLITE_CROSS_PROCESS_READY="+ready,
+		"CQLITE_CROSS_PROCESS_START="+start,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -229,7 +229,7 @@ func TestConcurrentCrossProcessWritersNoLostUpdates(t *testing.T) {
 }
 
 func TestWALCommitSurvivesAbruptProcessExit(t *testing.T) {
-	const dirEnv = "SUJIT_SQLITE_ABRUPT_EXIT_DIR"
+	const dirEnv = "CQLITE_ABRUPT_EXIT_DIR"
 	if dir := os.Getenv(dirEnv); dir != "" {
 		d, err := Open(dir, Options{SyncPolicy: SyncFull})
 		if err != nil {

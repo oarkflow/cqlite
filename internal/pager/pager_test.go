@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/sujit/sqlite/internal/page"
+	"github.com/oarkflow/sqlite/internal/page"
 )
 
 func TestPagerWriteReadAllocate(t *testing.T) {

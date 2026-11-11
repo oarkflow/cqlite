@@ -26,7 +26,7 @@ class SqliteExplorer {
       tree.iconPath = new vscode.ThemeIcon('database');
       tree.description = db || '';
       if (!db) {
-        tree.command = { command: 'sujitSqlite.openDatabase', title: 'Open Database' };
+        tree.command = { command: 'cQlite.openDatabase', title: 'Open Database' };
       }
       return tree;
     }
@@ -85,7 +85,7 @@ class DatabaseEditorProvider {
     const dbPath = document.uri.fsPath;
     webviewPanel.webview.options = { enableScripts: true };
     await setDatabase(dbPath).catch(err => {
-      console.warn(`Sujit SQLite: failed to persist database path: ${err && err.message ? err.message : err}`);
+      console.warn(`cQlite: failed to persist database path: ${err && err.message ? err.message : err}`);
     });
     await renderDatabasePanel(this.explorer, webviewPanel, dbPath);
   }
@@ -144,8 +144,8 @@ async function handleDatabaseMessage(explorer, webviewPanel, dbPath, message) {
 }
 
 async function openDatabaseObjectPanel(explorer, dbPath, objectName) {
-  const title = `Sujit SQLite: ${objectName}`;
-  const panel = vscode.window.createWebviewPanel('sujitSqlite.databaseViewerPanel', title, vscode.ViewColumn.Beside, {
+  const title = `cQlite: ${objectName}`;
+  const panel = vscode.window.createWebviewPanel('cQlite.databaseViewerPanel', title, vscode.ViewColumn.Beside, {
     enableScripts: true,
     retainContextWhenHidden: true
   });
@@ -156,19 +156,19 @@ function activate(context) {
   extensionContext = context;
   const explorer = new SqliteExplorer();
   const dbEditorProvider = new DatabaseEditorProvider(explorer);
-  vscode.window.registerTreeDataProvider('sujitSqliteExplorer', explorer);
+  vscode.window.registerTreeDataProvider('cQliteExplorer', explorer);
 
   context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider('sujitSqlite.databaseViewer', dbEditorProvider, {
+    vscode.window.registerCustomEditorProvider('cQlite.databaseViewer', dbEditorProvider, {
       supportsMultipleEditorsPerDocument: false,
       webviewOptions: { retainContextWhenHidden: true }
     }),
-    vscode.commands.registerCommand('sujitSqlite.openDatabase', async () => {
+    vscode.commands.registerCommand('cQlite.openDatabase', async () => {
       const selected = await vscode.window.showOpenDialog({
         canSelectFiles: true,
         canSelectFolders: true,
         canSelectMany: false,
-        filters: { 'Sujit SQLite database': ['db'], 'All files': ['*'] }
+        filters: { 'cQlite database': ['db'], 'All files': ['*'] }
       });
       if (!selected || selected.length === 0) {
         return;
@@ -176,10 +176,10 @@ function activate(context) {
       await setDatabase(selected[0].fsPath);
       await refreshSchema(explorer);
     }),
-    vscode.commands.registerCommand('sujitSqlite.refresh', async () => refreshSchema(explorer)),
-    vscode.commands.registerCommand('sujitSqlite.newQuery', newQuery),
-    vscode.commands.registerCommand('sujitSqlite.runQuery', runActiveQuery),
-    vscode.commands.registerCommand('sujitSqlite.showTable', async item => {
+    vscode.commands.registerCommand('cQlite.refresh', async () => refreshSchema(explorer)),
+    vscode.commands.registerCommand('cQlite.newQuery', newQuery),
+    vscode.commands.registerCommand('cQlite.runQuery', runActiveQuery),
+    vscode.commands.registerCommand('cQlite.showTable', async item => {
       const name = item && item.object ? item.object.name : await pickObject(explorer);
       if (name) {
         await showObject(name);
@@ -204,7 +204,7 @@ async function setDatabase(dbPath) {
   const target = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
     ? vscode.ConfigurationTarget.Workspace
     : vscode.ConfigurationTarget.Global;
-  await vscode.workspace.getConfiguration('sujitSqlite').update('database', dbPath, target);
+  await vscode.workspace.getConfiguration('cQlite').update('database', dbPath, target);
 }
 
 async function refreshSchema(explorer, noisy = true, dbOverride = '') {
@@ -217,12 +217,12 @@ async function refreshSchema(explorer, noisy = true, dbOverride = '') {
     const schema = await bridge(['schema'], { db });
     explorer.refresh(schema);
     if (noisy) {
-      vscode.window.setStatusBarMessage(`Sujit SQLite: loaded ${schemaObjects(schema).length} objects`, 2500);
+      vscode.window.setStatusBarMessage(`cQlite: loaded ${schemaObjects(schema).length} objects`, 2500);
     }
     return schema;
   } catch (err) {
     explorer.refresh(null);
-    vscode.window.showErrorMessage(`Sujit SQLite schema failed: ${err.message}`);
+    vscode.window.showErrorMessage(`cQlite schema failed: ${err.message}`);
     return null;
   }
 }
@@ -236,7 +236,7 @@ async function newQuery() {
 }
 
 async function openSQLEditorPanel(dbPath, initialSQL, title) {
-  const panel = vscode.window.createWebviewPanel('sujitSqliteSqlEditor', `Sujit SQLite: ${title}`, vscode.ViewColumn.Beside, {
+  const panel = vscode.window.createWebviewPanel('cQliteSqlEditor', `cQlite: ${title}`, vscode.ViewColumn.Beside, {
     enableScripts: true,
     retainContextWhenHidden: true
   });
@@ -311,7 +311,7 @@ async function runAndShow(sql, title) {
     const result = await runSQLForDatabase(db, sql);
     showResultPanel(title, result);
   } catch (err) {
-    vscode.window.showErrorMessage(`Sujit SQLite query failed: ${err.message}`);
+    vscode.window.showErrorMessage(`cQlite query failed: ${err.message}`);
   }
 }
 
@@ -327,7 +327,7 @@ async function pickObject(explorer) {
 }
 
 function showResultPanel(title, result) {
-  const panel = vscode.window.createWebviewPanel('sujitSqliteResults', `Sujit SQLite: ${title}`, vscode.ViewColumn.Beside, {});
+  const panel = vscode.window.createWebviewPanel('cQliteResults', `cQlite: ${title}`, vscode.ViewColumn.Beside, {});
   panel.webview.html = page('Results', `
     <section class="toolbar"><strong>${esc(resultSummary(result))}</strong></section>
     <pre>${esc(result.sql || '')}</pre>
@@ -1231,7 +1231,7 @@ async function ensureDatabase(prompt = true) {
   if (!prompt) {
     return '';
   }
-  await vscode.commands.executeCommand('sujitSqlite.openDatabase');
+  await vscode.commands.executeCommand('cQlite.openDatabase');
   return currentDatabase();
 }
 
@@ -1257,7 +1257,7 @@ function queryLogs(dbPath) {
     return [];
   }
   dbPath = normalizedDbPath(dbPath);
-  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  const all = extensionContext.globalState.get('cQlite.queryLogs', {});
   return Array.isArray(all[dbPath]) ? all[dbPath] : [];
 }
 
@@ -1266,7 +1266,7 @@ async function appendQueryLog(dbPath, result, source) {
     return;
   }
   dbPath = normalizedDbPath(dbPath);
-  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  const all = extensionContext.globalState.get('cQlite.queryLogs', {});
   const entry = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     database: dbPath,
@@ -1280,7 +1280,7 @@ async function appendQueryLog(dbPath, result, source) {
     rowsAffected: result.rowsAffected || 0
   };
   all[dbPath] = [...queryLogs(dbPath), entry];
-  await extensionContext.globalState.update('sujitSqlite.queryLogs', all);
+  await extensionContext.globalState.update('cQlite.queryLogs', all);
 }
 
 async function clearQueryLogs(dbPath) {
@@ -1288,9 +1288,9 @@ async function clearQueryLogs(dbPath) {
     return;
   }
   dbPath = normalizedDbPath(dbPath);
-  const all = extensionContext.globalState.get('sujitSqlite.queryLogs', {});
+  const all = extensionContext.globalState.get('cQlite.queryLogs', {});
   all[dbPath] = [];
-  await extensionContext.globalState.update('sujitSqlite.queryLogs', all);
+  await extensionContext.globalState.update('cQlite.queryLogs', all);
 }
 
 function normalizedDbPath(dbPath) {
@@ -1298,7 +1298,7 @@ function normalizedDbPath(dbPath) {
 }
 
 function config() {
-  return vscode.workspace.getConfiguration('sujitSqlite');
+  return vscode.workspace.getConfiguration('cQlite');
 }
 
 function bridge(args, options) {

@@ -3,7 +3,7 @@
 // and improve cache locality.
 package ast
 
-import "github.com/sujit/sqlite/internal/sqlparser/lexer"
+import "github.com/oarkflow/sqlite/internal/sqlparser/lexer"
 
 // Node is implemented by every AST node.
 type Node interface {

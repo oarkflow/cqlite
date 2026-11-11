@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	"github.com/sujit/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/catalog"
 )
 
 func TestPositionArenaAllocationsAreDisjointAndZeroed(t *testing.T) {

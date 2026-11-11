@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	catalog "github.com/sujit/sqlite/internal/catalog"
-	"github.com/sujit/sqlite/internal/sqlparser"
-	"github.com/sujit/sqlite/internal/sqlparser/ast"
+	catalog "github.com/oarkflow/sqlite/internal/catalog"
+	"github.com/oarkflow/sqlite/internal/sqlparser"
+	"github.com/oarkflow/sqlite/internal/sqlparser/ast"
 )
 
 // triggerSignal is a control-flow outcome raised by RAISE() inside a trigger.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	sqlparser "github.com/sujit/sqlite/internal/sqlparser"
+	sqlparser "github.com/oarkflow/sqlite/internal/sqlparser"
 )
 
 func TestParseDocumentLosslessRoundTrip(t *testing.T) {
