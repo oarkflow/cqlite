@@ -187,7 +187,7 @@ func embeddedExample(ctx context.Context, path string) error {
 }
 
 func databaseSQLExample(ctx context.Context, path string) error {
-	db, err := sql.Open("sujitsqlite", path)
+	db, err := sql.Open("cqlite", path)
 	if err != nil {
 		return err
 	}

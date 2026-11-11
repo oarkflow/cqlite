@@ -14,7 +14,7 @@ import (
 	db "github.com/sujit/sqlite"
 )
 
-const Name = "sujitsqlite"
+const Name = "cqlite"
 
 func init() {
 	sql.Register(Name, &Driver{})

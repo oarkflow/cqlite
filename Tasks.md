@@ -264,7 +264,7 @@ After moving simple-select projector construction to an 8-column stack buffer wi
 - [x] Preserve `Exec(ctx, sql, args...)`.
 - [x] Preserve `Query(ctx, sql, args...)`.
 - [x] Preserve `Begin(ctx, TxOptions)`.
-- [x] Preserve driver name `sujitsqlite`.
+- [x] Register the custom `database/sql` driver as `cqlite`.
 - [x] Add richer `Rows`/column metadata for `database/sql` compatibility.
 - [x] Add explicit crash-test lock bypass through `Options.DisableFileLock`.
 - [x] Add optional diagnostic planner output only if needed for observability or planner tests.
