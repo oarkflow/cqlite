@@ -169,6 +169,75 @@ func TestStructuredAndJSONNumberBindingsKeepStorageClassAfterReopen(t *testing.T
 	assert(d)
 }
 
+func TestJSONColumnsParseValidateAndPersistDocuments(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	d, err := Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `CREATE TABLE json_values (id INTEGER PRIMARY KEY, document JSON)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO json_values VALUES (:id, :document)`, Named("id", 1), Named("document", map[string]any{"answer": 42})); err != nil {
+		t.Fatalf("insert structured JSON: %v", err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO json_values VALUES (:id, :document)`, Named("id", 2), Named("document", `{"items":[true,null]}`)); err != nil {
+		t.Fatalf("insert JSON text: %v", err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO json_values VALUES (:id, :document)`, Named("id", 3), Named("document", `{"broken":}`)); err == nil {
+		t.Fatal("expected malformed JSON document to be rejected")
+	}
+	info, err := d.Query(ctx, `PRAGMA table_info(json_values)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := info.Next(); !ok || row[1] != "id" {
+		t.Fatalf("first table_info row = %#v, ok=%v", row, ok)
+	}
+	if row, ok := info.Next(); !ok || row[2] != "JSON" {
+		t.Fatalf("JSON declared type = %#v, ok=%v; want JSON", row, ok)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err = Open(dir, Options{SyncPolicy: SyncOff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	rows, err := d.Query(ctx, `SELECT json_extract(document, '$.answer'), json_valid(document) FROM json_values WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(42) || row[1] != int64(1) {
+		t.Fatalf("reopened JSON values = %#v, ok=%v; want 42 and valid", row, ok)
+	}
+	if _, err := d.Exec(ctx, `UPDATE json_values SET document = json_set(document, '$.answer', 43) WHERE json_extract(document, '$.answer') = 42`); err != nil {
+		t.Fatalf("update JSON value: %v", err)
+	}
+	rows, err = d.Query(ctx, `SELECT json_extract(document, '$.answer') FROM json_values WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(43) {
+		t.Fatalf("updated JSON query = %#v, ok=%v; want 43", row, ok)
+	}
+	if _, err := d.Exec(ctx, `DELETE FROM json_values WHERE json_extract(document, '$.answer') = 43`); err != nil {
+		t.Fatalf("delete by JSON value: %v", err)
+	}
+	rows, err = d.Query(ctx, `SELECT id FROM json_values ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row, ok := rows.Next(); !ok || row[0] != int64(2) {
+		t.Fatalf("remaining rows after JSON delete = %#v, ok=%v; want id 2", row, ok)
+	}
+	if _, ok := rows.Next(); ok {
+		t.Fatal("JSON delete left an unexpected row")
+	}
+}
+
 func TestEmptyBlobRemainsDistinctFromNullAcrossHandlesAndRecovery(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

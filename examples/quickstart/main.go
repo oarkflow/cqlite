@@ -29,19 +29,23 @@ func main() {
 	if _, err := db.Exec(ctx, `CREATE TABLE users (
 		id INTEGER PRIMARY KEY,
 		name TEXT NOT NULL,
-		email TEXT UNIQUE
+		email TEXT UNIQUE,
+		profile JSON
 	)`); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO users(name, email) VALUES (?, ?)`, "Ada", "ada@example.test"); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO users(name, email, profile) VALUES (?, ?, ?)`, "Ada", "ada@example.test", `{"role":"admin","active":true}`); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO users(name, email) VALUES (:name, :email)`,
-		cqlite.Named("name", "Grace"), cqlite.Named("email", "grace@example.test")); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO users(name, email, profile) VALUES (:name, :email, :profile)`,
+		cqlite.Named("name", "Grace"), cqlite.Named("email", "grace@example.test"), cqlite.Named("profile", map[string]any{"role": "editor", "active": true})); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE users SET profile = json_set(profile, '$.role', 'writer') WHERE json_extract(profile, '$.role') = 'editor'`); err != nil {
 		log.Fatal(err)
 	}
 
-	rows, err := db.Query(ctx, `SELECT id, name, email FROM users WHERE name <> :skip ORDER BY id`, cqlite.Named("skip", "Nobody"))
+	rows, err := db.Query(ctx, `SELECT id, name, email, json_extract(profile, '$.role') FROM users WHERE name <> :skip ORDER BY id`, cqlite.Named("skip", "Nobody"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -50,7 +54,10 @@ func main() {
 		if !ok {
 			break
 		}
-		fmt.Printf("id=%v name=%v email=%v\n", row[0], row[1], row[2])
+		fmt.Printf("id=%v name=%v email=%v role=%v\n", row[0], row[1], row[2], row[3])
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM users WHERE json_extract(profile, '$.role') = 'writer'`); err != nil {
+		log.Fatal(err)
 	}
 	if err := db.Checkpoint(ctx); err != nil {
 		log.Fatal(err)

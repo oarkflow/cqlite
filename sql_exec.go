@@ -5732,6 +5732,24 @@ func coerce(col catalog.Column, v any, strict bool) (any, error) {
 		}
 		return nil, nil
 	}
+	if col.Type == catalog.JSON {
+		// JSON columns keep documents as UTF-8 text, but unlike ordinary TEXT
+		// columns they reject malformed documents. Structured Go bind values
+		// have already been JSON-marshaled by normalizeSQLiteBindValue.
+		var document string
+		switch value := v.(type) {
+		case string:
+			document = value
+		case []byte:
+			document = string(value)
+		default:
+			return nil, fmt.Errorf("cannot store %T in JSON column %s", v, col.Name)
+		}
+		if !json.Valid([]byte(document)) {
+			return nil, fmt.Errorf("invalid JSON for column %s", col.Name)
+		}
+		return document, nil
+	}
 	if !strict {
 		return applyAffinity(col, v), nil
 	}
@@ -5754,6 +5772,8 @@ func coerce(col catalog.Column, v any, strict bool) (any, error) {
 			return s, nil
 		}
 		return fmt.Sprint(v), nil
+	case catalog.JSON:
+		return v, nil // handled above; retained for exhaustive type handling
 	case catalog.Blob:
 		if x, ok := v.([]byte); ok {
 			return x, nil
@@ -5784,7 +5804,7 @@ func applyAffinity(col catalog.Column, v any) any {
 		if f, ok := asFloat(v); ok {
 			return f
 		}
-	case catalog.Text:
+	case catalog.Text, catalog.JSON:
 		switch x := v.(type) {
 		case string:
 			return v

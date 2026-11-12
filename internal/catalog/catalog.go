@@ -20,7 +20,10 @@ const (
 	BigInt    Type = Integer
 	Boolean   Type = Numeric
 	Timestamp Type = Numeric
-	JSON      Type = Text
+	// JSON is a distinct declared type with TEXT storage affinity. Keeping it
+	// distinct lets writes validate JSON documents and schema introspection
+	// preserve the declared type.
+	JSON Type = "JSON"
 )
 
 type Column struct {
@@ -173,7 +176,9 @@ func ParseType(s string) (Type, error) {
 		return Any, nil
 	case strings.Contains(decl, "INT"):
 		return Integer, nil
-	case strings.Contains(decl, "CHAR"), strings.Contains(decl, "CLOB"), strings.Contains(decl, "TEXT"), strings.Contains(decl, "JSON"):
+	case decl == "JSON" || strings.HasPrefix(decl, "JSON("):
+		return JSON, nil
+	case strings.Contains(decl, "CHAR"), strings.Contains(decl, "CLOB"), strings.Contains(decl, "TEXT"):
 		return Text, nil
 	case strings.Contains(decl, "BLOB"):
 		return Blob, nil
