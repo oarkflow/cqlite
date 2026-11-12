@@ -682,7 +682,7 @@ func validateInsertFast(s *persistedState, t *catalog.Table, data *tableData, va
 		if !idx.Unique {
 			continue
 		}
-		if len(idx.Columns) == 0 {
+		if idx.Partial || len(idx.Columns) == 0 {
 			return validateRow(s, t, data, values, 0)
 		}
 		if data.indexes == nil {
@@ -2113,9 +2113,10 @@ func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) 
 		}
 		cols = append(cols, name)
 	}
-	idx := catalog.Index{Name: idxName, Columns: cols, Unique: st.Type == ast.UniqueConstraint, SQL: strings.TrimSpace(rawSQL)}
+	where := partialIndexWhereClause(rawSQL)
+	idx := catalog.Index{Name: idxName, Columns: cols, Unique: st.Type == ast.UniqueConstraint, SQL: strings.TrimSpace(rawSQL), Where: where, Partial: where != ""}
 	if idx.Unique {
-		if err := validateUniqueIndexExisting(t, s.Tables[t.Name], idx); err != nil {
+		if err := validateUniqueIndexExisting(s, t, s.Tables[t.Name], idx); err != nil {
 			return Result{}, err
 		}
 	}
@@ -2126,6 +2127,56 @@ func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) 
 	t.SchemaVers++
 	s.Pragmas.SchemaVer++
 	return Result{}, nil
+}
+
+func partialIndexWhereClause(query string) string {
+	onAt := indexFold(query, " on ")
+	if onAt < 0 {
+		return ""
+	}
+	afterOn := query[onAt+len(" on "):]
+	openRel := strings.IndexByte(afterOn, '(')
+	if openRel < 0 {
+		return ""
+	}
+	depth := 0
+	var quote byte
+	closeAt := -1
+	for i := openRel; i < len(afterOn); i++ {
+		c := afterOn[i]
+		if quote != 0 {
+			if c == quote {
+				if i+1 < len(afterOn) && afterOn[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+		case '[':
+			quote = ']'
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				closeAt = i
+				i = len(afterOn)
+			}
+		}
+	}
+	if closeAt < 0 {
+		return ""
+	}
+	tail := strings.TrimSpace(afterOn[closeAt+1:])
+	if len(tail) >= len("where ") && strings.EqualFold(tail[:len("where ")], "where ") {
+		return strings.TrimSpace(tail[len("where "):])
+	}
+	return ""
 }
 
 func execManualCreateIndex(s *persistedState, query string) (Result, bool, error) {
@@ -2181,7 +2232,7 @@ func execManualCreateIndex(s *persistedState, query string) (Result, bool, error
 		idx.Columns = []string{catalog.Normalize(expr)}
 	}
 	if idx.Unique && len(idx.Columns) > 0 {
-		if err := validateUniqueIndexExisting(t, s.Tables[t.Name], idx); err != nil {
+		if err := validateUniqueIndexExisting(s, t, s.Tables[t.Name], idx); err != nil {
 			return Result{}, true, err
 		}
 	}
@@ -2206,7 +2257,22 @@ func catalogIndexByName(s *persistedState, name string) (catalog.Index, bool) {
 	return catalog.Index{}, false
 }
 
-func validateUniqueIndexExisting(t *catalog.Table, data *tableData, idx catalog.Index) error {
+func partialIndexIncludesRow(s *persistedState, idx catalog.Index, values map[string]any) (bool, error) {
+	if !idx.Partial || strings.TrimSpace(idx.Where) == "" {
+		return true, nil
+	}
+	stmt, err := parseStatementCached("SELECT 1 WHERE " + idx.Where)
+	if err != nil {
+		return false, fmt.Errorf("parse partial index predicate %s: %w", idx.Name, err)
+	}
+	selectStmt, ok := stmt.(*ast.SelectStmt)
+	if !ok {
+		return false, fmt.Errorf("invalid partial index predicate: %s", idx.Name)
+	}
+	return matchWhereState(s, selectStmt.Where, values, &binder{})
+}
+
+func validateUniqueIndexExisting(s *persistedState, t *catalog.Table, data *tableData, idx catalog.Index) error {
 	if t == nil || data == nil || !idx.Unique || len(idx.Columns) == 0 {
 		return nil
 	}
@@ -2215,9 +2281,23 @@ func validateUniqueIndexExisting(t *catalog.Table, data *tableData, idx catalog.
 		if left.Deleted != 0 {
 			continue
 		}
+		leftIncluded, err := partialIndexIncludesRow(s, idx, left.Values)
+		if err != nil {
+			return err
+		}
+		if !leftIncluded {
+			continue
+		}
 		for j := i + 1; j < len(data.Rows); j++ {
 			right := data.Rows[j]
 			if right.Deleted != 0 {
+				continue
+			}
+			rightIncluded, err := partialIndexIncludesRow(s, idx, right.Values)
+			if err != nil {
+				return err
+			}
+			if !rightIncluded {
 				continue
 			}
 			same := true
@@ -2925,6 +3005,13 @@ func applyUpsert(s *persistedState, t *catalog.Table, data *tableData, incoming 
 				if !idx.Unique || len(idx.Columns) == 0 {
 					continue
 				}
+				newIncluded, err := partialIndexIncludesRow(s, idx, incoming)
+				if err != nil {
+					return err
+				}
+				if !newIncluded {
+					continue
+				}
 				same := true
 				for _, name := range idx.Columns {
 					if incoming[name] == nil || !valuesEqual(row.Values[name], incoming[name], columnCollation(t, name)) {
@@ -3465,7 +3552,7 @@ func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows
 		if st.Distinct {
 			out = distinctRowsKeepFirst(len(cols), out)
 		}
-		out, err = applyLimit(out, st.Limit, args)
+		out, err = applyLimit(out, st.Limit, args, st)
 		if err != nil {
 			return nil, err
 		}
@@ -3511,7 +3598,7 @@ func execSelectGeneric(s *persistedState, st *ast.SelectStmt, args []any) (*Rows
 	if st.Distinct {
 		out = distinctRowsKeepFirst(len(cols), out)
 	}
-	out, err = applyLimit(out, st.Limit, args)
+	out, err = applyLimit(out, st.Limit, args, st)
 	if err != nil {
 		return nil, err
 	}
@@ -3653,7 +3740,8 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 	if len(st.OrderBy) > 0 {
 		return nil, false, nil
 	}
-	predicate, ok, err := fastPredicate(t, st.Where, args)
+	whereBind := &binder{args: args}
+	predicate, ok, err := fastPredicate(t, st.Where, whereBind)
 	if err != nil {
 		return nil, true, err
 	}
@@ -3690,7 +3778,7 @@ func fastSingleTableSelect(s *persistedState, st *ast.SelectStmt, args []any) (*
 			}
 		}
 	}
-	out, err = applyFlatLimit(out, width, st.Limit, args)
+	out, err = applyFlatLimit(out, width, st.Limit, args, st)
 	if err != nil {
 		return nil, true, err
 	}
@@ -4172,7 +4260,7 @@ func fastProjectors(t *catalog.Table, cols []ast.SelectColumn) ([]string, []func
 	return names, projectors, true
 }
 
-func fastPredicate(t *catalog.Table, expr ast.Expr, args []any) (func(rowVersion) bool, bool, error) {
+func fastPredicate(t *catalog.Table, expr ast.Expr, bind *binder) (func(rowVersion) bool, bool, error) {
 	if expr == nil {
 		return func(rowVersion) bool { return true }, true, nil
 	}
@@ -4182,11 +4270,11 @@ func fastPredicate(t *catalog.Table, expr ast.Expr, args []any) (func(rowVersion
 	}
 	switch be.Op {
 	case lexer.AND, lexer.OR:
-		left, ok, err := fastPredicate(t, be.Left, args)
+		left, ok, err := fastPredicate(t, be.Left, bind)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
-		right, ok, err := fastPredicate(t, be.Right, args)
+		right, ok, err := fastPredicate(t, be.Right, bind)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
@@ -4215,7 +4303,7 @@ func fastPredicate(t *catalog.Table, expr ast.Expr, args []any) (func(rowVersion
 			colIdx = idx
 		}
 	}
-	val, err := evalExpr(valueExpr, nil, &binder{args: args})
+	val, err := evalExpr(valueExpr, nil, bind)
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported expression") {
 			return nil, false, nil
@@ -4582,6 +4670,27 @@ func queryPragma(s *persistedState, query string) (*Rows, bool, error) {
 		return nil, ok, nil
 	}
 	switch name {
+	case "integrity_check", "quick_check":
+		check := "ok"
+		for _, table := range s.Catalog.Tables {
+			data := s.Tables[table.Name]
+			if data == nil {
+				continue
+			}
+			for _, row := range data.Rows {
+				if row.Deleted != 0 {
+					continue
+				}
+				if err := validateRow(s, table, data, row.Values, row.RowID); err != nil {
+					check = err.Error()
+					break
+				}
+			}
+			if check != "ok" {
+				break
+			}
+		}
+		return isql.NewRows([]string{name}, [][]any{{check}}), true, nil
 	case "foreign_keys":
 		if s.Pragmas.ForeignKeys {
 			return isql.NewRows([]string{"foreign_keys"}, [][]any{{int64(1)}}), true, nil
@@ -5203,7 +5312,10 @@ func usableAccessForColumn(s *persistedState, table, col string) (string, bool) 
 		return "PRIMARY", true
 	}
 	for _, idx := range t.Indexes {
-		if len(idx.Columns) > 0 && idx.Columns[0] == col {
+		// Single-column lookups build a single-value index key. A composite
+		// index has a tuple key, so using it for only its first column can
+		// incorrectly return no rows. Fall back to a scan in that case.
+		if len(idx.Columns) == 1 && idx.Columns[0] == col {
 			return idx.Name, false
 		}
 	}
@@ -5419,8 +5531,22 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 		if !idx.Unique {
 			continue
 		}
+		newIncluded, err := partialIndexIncludesRow(s, idx, values)
+		if err != nil {
+			return err
+		}
+		if !newIncluded {
+			continue
+		}
 		for _, row := range data.Rows {
 			if row.Deleted != 0 || row.RowID == self {
+				continue
+			}
+			oldIncluded, err := partialIndexIncludesRow(s, idx, row.Values)
+			if err != nil {
+				return err
+			}
+			if !oldIncluded {
 				continue
 			}
 			same := true
@@ -5433,6 +5559,13 @@ func validateRow(s *persistedState, t *catalog.Table, data *tableData, values ma
 		}
 		for _, row := range data.Pending {
 			if row.Deleted != 0 || row.RowID == self {
+				continue
+			}
+			oldIncluded, err := partialIndexIncludesRow(s, idx, row.Values)
+			if err != nil {
+				return err
+			}
+			if !oldIncluded {
 				continue
 			}
 			same := true
@@ -5718,7 +5851,9 @@ func coerce(col catalog.Column, v any, strict bool) (any, error) {
 	// These values are already canonical SQLite storage values. Keep common
 	// integer and text binds out of the reflection and conversion path.
 	switch v.(type) {
-	case int64, string:
+	case int64:
+	case string:
+		v = strings.Clone(v.(string))
 	default:
 		var err error
 		v, err = normalizeSQLiteBindValue(v)
@@ -7349,21 +7484,78 @@ func rowFromOutput(cols []string, values []any) map[string]any {
 	return row
 }
 
-func applyLimit(rows [][]any, lim *ast.LimitClause, args []any) ([][]any, error) {
+func countPositionalParamsBefore(root any, position int32) int {
+	paramType := reflect.TypeOf((*ast.Param)(nil))
+	seen := make(map[uintptr]bool)
+	count := 0
+	var walk func(reflect.Value)
+	walk = func(value reflect.Value) {
+		if !value.IsValid() {
+			return
+		}
+		if value.Kind() == reflect.Interface {
+			if !value.IsNil() {
+				walk(value.Elem())
+			}
+			return
+		}
+		if value.Kind() == reflect.Pointer {
+			if value.IsNil() {
+				return
+			}
+			if value.Type() == paramType {
+				param := value.Interface().(*ast.Param)
+				if param.Pos() < position && parameterName(param.Raw) == "" {
+					count++
+				}
+				return
+			}
+			ptr := value.Pointer()
+			if seen[ptr] {
+				return
+			}
+			seen[ptr] = true
+			walk(value.Elem())
+			return
+		}
+		switch value.Kind() {
+		case reflect.Struct:
+			for i := 0; i < value.NumField(); i++ {
+				walk(value.Field(i))
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < value.Len(); i++ {
+				walk(value.Index(i))
+			}
+		}
+	}
+	walk(reflect.ValueOf(root))
+	return count
+}
+
+func applyLimit(rows [][]any, lim *ast.LimitClause, args []any, statement ...any) ([][]any, error) {
 	if lim == nil {
 		return rows, nil
 	}
 	count := int64(len(rows))
 	offset := int64(0)
 	if lim.Count != nil {
-		v, err := evalExpr(lim.Count, nil, &binder{args: args})
+		start := 0
+		if len(statement) > 0 {
+			start = countPositionalParamsBefore(statement[0], lim.Count.Pos())
+		}
+		v, err := evalExpr(lim.Count, nil, &binder{args: args, pos: start})
 		if err != nil {
 			return nil, err
 		}
 		count, _ = asInt(v)
 	}
 	if lim.Offset != nil {
-		v, err := evalExpr(lim.Offset, nil, &binder{args: args})
+		start := 0
+		if len(statement) > 0 {
+			start = countPositionalParamsBefore(statement[0], lim.Offset.Pos())
+		}
+		v, err := evalExpr(lim.Offset, nil, &binder{args: args, pos: start})
 		if err != nil {
 			return nil, err
 		}
@@ -7385,7 +7577,7 @@ func applyLimit(rows [][]any, lim *ast.LimitClause, args []any) ([][]any, error)
 	return rows[int(offset):int(end)], nil
 }
 
-func applyFlatLimit(rows []any, width int, lim *ast.LimitClause, args []any) ([]any, error) {
+func applyFlatLimit(rows []any, width int, lim *ast.LimitClause, args []any, statement ...any) ([]any, error) {
 	if lim == nil || width <= 0 {
 		return rows, nil
 	}

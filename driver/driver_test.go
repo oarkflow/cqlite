@@ -2,10 +2,14 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"unsafe"
 
 	db "github.com/oarkflow/cqlite"
 )
@@ -32,6 +36,165 @@ func TestDatabaseSQLDriver(t *testing.T) {
 	}
 	if name != "Ada" {
 		t.Fatalf("name = %q", name)
+	}
+}
+
+func TestDatabaseSQLCompositePrimaryKeyPrefixWithOrderBy(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, `CREATE TABLE tenant_policies (
+		tenant_id TEXT NOT NULL, rev INTEGER NOT NULL, body TEXT NOT NULL,
+		PRIMARY KEY (tenant_id, rev)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		tenant string
+		rev    int
+		body   string
+	}{
+		{"t1", 1, "first"}, {"t1", 2, "latest"}, {"t2", 1, "other"},
+	} {
+		if _, err := database.ExecContext(ctx, `INSERT INTO tenant_policies VALUES (?, ?, ?)`, row.tenant, row.rev, row.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var body string
+	var rev int
+	if err := database.QueryRowContext(ctx, `SELECT body, rev FROM tenant_policies WHERE tenant_id = ? ORDER BY rev DESC LIMIT 1`, "t1").Scan(&body, &rev); err != nil {
+		t.Fatal(err)
+	}
+	if body != "latest" || rev != 2 {
+		t.Fatalf("got (%q, %d), want (%q, 2)", body, rev, "latest")
+	}
+}
+
+func TestDatabaseSQLAndPredicateBindsInOrder(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, `CREATE TABLE scoped_rows (id TEXT PRIMARY KEY, subject_id TEXT NOT NULL, value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO scoped_rows VALUES (?, ?, ?)`, "row-1", "subject-1", "found"); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err := database.QueryRowContext(ctx, `SELECT value FROM scoped_rows WHERE id = ? AND subject_id = ?`, "row-1", "subject-1").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "found" {
+		t.Fatalf("value = %q, want found", value)
+	}
+}
+
+func TestDatabaseSQLWhereAndLimitParametersKeepOrder(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, `CREATE TABLE due_rows (id TEXT PRIMARY KEY, status TEXT, due_at TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO due_rows VALUES (?, ?, ?)`, "d1", "pending", "2026-11-12T21:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := database.QueryRowContext(ctx, `SELECT id FROM due_rows WHERE status = 'pending' AND due_at <= ? ORDER BY due_at LIMIT ?`, "2026-11-13T00:00:00Z", 1).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if id != "d1" {
+		t.Fatalf("id = %q, want d1", id)
+	}
+}
+
+func TestDatabaseSQLPartialUniqueIndex(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	if _, err := database.ExecContext(ctx, `CREATE TABLE accounts (tenant_id TEXT NOT NULL, phone_bidx TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `CREATE UNIQUE INDEX accounts_phone ON accounts (tenant_id, phone_bidx) WHERE phone_bidx <> ''`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := database.ExecContext(ctx, `INSERT INTO accounts VALUES (?, ?)`, "t1", ""); err != nil {
+			t.Fatalf("insert empty phone %d: %v", i, err)
+		}
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO accounts VALUES (?, ?)`, "t1", "phone-hash"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO accounts VALUES (?, ?)`, "t1", "phone-hash"); err == nil {
+		t.Fatal("duplicate indexed phone was accepted")
+	}
+}
+
+func TestDatabaseSQLVacuumInto(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source.db")
+	destination := filepath.Join(dir, "snapshot.db")
+	database, err := sql.Open(Name, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE snapshot_rows (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO snapshot_rows VALUES (1, 'kept')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`VACUUM INTO ?`, destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := sql.Open(Name, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	var value string
+	if err := snapshot.QueryRow(`SELECT value FROM snapshot_rows WHERE id=1`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "kept" {
+		t.Fatalf("snapshot value = %q, want kept", value)
+	}
+	if _, err := database.Exec(`VACUUM INTO ?`, destination); err == nil {
+		t.Fatal("VACUUM INTO overwrote an existing destination")
+	}
+}
+
+func TestDatabaseSQLIntegrityCheck(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE integrity_rows (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	var result string
+	if err := database.QueryRow(`PRAGMA integrity_check`).Scan(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result != "ok" {
+		t.Fatalf("integrity_check = %q, want ok", result)
 	}
 }
 
@@ -294,5 +457,74 @@ func TestDatabaseSQLTextMarshalerBinding(t *testing.T) {
 	}
 	if value != "typed:uuid" || storageClass != "text" {
 		t.Fatalf("value=%q storageClass=%q; want typed text", value, storageClass)
+	}
+}
+
+func TestDatabaseSQLCopiesBoundTextValues(t *testing.T) {
+	database, err := sql.Open(Name, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE text_values (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	buffer := []byte("case-id")
+	aliased := unsafe.String(&buffer[0], len(buffer))
+	if _, err := database.Exec(`INSERT INTO text_values VALUES (?)`, aliased); err != nil {
+		t.Fatal(err)
+	}
+	copy(buffer, []byte("mutated"))
+	var got string
+	if err := database.QueryRow(`SELECT value FROM text_values`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "case-id" {
+		t.Fatalf("stored value = %q, want case-id", got)
+	}
+}
+
+func TestDatabaseSQLPackedFileStableAcrossReadOnlyOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stable.db")
+	database, err := sql.Open(Name, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`CREATE TABLE stable_rows (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO stable_rows VALUES (1, 'kept')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(original)
+	for i := 0; i < 3; i++ {
+		database, err := sql.Open(Name, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var value string
+		if err := database.QueryRow(`SELECT value FROM stable_rows WHERE id=1`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "kept" {
+			t.Fatalf("value = %q, want kept", value)
+		}
+		if err := database.Close(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum := sha256.Sum256(got); sum != want {
+			t.Fatalf("archive changed after read-only open %d", i+1)
+		}
 	}
 }

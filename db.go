@@ -379,6 +379,8 @@ func packDatabaseFile(src, path string) error {
 			return err
 		}
 		header.Name = filepath.ToSlash(rel)
+		// Packed database archives should hash identically across read-only opens.
+		header.Modified = time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC)
 		header.Method = zip.Deflate
 		writer, err := zw.CreateHeader(header)
 		if err != nil {
@@ -488,6 +490,12 @@ func (d *DB) acquireWriteGate(ctx context.Context) error {
 func (d *DB) releaseWriteGate() { d.writeGate <- struct{}{} }
 
 func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error) {
+	if path, matched, err := parseVacuumInto(query, args); matched {
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{}, d.vacuumInto(ctx, path)
+	}
 	if res, ok, err := d.execAttachStatement(ctx, query, args...); ok || err != nil {
 		return res, err
 	}
@@ -502,6 +510,83 @@ func (d *DB) Exec(ctx context.Context, query string, args ...any) (Result, error
 		return ad.db.execLocal(ctx, query, args...)
 	}
 	return d.execLocal(ctx, query, args...)
+}
+
+func parseVacuumInto(query string, args []any) (string, bool, error) {
+	q := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
+	if len(q) < len("VACUUM INTO") || !strings.EqualFold(q[:len("VACUUM INTO")], "VACUUM INTO") {
+		return "", false, nil
+	}
+	rest := strings.TrimSpace(q[len("VACUUM INTO"):])
+	if rest == "?" {
+		if len(args) == 0 {
+			return "", true, errors.New("VACUUM INTO requires a destination")
+		}
+		path, ok := args[0].(string)
+		if !ok || strings.TrimSpace(path) == "" {
+			return "", true, errors.New("VACUUM INTO destination must be a non-empty string")
+		}
+		return path, true, nil
+	}
+	if len(rest) < 2 || (rest[0] != '\'' && rest[0] != '"') || rest[len(rest)-1] != rest[0] {
+		return "", true, errors.New("invalid VACUUM INTO destination")
+	}
+	quote := rest[0]
+	path := strings.ReplaceAll(rest[1:len(rest)-1], string([]byte{quote, quote}), string(quote))
+	if strings.TrimSpace(path) == "" {
+		return "", true, errors.New("VACUUM INTO destination must be a non-empty string")
+	}
+	return path, true, nil
+}
+
+func (d *DB) vacuumInto(ctx context.Context, destination string) error {
+	if err := d.acquireWriteGate(ctx); err != nil {
+		return err
+	}
+	defer d.releaseWriteGate()
+	if err := d.checkOpen(); err != nil {
+		return err
+	}
+	if err := d.acquireWriteLock(ctx); err != nil {
+		return err
+	}
+	defer releaseDatabaseWriteLock(d.lock)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.refreshWALLocked(); err != nil {
+		return err
+	}
+	destination, err := filepath.Abs(destination)
+	if err != nil {
+		return err
+	}
+	if d.singleFile != "" {
+		source, sourceErr := filepath.Abs(d.singleFile)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		if source == destination {
+			return errors.New("VACUUM INTO destination must differ from source database")
+		}
+	}
+	if _, err := os.Stat(destination); err == nil {
+		return errors.New("VACUUM INTO destination already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for name, table := range d.state.Tables {
+		if schema := d.state.Catalog.Tables[name]; schema != nil {
+			if err := table.materializeLazy(schema); err != nil {
+				return err
+			}
+		}
+	}
+	d.state.materializePending()
+	if err := d.writeCheckpointPages(d.state, d.applied); err != nil {
+		return err
+	}
+	d.checkpointed = d.applied
+	return packDatabaseFile(d.path, destination)
 }
 
 // execLocal runs a statement against this database without schema routing. It
@@ -1966,6 +2051,7 @@ func (d *DB) snapshotForRead() persistedState {
 
 // queryLocal runs a query against this database without schema routing.
 func (d *DB) queryLocal(ctx context.Context, query string, args ...any) (*Rows, error) {
+
 	if rows, ok, err := d.queryDatabaseList(query); ok {
 		return rows, err
 	}
