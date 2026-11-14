@@ -648,7 +648,7 @@ func benchCustomReopenRecovery(b *testing.B) {
 }
 
 func benchMattnReopenRecovery(b *testing.B) {
-	path := filepath.Join(b.TempDir(), "sqlite.db")
+	path := filepath.Join(b.TempDir(), "sqlite.cq")
 	d, err := sql.Open("sqlite3", path)
 	if err != nil {
 		b.Fatal(err)
@@ -1150,7 +1150,7 @@ func openBenchMattn(b *testing.B) *sql.DB {
 
 func openBenchMattnWithPragmas(b *testing.B, pragmas ...string) *sql.DB {
 	b.Helper()
-	path := filepath.Join(b.TempDir(), "sqlite.db")
+	path := filepath.Join(b.TempDir(), "sqlite.cq")
 	d, err := sql.Open("sqlite3", path)
 	if err != nil {
 		b.Fatal(err)

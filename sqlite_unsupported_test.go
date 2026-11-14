@@ -187,7 +187,7 @@ func TestSQLiteAttachAndMemoryNames(t *testing.T) {
 	}
 
 	// ATTACH of an in-memory database must not create a directory either.
-	d, err := Open(filepath.Join(t.TempDir(), "main.db"), Options{})
+	d, err := Open(filepath.Join(t.TempDir(), "main.cq"), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

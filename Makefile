@@ -21,9 +21,10 @@ build-bridge:
 	@mkdir -p bin
 	GOCACHE="$(GOCACHE)" go build -o $(BRIDGE_BIN) ./cmd/cqlite-vscode-bridge
 
-install-extension:
-	@mkdir -p "$(EXTENSION_DIR)"
+install-extension: build-bridge
+	@mkdir -p "$(EXTENSION_DIR)/bin"
 	@cp -R "$(EXTENSION_SRC)/." "$(EXTENSION_DIR)/"
+	@cp "$(BRIDGE_BIN)" "$(EXTENSION_DIR)/bin/cqlite-vscode-bridge"
 	@echo "Installed $(EXTENSION_ID) to $(EXTENSION_DIR)"
 
 reload-vscode:

@@ -12,7 +12,7 @@ import (
 )
 
 func TestPagerWriteReadAllocate(t *testing.T) {
-	path := t.TempDir() + "/pages.db"
+	path := t.TempDir() + "/pages.cq"
 	p, err := Open(path, page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +68,7 @@ func TestPagerWriteReadAllocate(t *testing.T) {
 }
 
 func TestPagerRejectsPageIDMismatch(t *testing.T) {
-	path := t.TempDir() + "/pages.db"
+	path := t.TempDir() + "/pages.cq"
 	p, err := Open(path, page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestPagerRejectsPageIDMismatch(t *testing.T) {
 }
 
 func TestPagerRecordsRoundTrip(t *testing.T) {
-	p, err := Open(t.TempDir()+"/records.db", page.DefaultSize)
+	p, err := Open(t.TempDir()+"/records.cq", page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestPagerRecordsRoundTrip(t *testing.T) {
 }
 
 func TestPagerRecordsRoundTripBinaryPayload(t *testing.T) {
-	p, err := Open(t.TempDir()+"/records.db", page.DefaultSize)
+	p, err := Open(t.TempDir()+"/records.cq", page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestPagerRecordsRoundTripBinaryPayload(t *testing.T) {
 }
 
 func TestConcurrentWriteRecordsDoesNotInterleaveBatches(t *testing.T) {
-	p, err := Open(t.TempDir()+"/records.db", page.DefaultSize)
+	p, err := Open(t.TempDir()+"/records.cq", page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestConcurrentWriteRecordsDoesNotInterleaveBatches(t *testing.T) {
 }
 
 func TestPagerRecordsOverflowRoundTrip(t *testing.T) {
-	p, err := Open(t.TempDir()+"/records.db", 128)
+	p, err := Open(t.TempDir()+"/records.cq", 128)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestPagerReadsLegacyJSONRecords(t *testing.T) {
 }
 
 func TestPagerBlobRoundTrip(t *testing.T) {
-	p, err := Open(t.TempDir()+"/blob.db", 128)
+	p, err := Open(t.TempDir()+"/blob.cq", 128)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestPagerBlobRoundTrip(t *testing.T) {
 }
 
 func TestPagerRejectsCorruptBlobHeader(t *testing.T) {
-	path := t.TempDir() + "/blob.db"
+	path := t.TempDir() + "/blob.cq"
 	p, err := Open(path, 128)
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +284,7 @@ func TestPagerRejectsCorruptBlobHeader(t *testing.T) {
 }
 
 func TestPagerRejectsCorruptRecordSize(t *testing.T) {
-	path := t.TempDir() + "/records.db"
+	path := t.TempDir() + "/records.cq"
 	p, err := Open(path, page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func TestPagerRejectsCorruptRecordSize(t *testing.T) {
 }
 
 func TestPagerRejectsOversizedRecordPayload(t *testing.T) {
-	path := t.TempDir() + "/records.db"
+	path := t.TempDir() + "/records.cq"
 	p, err := Open(path, page.DefaultSize)
 	if err != nil {
 		t.Fatal(err)
@@ -336,7 +336,7 @@ func TestPagerRejectsOversizedRecordPayload(t *testing.T) {
 }
 
 func TestPagerRejectsCorruptRecordOverflowPage(t *testing.T) {
-	path := t.TempDir() + "/records.db"
+	path := t.TempDir() + "/records.cq"
 	p, err := Open(path, 128)
 	if err != nil {
 		t.Fatal(err)

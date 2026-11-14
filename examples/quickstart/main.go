@@ -20,7 +20,7 @@ func main() {
 	}
 	// defer os.RemoveAll(dir)
 
-	db, err := cqlite.Open(filepath.Join(dir, "app.db"), cqlite.Options{})
+	db, err := cqlite.Open(filepath.Join(dir, "app.cq"), cqlite.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -103,6 +104,10 @@ func main() {
 	}
 
 	ctx := context.Background()
+	if isPlainSQLiteFile(dbPath) {
+		write(response{OK: false, Database: dbPath, Error: "not a cQlite database: this is an ordinary SQLite file. cQlite opens only its own packed .cq format"})
+		os.Exit(1)
+	}
 	database, err := cqlite.Open(dbPath, cqlite.Options{})
 	if err != nil {
 		write(response{OK: false, Error: err.Error(), Database: dbPath})
@@ -159,6 +164,21 @@ func main() {
 		os.Exit(1)
 	}
 	write(res)
+}
+
+// isPlainSQLiteFile reports whether path is a regular SQLite 3 file, which the cQlite
+// engine cannot read; checking the header lets us fail with a clear message.
+func isPlainSQLiteFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 16)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return false
+	}
+	return string(head) == "SQLite format 3\x00"
 }
 
 func schema(ctx context.Context, database *cqlite.DB, dbPath string) (response, error) {

@@ -69,7 +69,7 @@ func runCustomMixedErr(t *testing.T, setup, statements []string) [][][]string {
 
 func runSQLiteMixedErr(t *testing.T, setup, statements []string) [][][]string {
 	t.Helper()
-	dbPath := t.TempDir() + "/sqlite.db"
+	dbPath := t.TempDir() + "/sqlite.cq"
 	runSQLiteScript(t, dbPath, setup)
 	var out [][][]string
 	for _, stmt := range statements {

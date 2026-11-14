@@ -916,7 +916,7 @@ func TestCreateTableIfNotExistsPreservesRows(t *testing.T) {
 
 func TestSingleFileDatabasePersists(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "single.db")
+	path := filepath.Join(t.TempDir(), "single.cq")
 	d, err := Open(path, Options{})
 	if err != nil {
 		t.Fatal(err)

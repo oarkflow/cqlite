@@ -13,7 +13,7 @@ import (
 
 func main() {
 	ctx := context.Background()
-	file, err := os.CreateTemp("", "cqlite-driver-*.db")
+	file, err := os.CreateTemp("", "cqlite-driver-*.cq")
 	if err != nil {
 		log.Fatal(err)
 	}

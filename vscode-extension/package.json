@@ -35,6 +35,11 @@
 					"default": "go",
 					"description": "Command used to launch the cQlite bridge."
 				},
+				"cQlite.bridgePath": {
+					"type": "string",
+					"default": "",
+					"description": "Optional absolute path to a prebuilt cqlite-vscode-bridge binary. Takes precedence over every other bridge setting."
+				},
 				"cQlite.bridgeArgs": {
 					"type": "array",
 					"default": [
@@ -77,7 +82,7 @@
 				"displayName": "cQlite Database",
 				"selector": [
 					{
-						"filenamePattern": "*.db"
+						"filenamePattern": "*.cq"
 					}
 				],
 				"priority": "default"

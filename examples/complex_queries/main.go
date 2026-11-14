@@ -28,8 +28,8 @@ func main() {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		log.Fatal(err)
 	}
-	embeddedPath := filepath.Join(dir, "complex_embedded.db")
-	driverPath := filepath.Join(dir, "complex_driver.db")
+	embeddedPath := filepath.Join(dir, "complex_embedded.cq")
+	driverPath := filepath.Join(dir, "complex_driver.cq")
 	fmt.Println("embedded database:", embeddedPath)
 	fmt.Println("database/sql database:", driverPath)
 

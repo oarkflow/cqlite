@@ -19,7 +19,7 @@ func BenchmarkSQLiteNativeComparison(b *testing.B) {
 		{"native", "sqlite3-native-benchmark"},
 	} {
 		b.Run(engine.name+"/point_lookup", func(b *testing.B) {
-			path := filepath.Join(b.TempDir(), "bench.db")
+			path := filepath.Join(b.TempDir(), "bench.cq")
 			db, err := sql.Open(engine.driver, path)
 			if err != nil {
 				b.Fatal(err)

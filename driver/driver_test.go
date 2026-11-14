@@ -145,8 +145,8 @@ func TestDatabaseSQLPartialUniqueIndex(t *testing.T) {
 
 func TestDatabaseSQLVacuumInto(t *testing.T) {
 	dir := t.TempDir()
-	source := filepath.Join(dir, "source.db")
-	destination := filepath.Join(dir, "snapshot.db")
+	source := filepath.Join(dir, "source.cq")
+	destination := filepath.Join(dir, "snapshot.cq")
 	database, err := sql.Open(Name, source)
 	if err != nil {
 		t.Fatal(err)
@@ -485,7 +485,7 @@ func TestDatabaseSQLCopiesBoundTextValues(t *testing.T) {
 }
 
 func TestDatabaseSQLPackedFileStableAcrossReadOnlyOpens(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "stable.db")
+	path := filepath.Join(t.TempDir(), "stable.cq")
 	database, err := sql.Open(Name, path)
 	if err != nil {
 		t.Fatal(err)

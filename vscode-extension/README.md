@@ -4,7 +4,7 @@ VS Code extension for `github.com/oarkflow/cqlite` databases.
 
 ## Features
 
-- Open a cQlite database file such as `complex_embedded.db`.
+- Open a cQlite database file such as `complex_embedded.cq`.
 - Browse tables, views, columns, primary keys, nullability, and indexes.
 - Run the selected SQL or the whole active editor.
 - Preview the selected table/view immediately from the database editor toolbar.
@@ -29,13 +29,13 @@ make test-extension
 3. Keep the default settings:
    - `cQlite.bridgeCommand`: `go`
    - `cQlite.bridgeArgs`: `["run", "./cmd/cqlite-vscode-bridge"]`
-4. Run `cQlite: Open Database` and choose a `.db` file, for example:
-   - `examples/complex_queries/data/complex_embedded.db`
-   - `examples/complex_queries/data/complex_driver.db`
+4. Run `cQlite: Open Database` and choose a `.cq` file, for example:
+   - `examples/complex_queries/data/complex_embedded.cq`
+   - `examples/complex_queries/data/complex_driver.cq`
 
-The bridge runs from the workspace root and uses the Go engine directly, so it supports this project’s packed single-file `.db` format.
+The bridge runs from the workspace root and uses the Go engine directly, so it supports this project’s packed single-file `.cq` format.
 
-Opening a `*.db` file in VS Code automatically uses the cQlite custom editor, sets it as the active database, loads schema into the explorer, and shows a toolbar-driven table/view preview.
+Opening a `*.cq` file in VS Code automatically uses the cQlite custom editor, sets it as the active database, loads schema into the explorer, and shows a toolbar-driven table/view preview.
 
 ## Commands
 

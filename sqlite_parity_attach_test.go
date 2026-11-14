@@ -108,7 +108,7 @@ func assertAttachParity(t *testing.T, setup, statements []string) {
 	t.Helper()
 	mk := func() (string, string) {
 		dir := t.TempDir()
-		return filepath.Join(dir, "main.db"), filepath.Join(dir, "other.db")
+		return filepath.Join(dir, "main.cq"), filepath.Join(dir, "other.cq")
 	}
 	m1, o1 := mk()
 	custom := runCustomAttach(t, m1, o1, setup, statements)
@@ -173,8 +173,8 @@ func TestSQLiteParityAttachDetachError(t *testing.T) {
 func TestSQLiteAttachIsFileBacked(t *testing.T) {
 	requireSQLite3(t)
 	dir := t.TempDir()
-	mainFile := filepath.Join(dir, "main.db")
-	otherFile := filepath.Join(dir, "other.db")
+	mainFile := filepath.Join(dir, "main.cq")
+	otherFile := filepath.Join(dir, "other.cq")
 	ctx := context.Background()
 	d, err := Open(mainFile, Options{})
 	if err != nil {
@@ -214,12 +214,12 @@ func TestSQLiteAttachIsFileBacked(t *testing.T) {
 func TestCrossDatabaseSelectReadsQualifiedTablesFromEachFile(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	d, err := Open(filepath.Join(dir, "main.db"), Options{})
+	d, err := Open(filepath.Join(dir, "main.cq"), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	if _, err := d.Exec(ctx, fmt.Sprintf(`ATTACH DATABASE '%s' AS other`, filepath.Join(dir, "other.db"))); err != nil {
+	if _, err := d.Exec(ctx, fmt.Sprintf(`ATTACH DATABASE '%s' AS other`, filepath.Join(dir, "other.cq"))); err != nil {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{
@@ -253,12 +253,12 @@ func TestCrossDatabaseSelectReadsQualifiedTablesFromEachFile(t *testing.T) {
 func TestCrossDatabaseSelectConcurrentWithAttachedWrites(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	d, err := Open(filepath.Join(dir, "main.db"), Options{SyncPolicy: SyncOff})
+	d, err := Open(filepath.Join(dir, "main.cq"), Options{SyncPolicy: SyncOff})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	if _, err := d.Exec(ctx, fmt.Sprintf(`ATTACH DATABASE '%s' AS other`, filepath.Join(dir, "other.db"))); err != nil {
+	if _, err := d.Exec(ctx, fmt.Sprintf(`ATTACH DATABASE '%s' AS other`, filepath.Join(dir, "other.cq"))); err != nil {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{

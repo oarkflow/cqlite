@@ -40,7 +40,7 @@ persistent application schema and stores its demo files in
 The embedded API accepts a context and variadic bind arguments:
 
 ```go
-db, err := cqlite.Open("app.db", cqlite.Options{})
+db, err := cqlite.Open("app.cq", cqlite.Options{})
 if err != nil { return err }
 defer db.Close()
 

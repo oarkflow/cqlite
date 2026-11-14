@@ -58,7 +58,7 @@ func TestSQLiteParityUsesTypeAffinity(t *testing.T) {
 		t.Fatalf("custom affinity result = %#v ok=%v", row, ok)
 	}
 
-	sqliteDB := t.TempDir() + "/sqlite.db"
+	sqliteDB := t.TempDir() + "/sqlite.cq"
 	runSQLiteScript(t, sqliteDB, []string{
 		`CREATE TABLE strict_docs (id INT PRIMARY KEY)`,
 		`INSERT INTO strict_docs (id) VALUES ('123')`,
@@ -918,7 +918,7 @@ func runCustomDB(t *testing.T, setup, queries []string) [][][]string {
 
 func runSQLite(t *testing.T, setup, queries []string) [][][]string {
 	t.Helper()
-	dbPath := t.TempDir() + "/sqlite.db"
+	dbPath := t.TempDir() + "/sqlite.cq"
 	runSQLiteScript(t, dbPath, setup)
 	var out [][][]string
 	for _, query := range queries {

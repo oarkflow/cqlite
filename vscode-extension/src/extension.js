@@ -1305,7 +1305,12 @@ function bridge(args, options) {
   const cfg = config();
   const db = options.db;
   const cwd = workspaceRoot();
-  const bridgeCommand = resolveBridgeCommand(cfg, cwd);
+  let bridgeCommand;
+  try {
+    bridgeCommand = resolveBridgeCommand(cfg, cwd);
+  } catch (err) {
+    return Promise.reject(err);
+  }
   const command = bridgeCommand.command;
   const prefixArgs = bridgeCommand.prefixArgs;
   const commandArgs = [];
@@ -1340,13 +1345,34 @@ function bridge(args, options) {
 }
 
 function resolveBridgeCommand(cfg, cwd) {
+  const exe = process.platform === 'win32' ? 'cqlite-vscode-bridge.exe' : 'cqlite-vscode-bridge';
+  // 1. Explicit path to a prebuilt bridge binary.
+  const explicit = cfg.get('bridgePath', '');
+  if (explicit && fs.existsSync(explicit)) {
+    return { command: explicit, prefixArgs: [] };
+  }
   const defaultArgs = ['run', './cmd/cqlite-vscode-bridge'];
   const configuredCommand = cfg.get('bridgeCommand', 'go');
   const configuredArgs = cfg.get('bridgeArgs', defaultArgs);
   if (configuredCommand === 'go' && sameStringList(configuredArgs, defaultArgs)) {
-    const binary = path.join(cwd, 'bin', process.platform === 'win32' ? 'cqlite-vscode-bridge.exe' : 'cqlite-vscode-bridge');
-    if (fs.existsSync(binary)) {
-      return { command: binary, prefixArgs: [] };
+    // 2. Binary bundled with the installed extension (make install-extension), so
+    //    it works from any workspace, not only this repository.
+    if (extensionContext && extensionContext.extensionPath) {
+      const bundled = path.join(extensionContext.extensionPath, 'bin', exe);
+      if (fs.existsSync(bundled)) {
+        return { command: bundled, prefixArgs: [] };
+      }
+    }
+    // 3. Binary or source in the open workspace (the cqlite repository itself).
+    const local = path.join(cwd, 'bin', exe);
+    if (fs.existsSync(local)) {
+      return { command: local, prefixArgs: [] };
+    }
+    if (!fs.existsSync(path.join(cwd, 'cmd', 'cqlite-vscode-bridge'))) {
+      throw new Error(
+        `cQlite bridge not found. The open workspace (${cwd}) is not the cqlite repository and no bundled bridge is installed. ` +
+        'Run "make install-extension" in the cqlite repository, or set cQlite.bridgePath.'
+      );
     }
   }
   return { command: configuredCommand, prefixArgs: configuredArgs };

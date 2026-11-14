@@ -1,6 +1,6 @@
 {
-	"cQlite.database": "/Users/sujit/Sites/sqlite/data/app.db",
+	"cQlite.database": "/Users/sujit/Sites/sqlite/data/app.cq",
 	"workbench.editorAssociations": {
-		"*.db": "cQlite.databaseViewer"
+		"*.cq": "cQlite.databaseViewer"
 	}
 }

@@ -9,7 +9,7 @@ go run ./examples/complex_queries
 ```
 
 The example persists single-file databases under `examples/complex_queries/data/`.
-Each run refreshes only the demo seed rows, so the `.db` files remain on disk and reruns stay deterministic.
+Each run refreshes only the demo seed rows, so the `.cq` files remain on disk and reruns stay deterministic.
 
 ## Files
 

@@ -84,7 +84,7 @@ type simpleWALRecord struct {
 //     directory that Close removes.
 //   - "" is a private temporary database with the same lifetime.
 //
-// Any other path is a regular persistent database. Paths ending in ".db" are
+// Any other path is a regular persistent database. Paths ending in ".cq" are
 // stored as a single packed file; all others are directories.
 func Open(path string, opts Options) (*DB, error) {
 	if isMemoryDatabaseName(path) || path == "" {
@@ -92,7 +92,7 @@ func Open(path string, opts Options) (*DB, error) {
 		if err != nil {
 			return nil, err
 		}
-		db, err := openWithPath(filepath.Join(root, "mem.db"), opts)
+		db, err := openWithPath(filepath.Join(root, "mem.cq"), opts)
 		if err != nil {
 			_ = os.RemoveAll(root)
 			return nil, err
@@ -290,7 +290,7 @@ func prepareDatabaseStorage(path string) (storagePath, lockPath, singleFile stri
 }
 
 func isSingleFileDatabasePath(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".db")
+	return strings.EqualFold(filepath.Ext(path), ".cq")
 }
 
 func unpackDatabaseFile(path, dest string) error {
