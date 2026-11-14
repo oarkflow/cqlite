@@ -77,6 +77,52 @@ func TestDatabaseFileLockAllowsCompetingReaders(t *testing.T) {
 	_ = competing.Close()
 }
 
+func TestQueryRejectsTrailingSyntaxAfterLimit(t *testing.T) {
+	d, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	ctx := context.Background()
+	if _, err := d.Exec(ctx, `CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO orders (total) VALUES (10)`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = d.Query(ctx, `SELECT * FROM "orders" LIMIT 200 order by total desc;`)
+	if err == nil {
+		t.Fatal("expected malformed SQL to return a syntax error")
+	}
+	_, err = d.Query(ctx, `EXPLAIN QUERY PLAN SELECT * FROM "orders" LIMIT 200 order by total desc;`)
+	if err == nil {
+		t.Fatal("expected malformed EXPLAIN SQL to return a syntax error")
+	}
+
+	for _, sql := range []string{
+		`INSERT INTO orders (id, total) VALUES (5, 10) trailing_token`,
+		`UPDATE orders SET total = 5 WHERE id = 1 trailing_token`,
+		`DELETE FROM orders WHERE id = 1 trailing_token`,
+	} {
+		if _, err := d.Exec(ctx, sql); err == nil {
+			t.Errorf("expected malformed write to fail: %s", sql)
+		}
+	}
+	rows, err := d.Query(ctx, `SELECT id, total FROM orders ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok := rows.Next()
+	if !ok || len(row) != 2 || row[0] != int64(1) || row[1] != int64(10) {
+		t.Fatalf("malformed writes changed the database: row=%#v ok=%v", row, ok)
+	}
+	if _, ok := rows.Next(); ok {
+		t.Fatal("malformed insert added a row")
+	}
+}
+
 func TestDatabaseWriteLockRejectsCompetingWriter(t *testing.T) {
 	if os.Getenv("CQLITE_WRITE_LOCK_HELPER") == "1" {
 		dir := os.Getenv("CQLITE_LOCK_DIR")

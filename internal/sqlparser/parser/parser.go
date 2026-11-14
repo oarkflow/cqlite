@@ -157,6 +157,19 @@ func (p *Parser) ParseOne() (ast.Statement, error) {
 	return stmt, nil
 }
 
+// ParseSingle parses exactly one statement and rejects any trailing tokens or
+// additional statements. ParseOne remains available for streaming callers.
+func (p *Parser) ParseSingle() (ast.Statement, error) {
+	stmt, err := p.ParseOne()
+	if err != nil || stmt == nil {
+		return stmt, err
+	}
+	if p.tok.Type != lexer.EOF {
+		return nil, p.errorf("unexpected token %q after statement", p.tok.Raw)
+	}
+	return stmt, nil
+}
+
 // ParseAll parses all statements separated by semicolons.
 func (p *Parser) ParseAll() ([]ast.Statement, error) {
 	var stmts []ast.Statement
@@ -193,7 +206,7 @@ func ParseStatement(src string) (ast.Statement, error) {
 	p.tok = p.nextToken()
 	p.hasPeek = false
 	p.arena.reset()
-	stmt, err := p.ParseOne()
+	stmt, err := p.ParseSingle()
 	parserPool.Put(p)
 	return stmt, err
 }
@@ -2227,7 +2240,21 @@ func (p *Parser) parseCreateTable(orReplace, temporary, unlogged bool) (*ast.Cre
 	}
 
 	// Table options (ENGINE=..., CHARSET=..., etc.)
-	for p.is(lexer.IDENT) || p.is(lexer.ENGINE) || p.is(lexer.COMMENT_KW) {
+	for p.is(lexer.IDENT) || p.is(lexer.ENGINE) || p.is(lexer.COMMENT_KW) || p.is(lexer.DEFAULT) {
+		if p.is(lexer.DEFAULT) {
+			p.advance()
+			if !p.is(lexer.IDENT) || !strings.EqualFold(string(p.tok.Raw), "charset") {
+				return nil, p.errorf("expected CHARSET after DEFAULT")
+			}
+			p.advance()
+			p.tryEat(lexer.EQ)
+			if p.tok.Type == lexer.EOF {
+				return nil, p.errorf("expected charset value")
+			}
+			val := p.advance().Raw
+			stmt.Options = arenaAppend(&p.arena, stmt.Options, ast.TableOption{Key: []byte("DEFAULT CHARSET"), Value: val})
+			continue
+		}
 		key := p.advance().Raw
 		p.tryEat(lexer.EQ)
 		val := p.advance().Raw
@@ -2669,6 +2696,15 @@ func (p *Parser) parseCreateIndex() (*ast.CreateIndexStmt, error) {
 	}
 	p.tryEatKeyword(lexer.INDEX)
 	stmt := arenaNode(&p.arena, ast.CreateIndexStmt{Type: typ, TokPos: pos})
+	if p.tryEatKeyword(lexer.IF) {
+		if err := p.eatKeyword(lexer.NOT); err != nil {
+			return nil, err
+		}
+		if err := p.eatKeyword(lexer.EXISTS); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
 	name, err := p.parseIdent()
 	if err != nil {
 		return nil, err

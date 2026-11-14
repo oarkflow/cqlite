@@ -79,7 +79,7 @@ func withQueryStatement[T any](query string, run func(ast.Statement) (T, error))
 	p := queryParserPool.Get().(*sqlparser.Parser)
 	p.ResetString(normalizeInsertOrReplace(query))
 	defer queryParserPool.Put(p)
-	stmt, err := p.Next()
+	stmt, err := p.Single()
 	if err != nil {
 		var zero T
 		return zero, err
@@ -906,7 +906,11 @@ func execSimpleSelectPlan(s *persistedState, query string, args []any) (*Rows, b
 			return nil, true, err
 		}
 		if row.Deleted != 0 || !simpleSelectMatches(t, plan, row, args) {
-			return isql.NewFlatRows(cols, nil), true, nil
+			// The page point-read can miss a row that is present in the fully
+			// materialized view (for example after a committed update). Fall back
+			// to the regular executor on misses so projected SELECTs remain
+			// consistent with SELECT * and table browsing.
+			return nil, false, nil
 		}
 		out := make([]any, 0, width)
 		out = appendSimpleSelectProjection(out, row, projectors, plan.cols)
@@ -1635,9 +1639,20 @@ func queryRows(ctx context.Context, s *persistedState, query string, args ...any
 	if rows, ok, err := queryPragma(s, query); ok || err != nil {
 		return rows, err
 	}
+	// Validate the complete statement before considering text-based fast paths.
+	// Those paths intentionally recognize only a subset of SELECT syntax and
+	// can otherwise accept a valid prefix while silently ignoring trailing
+	// tokens (for example, ORDER BY after LIMIT).
+	if _, err := sqlparser.ParseStatement(query); err != nil {
+		// EXPLAIN QUERY PLAN is a SQLite-specific form supported by the
+		// query-plan fast path but not yet represented by the SQL AST.
+		if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "EXPLAIN QUERY PLAN") {
+			return nil, err
+		}
+	}
 	if !s.compositeRead {
-		if rows, ok := queryPlan(s, query); ok {
-			return rows, nil
+		if rows, ok, err := queryPlan(s, query); ok {
+			return rows, err
 		}
 		if rows, ok, err := execSimpleSelectPlan(s, query, args); ok || err != nil {
 			return rows, err
@@ -2103,6 +2118,9 @@ func execCreateIndex(s *persistedState, st *ast.CreateIndexStmt, rawSQL string) 
 	}
 	idxName := catalog.Normalize(st.Name.Unquoted)
 	if _, ok := catalogIndexByName(s, idxName); ok {
+		if st.IfNotExists {
+			return Result{}, nil
+		}
 		return Result{}, fmt.Errorf("index already exists: %s", st.Name.Unquoted)
 	}
 	cols := make([]string, 0, len(st.Columns))
@@ -2803,6 +2821,21 @@ func execInsert(s *persistedState, st *ast.InsertStmt, args []any) (Result, erro
 		}
 		return true, rowid, nil
 	}
+	if st.DefaultValues {
+		row := make(map[string]any, len(t.Columns))
+		for _, col := range t.Columns {
+			row[col.Name] = col.Default
+		}
+		ok, rowid, err := insert(row)
+		if err != nil {
+			return Result{}, err
+		}
+		if ok {
+			affected = 1
+			last = rowid
+		}
+		return Result{RowsAffected: affected, LastInsertID: last}, nil
+	}
 	if st.Select != nil {
 		rows, err := execSelect(s, st.Select, args)
 		if err != nil {
@@ -3140,7 +3173,7 @@ func execUpdate(s *persistedState, st *ast.UpdateStmt, args []any) (Result, erro
 		}
 		row.ensureValues(t)
 		whereBind := binder{args: args, pos: setParamCount}
-		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
+		ok, err := matchWhereState(s, st.Where, rowValuesWithRowID(t, row), &whereBind)
 		if err != nil {
 			return Result{}, err
 		}
@@ -3234,7 +3267,7 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 	if insteadOf {
 		return execViewInsteadOfDelete(s, st, name, args)
 	}
-	_, data, err := tableForWrite(s, name)
+	t, data, err := tableForWrite(s, name)
 	if err != nil {
 		if insteadOf {
 			if view, ok := s.Catalog.View(name); ok {
@@ -3258,7 +3291,7 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 		}
 		row.ensureValues(s.Catalog.Tables[catalog.Normalize(name)])
 		whereBind := bind
-		ok, err := matchWhereState(s, st.Where, row.Values, &whereBind)
+		ok, err := matchWhereState(s, st.Where, rowValuesWithRowID(t, row), &whereBind)
 		if err != nil {
 			return Result{}, err
 		}
@@ -3294,6 +3327,20 @@ func execDelete(s *persistedState, st *ast.DeleteStmt, args []any) (Result, erro
 		data.rebuildRuntime(s.Catalog.Tables[catalog.Normalize(name)])
 	}
 	return Result{RowsAffected: affected}, nil
+}
+
+func rowValuesWithRowID(table *catalog.Table, row *rowVersion) map[string]any {
+	values := cloneValues(row.Values)
+	for _, name := range []string{"rowid", "_rowid_", "oid"} {
+		if _, exists := values[name]; !exists {
+			values[name] = row.RowID
+		}
+		qualified := table.Name + "." + name
+		if _, exists := values[qualified]; !exists {
+			values[qualified] = row.RowID
+		}
+	}
+	return values
 }
 
 func mutationCandidatePositions(s *persistedState, table string, data *tableData, where ast.Expr, args []any, argOffset int) []int {
@@ -4481,21 +4528,21 @@ func hasAggregateSelect(cols []ast.SelectColumn) bool {
 	return false
 }
 
-func queryPlan(s *persistedState, query string) (*Rows, bool) {
+func queryPlan(s *persistedState, query string) (*Rows, bool, error) {
 	q := strings.TrimSpace(strings.TrimSuffix(query, ";"))
 	if !strings.HasPrefix(strings.ToLower(q), "explain query plan ") {
-		return nil, false
+		return nil, false, nil
 	}
 	parseMu.Lock()
 	defer parseMu.Unlock()
 	inner := strings.TrimSpace(q[len("explain query plan "):])
 	stmt, err := parseStatementCached(inner)
 	if err != nil {
-		return isql.NewRows([]string{"id", "parent", "notused", "detail"}, [][]any{{int64(0), int64(0), int64(0), "PARSE ERROR"}}), true
+		return nil, true, err
 	}
 	sel, ok := stmt.(*ast.SelectStmt)
 	if !ok {
-		return isql.NewRows([]string{"id", "parent", "notused", "detail"}, [][]any{{int64(0), int64(0), int64(0), "EXECUTE " + fmt.Sprintf("%T", stmt)}}), true
+		return isql.NewRows([]string{"id", "parent", "notused", "detail"}, [][]any{{int64(0), int64(0), int64(0), "EXECUTE " + fmt.Sprintf("%T", stmt)}}), true, nil
 	}
 	var rows [][]any
 	var walk func(ast.TableRef)
@@ -4529,7 +4576,7 @@ func queryPlan(s *persistedState, query string) (*Rows, bool) {
 	if len(sel.GroupBy) > 0 {
 		rows = append(rows, []any{int64(len(rows)), int64(0), int64(0), "USE TEMP B-TREE FOR GROUP BY"})
 	}
-	return isql.NewRows([]string{"id", "parent", "notused", "detail"}, rows), true
+	return isql.NewRows([]string{"id", "parent", "notused", "detail"}, rows), true, nil
 }
 
 func coveringIndexForSelect(s *persistedState, table, index string, cols []ast.SelectColumn) bool {
@@ -6663,6 +6710,11 @@ func callScalarFunc(name string, args []any) (any, error) {
 
 func callScalarFuncRaw(name string, args []any) (any, error) {
 	switch name {
+	case "now":
+		if len(args) != 0 {
+			return nil, errors.New("now expects 0 arguments")
+		}
+		return time.Now().UTC().Format("2006-01-02 15:04:05"), nil
 	case "lower":
 		if len(args) != 1 {
 			return nil, errors.New("lower expects 1 argument")

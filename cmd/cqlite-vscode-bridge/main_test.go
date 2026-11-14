@@ -111,6 +111,27 @@ func TestRunBatchReturnsSeparateResults(t *testing.T) {
 	}
 }
 
+func TestRunSQLReturnsSyntaxErrorForTrailingClause(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "bridge.cq")
+	database, err := cqlite.Open(dbPath, cqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(ctx, `CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(ctx, `INSERT INTO orders (total) VALUES (10)`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = runSQL(ctx, database, dbPath, `SELECT * FROM "orders" LIMIT 200 order by total desc;`, 200)
+	if err == nil {
+		t.Fatal("expected runSQL to propagate the syntax error")
+	}
+}
+
 func TestBrowseRowsAppliesLimitOffsetAndSort(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "bridge.cq")

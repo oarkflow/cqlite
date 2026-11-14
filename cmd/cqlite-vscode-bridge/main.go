@@ -22,6 +22,7 @@ type response struct {
 	Results      []response  `json:"results,omitempty"`
 	Columns      []string    `json:"columns,omitempty"`
 	Rows         [][]any     `json:"rows,omitempty"`
+	RowIDs       []any       `json:"rowids,omitempty"`
 	RowsAffected int64       `json:"rowsAffected,omitempty"`
 	LastInsertID int64       `json:"lastInsertId,omitempty"`
 	SQL          string      `json:"sql,omitempty"`
@@ -413,24 +414,58 @@ func browseRows(ctx context.Context, database *cqlite.DB, dbPath, table, payload
 	if limit <= 0 {
 		limit = 200
 	}
-	var q strings.Builder
-	q.WriteString("SELECT * FROM ")
-	q.WriteString(quoteIdent(table))
-	if strings.TrimSpace(req.Where) != "" {
-		q.WriteString(" WHERE ")
-		q.WriteString(req.Where)
+	columns, _ := tableColumns(ctx, database, table)
+	columnNames := make(map[string]bool, len(columns))
+	for _, column := range columns {
+		columnNames[strings.ToLower(column.Name)] = true
 	}
-	if strings.TrimSpace(req.Sort) != "" {
-		q.WriteString(" ORDER BY ")
-		q.WriteString(req.Sort)
+	rowIDName := ""
+	for _, candidate := range []string{"rowid", "_rowid_", "oid"} {
+		if !columnNames[candidate] {
+			rowIDName = candidate
+			break
+		}
 	}
-	q.WriteString(" LIMIT ")
-	q.WriteString(fmt.Sprint(limit))
-	if req.Offset > 0 {
-		q.WriteString(" OFFSET ")
-		q.WriteString(fmt.Sprint(req.Offset))
+	buildQuery := func(projection string) string {
+		var q strings.Builder
+		q.WriteString("SELECT ")
+		q.WriteString(projection)
+		q.WriteString(" FROM ")
+		q.WriteString(quoteIdent(table))
+		if strings.TrimSpace(req.Where) != "" {
+			q.WriteString(" WHERE ")
+			q.WriteString(req.Where)
+		}
+		if strings.TrimSpace(req.Sort) != "" {
+			q.WriteString(" ORDER BY ")
+			q.WriteString(req.Sort)
+		}
+		q.WriteString(" LIMIT ")
+		q.WriteString(fmt.Sprint(limit))
+		if req.Offset > 0 {
+			q.WriteString(" OFFSET ")
+			q.WriteString(fmt.Sprint(req.Offset))
+		}
+		return q.String()
 	}
-	return runSQL(ctx, database, dbPath, q.String(), limit)
+	if rowIDName != "" {
+		result, err := runSQL(ctx, database, dbPath, buildQuery(rowIDName+", *"), limit)
+		if err == nil && len(result.Columns) > 0 {
+			out := result
+			out.Columns = append([]string(nil), result.Columns[1:]...)
+			out.RowIDs = make([]any, 0, len(result.Rows))
+			out.Rows = make([][]any, 0, len(result.Rows))
+			for _, row := range result.Rows {
+				if len(row) == 0 {
+					continue
+				}
+				out.RowIDs = append(out.RowIDs, row[0])
+				out.Rows = append(out.Rows, append([]any(nil), row[1:]...))
+			}
+			return out, nil
+		}
+	}
+	return runSQL(ctx, database, dbPath, buildQuery("*"), limit)
 }
 
 func applyStatements(ctx context.Context, database *cqlite.DB, dbPath, payload string) (response, error) {

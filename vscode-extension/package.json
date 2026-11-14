@@ -2,8 +2,12 @@
 	"name": "cqlite-tools",
 	"displayName": "cQlite Tools",
 	"description": "Viewer, schema explorer, and query runner for github.com/oarkflow/cqlite databases.",
-	"version": "0.1.0",
+  "version": "0.1.37",
 	"publisher": "sujit",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/oarkflow/cqlite.git"
+	},
 	"engines": {
 		"vscode": "^1.90.0"
 	},
@@ -15,6 +19,7 @@
 		"onCustomEditor:cQlite.databaseViewer",
 		"onView:cQliteExplorer",
 		"onCommand:cQlite.openDatabase",
+		"onCommand:cQlite.openExampleDatabase",
 		"onCommand:cQlite.refresh",
 		"onCommand:cQlite.newQuery",
 		"onCommand:cQlite.runQuery",
@@ -99,6 +104,16 @@
 					"command": "cQlite.refresh",
 					"when": "view == cQliteExplorer",
 					"group": "navigation"
+				},
+				{
+					"command": "cQlite.newQuery",
+					"when": "view == cQliteExplorer",
+					"group": "navigation"
+				},
+				{
+					"command": "cQlite.openExampleDatabase",
+					"when": "view == cQliteExplorer",
+					"group": "navigation"
 				}
 			],
 			"view/item/context": [
@@ -119,6 +134,13 @@
 					"when": "editorLangId == sql || editorLangId == cqlite-sql",
 					"group": "navigation"
 				}
+			],
+			"editor/title": [
+				{
+					"command": "cQlite.runQuery",
+					"when": "editorLangId == sql || editorLangId == cqlite-sql",
+					"group": "navigation"
+				}
 			]
 		},
 		"commands": [
@@ -126,6 +148,11 @@
 				"command": "cQlite.openDatabase",
 				"title": "cQlite: Open Database",
 				"icon": "$(folder-opened)"
+			},
+			{
+				"command": "cQlite.openExampleDatabase",
+				"title": "cQlite: Open Example Database",
+				"icon": "$(book)"
 			},
 			{
 				"command": "cQlite.refresh",
@@ -140,7 +167,7 @@
 			{
 				"command": "cQlite.runQuery",
 				"title": "cQlite: Run Query",
-				"icon": "$(play)"
+				"icon": "resources/run.svg"
 			},
 			{
 				"command": "cQlite.showTable",
@@ -157,6 +184,14 @@
 				"extensions": [
 					".cqlite.sql"
 				]
+			}
+		],
+		"keybindings": [
+			{
+				"command": "cQlite.runQuery",
+				"key": "ctrl+enter",
+				"mac": "cmd+enter",
+				"when": "editorTextFocus && (editorLangId == sql || editorLangId == cqlite-sql)"
 			}
 		]
 	}

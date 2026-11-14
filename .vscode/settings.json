@@ -1,5 +1,5 @@
 {
-	"cQlite.database": "/Users/sujit/Sites/sqlite/data/app.cq",
+	"cQlite.database": "/Users/sujit/Sites/sqlite/examples/complex_queries/data/complex_driver.cq",
 	"workbench.editorAssociations": {
 		"*.cq": "cQlite.databaseViewer"
 	}

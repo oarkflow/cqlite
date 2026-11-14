@@ -2520,7 +2520,9 @@ func (d *DB) commit(ctx context.Context, tx *Tx) error {
 		return err
 	}
 	if pendingOnly {
-		d.applyPendingOnly(tx, next)
+		if err := d.applyPendingOnly(tx, next); err != nil {
+			return err
+		}
 		d.applied = next
 		if err := d.maybeCheckpointLocked(context.Background()); err != nil {
 			return err
@@ -2594,7 +2596,7 @@ func (d *DB) validatePendingOnly(tx *Tx, revalidateConflicts bool) (bool, error)
 	return true, nil
 }
 
-func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
+func (d *DB) applyPendingOnly(tx *Tx, next uint64) error {
 	d.state.NextTx = next
 	d.state.Pragmas = tx.writes.Pragmas
 	for name, data := range tx.writes.Tables {
@@ -2604,6 +2606,15 @@ func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
 		liveData := d.state.Tables[name]
 		liveTable := d.state.Catalog.Tables[name]
 		txTable := tx.writes.Catalog.Tables[name]
+		// Checkpointed tables load lazily. Appending directly to Rows while
+		// leaving lazyRecords intact makes reads continue to see only the old
+		// checkpoint, and a later materialization can overwrite the insert.
+		if liveData.deferRuntime {
+			if err := liveData.materializeLazy(liveTable); err != nil {
+				return err
+			}
+			liveData.rebuildRuntime(liveTable)
+		}
 		if len(liveTable.Indexes) == 0 && !liveData.deferRuntime && liveData.rowids != nil && liveData.indexes != nil {
 			start := len(liveData.Rows)
 			liveData.Rows = reserveRowsForAppend(liveData.Rows, len(data.Pending))
@@ -2636,6 +2647,7 @@ func (d *DB) applyPendingOnly(tx *Tx, next uint64) {
 		}
 		liveTable.NextRowID = txTable.NextRowID
 	}
+	return nil
 }
 
 // reserveRowsForAppend grows the live table's row slice geometrically before
@@ -3069,7 +3081,12 @@ func (t *Tx) Exec(ctx context.Context, query string, args ...any) (Result, error
 		err    error
 	}
 	direct, parseErr := withQueryStatement(stripStrictOnly(query), func(stmt ast.Statement) (directResult, error) {
-		if _, insert := stmt.(*ast.InsertStmt); !insert {
+		_, insert := stmt.(*ast.InsertStmt)
+		// The insert pending-row WAL path is safe only for positional inserts
+		// recognized by simplePlan. General INSERT syntax (for example an
+		// explicit column list) must first materialize a lazily loaded table so
+		// the state snapshot also contains its checkpointed rows.
+		if !insert || !planOK {
 			t.writes.ensureRuntime()
 		}
 		triggerScopeMu.RLock()

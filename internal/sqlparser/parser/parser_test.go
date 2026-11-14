@@ -45,6 +45,42 @@ func TestSelectSimple(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsTrailingSQL(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT * FROM "orders" LIMIT 200 order by total desc;`,
+		`SELECT 1 SELECT 2`,
+	} {
+		if _, err := sqlparser.ParseStatement(sql); err == nil {
+			t.Errorf("ParseStatement(%q) accepted trailing SQL", sql)
+		}
+	}
+	// Streaming parser callers can still consume multiple statements with Next.
+	p := sqlparser.NewString("SELECT 1; SELECT 2")
+	if _, err := p.Next(); err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+	if _, err := p.Next(); err != nil {
+		t.Fatalf("second Next: %v", err)
+	}
+}
+
+func TestCreateIndexIfNotExistsWithQuotedIdentifiers(t *testing.T) {
+	stmt := mustParse(t, `CREATE INDEX IF NOT EXISTS "idx" ON "workbench_smoke" ("status")`)
+	idx := stmt.(*ast.CreateIndexStmt)
+	if !idx.IfNotExists {
+		t.Fatal("IF NOT EXISTS was not retained in the index AST")
+	}
+	if got := idx.Name.Unquoted; got != "idx" {
+		t.Fatalf("index name = %q, want idx", got)
+	}
+	if got := idx.Table.Parts[0].Unquoted; got != "workbench_smoke" {
+		t.Fatalf("table name = %q, want workbench_smoke", got)
+	}
+	if got := idx.Columns[0].Name.Unquoted; got != "status" {
+		t.Fatalf("column name = %q, want status", got)
+	}
+}
+
 func TestSelectStar(t *testing.T) {
 	mustParse(t, "SELECT * FROM users")
 }

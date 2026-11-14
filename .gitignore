@@ -1,6 +1,9 @@
 .gocache/
 bin/
 data/
+!examples/complex_queries/data/
+examples/complex_queries/data/*
+!examples/complex_queries/data/*.cq
 sqlite-cli
 sqlited
 *.test
@@ -9,3 +12,5 @@ sqlited
 .gocache-race
 .gomodcache
 .gocache-windows
+*.cq
+*.vsix

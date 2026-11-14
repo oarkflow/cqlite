@@ -1,0 +1,5 @@
+.vscode/**
+**/.DS_Store
+**/*.map
+node_modules/**
+test/**

@@ -118,6 +118,11 @@ func (p *Parser) Next() (Statement, error) {
 	return p.p.ParseOne()
 }
 
+// Single parses exactly one statement and rejects trailing SQL.
+func (p *Parser) Single() (Statement, error) {
+	return p.p.ParseSingle()
+}
+
 // All parses all remaining statements.
 func (p *Parser) All() ([]Statement, error) {
 	return p.p.ParseAll()

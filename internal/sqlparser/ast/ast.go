@@ -682,12 +682,13 @@ func (c *RenameTableCmd) Pos() int32    { return c.TokPos }
 
 // CreateIndexStmt represents CREATE [UNIQUE|FULLTEXT|SPATIAL] INDEX.
 type CreateIndexStmt struct {
-	Name     *Ident
-	Table    *QualifiedIdent
-	Columns  []*IndexColDef
-	Type     ConstraintType
-	IndexAlg []byte
-	TokPos   int32
+	Name        *Ident
+	Table       *QualifiedIdent
+	Columns     []*IndexColDef
+	Type        ConstraintType
+	IfNotExists bool
+	IndexAlg    []byte
+	TokPos      int32
 }
 
 func (n *CreateIndexStmt) node()      {}
